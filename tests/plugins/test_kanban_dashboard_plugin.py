@@ -1274,7 +1274,73 @@ def test_specify_happy_path(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Final result visibility for Done cards
+# Readability guards on the task drawer (render-time; stored text untouched)
 # ---------------------------------------------------------------------------
+
+
+def test_get_task_guards_body_and_comments(client):
+    """Freehand note surfaces render through the readability guards: the 64-hex
+    id truncates, chrome lines drop, comment paths get labels — while the DB
+    row keeps the raw stored text (presentation-only contract)."""
+    body = (
+        "Shadow entity 9c83f1f418d2ef8350d99ef94ee3b95cea2cd1538eabf61ee705224994ab9927, "
+        "row ~r334. Gate: Leo approval after walkthrough.\n"
+        "ESTIMATE\n"
+        "COMMENTS · 0\n"
+        "No attachments yet."
+    )
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "unreadable note", "body": body},
+    ).json()["task"]
+    with kbc.connect() as conn:
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (created["id"], "seat", "checklist: /Users/leokwan/.hermes/cache/scratch/r334-corrections.md", 1),
+        )
+        conn.commit()
+        raw = conn.execute("SELECT body FROM tasks WHERE id = ?", (created["id"],)).fetchone()[0]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{created['id']}").json()
+
+    shown = detail["task"]["body"]
+    assert "Shadow entity 9c83f1f4, Shadow plan row (~r334)." in shown  # hash truncated + token expanded
+    assert "9c83f1f418" not in shown
+    assert "ESTIMATE" not in shown and "COMMENTS · 0" not in shown  # chrome stripped
+    comment_body = detail["comments"][0]["body"]
+    assert "[r334-corrections.md] → /Users/leokwan/.hermes/cache/scratch/r334-corrections.md" in comment_body
+    # The stored row is untouched — guards live at the read boundary only.
+    assert raw == body
+
+
+def test_get_task_dedups_initial_status_double_stamp(client):
+    """The verified double stamp (created[status=blocked] + blocked
+    [reason=initial_status] at one timestamp) collapses in the drawer's
+    activity feed; a genuine later block stays."""
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "blocked at birth", "initial_status": "blocked"},
+    ).json()["task"]
+    ts = 1789930821
+    with kbc.connect() as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'created', ?, ?)",
+            (created["id"], json.dumps({"status": "blocked"}), ts),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
+            (created["id"], json.dumps({"reason": "initial_status", "status": "blocked", "actor": "user"}), ts),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
+            (created["id"], json.dumps({"reason": "needs human input"}), ts + 60),
+        )
+        conn.commit()
+
+    events = client.get(f"/api/plugins/kanban/tasks/{created['id']}").json()["events"]
+
+    stamps = [(e["kind"], (e["payload"] or {}).get("reason")) for e in events]
+    assert ("blocked", "initial_status") not in stamps
+    assert ("blocked", "needs human input") in stamps
 
 

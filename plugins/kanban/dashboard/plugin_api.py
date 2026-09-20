@@ -16,6 +16,7 @@ import logging
 import re
 import sqlite3
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import asdict
@@ -29,6 +30,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli.kanban_readability import (
+    apply_render_guards,
+    blocked_creator_keys,
+    dedup_activity_events,
+)
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
@@ -351,15 +357,23 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
+        # Note surfaces render through the readability guards — presentation only,
+        # stored rows are untouched: body/comment text is normalized and the
+        # double-stamped initial blocked transition is collapsed from activity.
         task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        if task_d.get("body"):
+            task_d["body"] = apply_render_guards(task_d["body"])
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+        comments = kanban_db.list_comments(conn, task_id)
+        for comment in comments:
+            comment.body = apply_render_guards(comment.body)
         return {
             "task": task_d,
-            "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
-            "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
+            "comments": [asdict(c) for c in comments],
+            "events": dedup_activity_events([asdict(e) for e in kanban_db.list_events(conn, task_id)]),
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": [
@@ -1676,6 +1690,9 @@ class _EventTail:
         self._board = board
         self._conn: Optional[sqlite3.Connection] = None
         self._executor: Optional[ThreadPoolExecutor] = None
+        # Recent created-into-blocked keys so an initial-status blocked twin
+        # split across poll batches is still suppressed (render-time only).
+        self._blocked_creators: deque[tuple] = deque(maxlen=64)
 
     def _fetch(self, cursor: int) -> tuple[int, list[dict]]:
         if self._conn is None:
@@ -1691,7 +1708,8 @@ class _EventTail:
             except Exception:
                 payload = None
             out.append({**dict(r), "payload": payload})
-        return (rows[-1]["id"] if rows else cursor), out
+        self._blocked_creators.extend(blocked_creator_keys(out))
+        return (rows[-1]["id"] if rows else cursor), dedup_activity_events(out, self._blocked_creators)
 
     def _close(self) -> None:
         if self._conn is not None:
