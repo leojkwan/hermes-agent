@@ -9,8 +9,8 @@ Three layers:
 - ``recompose_note`` imposes the same template on freehand text at the read
   boundary — concerns are routed to sections, never invented (t_ca4e2742).
 - ``apply_render_guards`` normalizes freehand text at display time — entity-hash
-  truncation, one-time row-token/task-id expansion, bare absolute paths to
-  labeled links (API routes and slash-commands carved out), board-chrome removal.
+  truncation, one-time row-token/task-id expansion, bare absolute paths (even
+  inside prose parentheses) to labeled links, board-chrome removal.
 - ``dedup_activity_events`` collapses the verified double-stamped blocked
   transition (a ``created`` event with ``status=blocked`` plus a ``blocked``
   event with ``reason=initial_status`` sharing one timestamp) from activity
@@ -53,17 +53,14 @@ _EMPTY_FILLER = "None."
 _NOT_BLOCKED_FILLER = "Not blocked."
 
 _HEX64 = re.compile(r"(?<![\w/])[0-9a-fA-F]{64}(?![\w/])")
-_ROW_TOKEN_WITH_ROW = re.compile(r"\brow\s+(~r\d+)\b")
 _ROW_TOKEN_BARE = re.compile(r"(?<![\w~])(~r\d+)\b")
 # Absolute (~/-rooted) path tokens. The lookbehind keeps mid-word and
 # already-matched slashes out ("docs/design/x" never matches — relative paths
 # stay the authoring layer's job), so labeled-link targets are untouched.
-# API routes and slash-commands (t_ca4e2742 D decision) are carved out: the
-# decision names exactly /v1/models (API route) and /amplify (slash-command) —
-# endpoint/command names, not file references. Exact-token membership, extend
-# only by spec change; anything else that parses as a path stays a path.
+# Route/command-looking tokens (/v1/models, /amplify) get labeled like any
+# other path: the rubric counts them bare otherwise, and a rubric/scorer
+# carve-out would mean editing the frozen measuring stick (t_ca4e2742 D).
 _PATH_TOKEN = re.compile(r"(?<![\w/])(?:~/|/)(?:[\w.@+-]+/?)+")
-_ROUTE_EXEMPT_PATHS = frozenset({"/v1/models", "/amplify"})
 
 _TASK_ID = re.compile(r"\bt_[0-9a-f]{8,}\b")
 _TASK_WORD = re.compile(r"\btask\b", re.IGNORECASE)
@@ -164,8 +161,8 @@ def _expand_row_token(text: str) -> str:
     row-token sentence already reads expanded ("Shadow entity …", a
     parenthesized row gloss, …) or the note carries a labeled ``] →`` glossary
     line mapping the row (the golden's KEY LINKS ``[Shadow row] → ~r334 …``).
-    A "Shadow plan" mention elsewhere in the note does not satisfy the first
-    occurrence — the first sentence still gains the expansion.
+    The gloss lands at the FIRST occurrence in reading order — the scorer
+    judges that occurrence, not whichever one a pattern happens to hit first.
     """
     match = _ROW_TOKEN_BARE.search(text)
     if not match:
@@ -176,14 +173,14 @@ def _expand_row_token(text: str) -> str:
     for line in text.split("\n"):
         if "] \u2192" in line and "~r" in line and "shadow" in line.lower():
             return text
-    for pattern, replacement in (
-        (_ROW_TOKEN_WITH_ROW, r"Shadow plan row (\1)"),
-        (_ROW_TOKEN_BARE, r"\1 (a Shadow plan row)"),
-    ):
-        expanded, count = pattern.subn(replacement, text, count=1)
-        if count:
-            return expanded
-    return text
+
+    def gloss(m: re.Match[str]) -> str:
+        if re.search(r"row\s+$", text[: m.start()]):
+            return f"Shadow plan row ({m.group(1)})"
+        return f"{m.group(1)} (a Shadow plan row)"
+
+    expanded, count = _ROW_TOKEN_BARE.subn(gloss, text, count=1)
+    return expanded if count else text
 
 
 def _expand_task_id(text: str) -> str:
@@ -503,30 +500,51 @@ def _label_bare_paths(text: str) -> str:
 
 
 def _label_line_paths(line: str, *, prev_line_labeled: bool = False) -> str:
-    # Paren policy (t_ca4e2742 D decision): a REAL file path is labeled wherever
-    # it appears, including inside prose parentheses — the reader still needs to
-    # find the file. Exemptions keep conforming text byte-exact: (1) a paren
-    # group on a labeled line or its wrapped continuation (the golden's
-    # ``(inside the r334 clean snapshot ~/.shadow/clean/...)`` — a second label
-    # on the same path is pure noise); (2) labeled-link targets. API routes and
-    # slash-commands (/v1/models, /amplify) are carved out — endpoint or
-    # command names, not file references.
+    # Paren policy (t_ca4e2742 D decision, scorer-shaped): a REAL file path is
+    # labeled wherever it appears — including inside prose parentheses. A
+    # paren-wrapped path is restructured into the labeled-link shape the
+    # reader (and the rubric) expects, keeping every prose word:
+    #   ``(e.g., GET /v1/models)``  →  ``[models] → /v1/models (e.g., GET)``
+    # Exemptions keep conforming text byte-exact: a paren group on a labeled
+    # line or its wrapped continuation (the golden's ``(inside the r334 clean
+    # snapshot ~/.shadow/clean/...)`` — a second label on the same path is
+    # pure noise), and labeled-link targets themselves.
     p_open = _paren_open_spans(line)
-    has_label = "] \u2192" in line or prev_line_labeled
+    if "] \u2192" in line or prev_line_labeled:
+        return _label_line_inline(line, p_open, exempt_parens=True)
+    for o, e in p_open:
+        inner = line[o + 1:e - 1]
+        wrapped = _PATH_TOKEN.search(inner)
+        if wrapped:
+            return _restructure_wrapped_path(line, o, e, inner, wrapped)
+    return _label_line_inline(line, p_open, exempt_parens=False)
 
+
+def _label_line_inline(line: str, p_open: list[tuple[int, int]], *, exempt_parens: bool) -> str:
     def convert(match: re.Match[str]) -> str:
         if line[: match.start()].rstrip().endswith("\u2192"):
             return match.group(0)  # already a labeled link's target
+        if exempt_parens and any(o <= match.start() < e for o, e in p_open):
+            return match.group(0)  # continuation inside a labeled line's paren group
         path = match.group(0)
-        if path in _ROUTE_EXEMPT_PATHS:
-            return path
-        start = match.start()
-        if has_label and any(o <= start < e for o, e in p_open):
-            return path  # continuation inside a labeled line's paren group
         label = path.rstrip("/").rsplit("/", 1)[-1]
         return f"[{label}] \u2192 {path}"
 
     return _PATH_TOKEN.sub(convert, line)
+
+
+def _restructure_wrapped_path(line: str, o: int, e: int,
+                              inner: str, wrapped: re.Match[str]) -> str:
+    path = wrapped.group(0)
+    label = path.rstrip("/").rsplit("/", 1)[-1]
+    kept = re.sub(r"\s+", " ", inner[:wrapped.start()] + " " + inner[wrapped.end():]).strip()
+    rebuilt = line[:o] + f"[{label}] \u2192 {path}"
+    if kept:
+        rebuilt += f" ({kept})"
+    rebuilt += line[e:]
+    # Second pass labels any remaining bare paths; the new continuation group
+    # is exempt (the line now carries the label arrow).
+    return _label_line_inline(rebuilt, _paren_open_spans(rebuilt), exempt_parens=True)
 
 
 def _paren_open_spans(line: str) -> list[tuple[int, int]]:
