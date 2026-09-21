@@ -99,5 +99,15 @@ def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
                 "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                 (sqlite3.Binary(b"429 quota exceeded"), tid),
             )
-        # BLOB last_failure_error still matches the quota/auth blocker pattern.
+        # BLOB bytes still reach the guard through the lossy-text read.
+        # Quota text no longer parks (owned by the rate-limit cooldown), so
+        # this row must read as respawnable, not crash and not blocker_auth.
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (sqlite3.Binary(b"401 auth failed"), tid),
+            )
+        # BLOB auth text still matches the blocker pattern and parks the card.
         assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
