@@ -147,12 +147,21 @@ def test_no_full_hash_in_prose():
     guarded = apply_render_guards(before)
     assert "9c83f1f418" not in guarded
     assert "Shadow entity 9c83f1f4" in guarded  # label prose preserved, id truncated to 8
-    assert "Shadow plan row (~r334)" in guarded  # jargon token expanded once
+    assert "row ~r334" in guarded  # sentence already carries "Shadow entity" — compliant as-is
 
 
-def test_row_expansion_skips_labeled_text():
-    text = "See ~r334 — documented under the Shadow plan."
-    assert apply_render_guards(text) == text
+def test_row_expansion_skips_scorer_compliant_text():
+    text = "Documented on the Shadow plan (~r334) review."
+    assert apply_render_guards(text) == text  # paren gloss = expanded, per rubric §3a
+
+
+def test_row_expands_first_occurrence_even_with_plan_mention_elsewhere():
+    # A "Shadow plan" mention in an EARLIER sentence does not satisfy the
+    # first row-token sentence — the scorer still demands expansion there.
+    text = "Context for the Shadow plan. Row ~r334 awaits review."
+    guarded = apply_render_guards(text)
+    assert "~r334 (a Shadow plan row)" in guarded  # first occurrence expanded
+    assert "Context for the Shadow plan." in guarded  # earlier prose untouched
 
 
 def test_label_paths_bare_absolute():
@@ -162,6 +171,65 @@ def test_label_paths_bare_absolute():
     # Labeled-link targets and parenthesised paths are left alone.
     labeled = "[x] → docs/design/review-center/scan-wait-r1/\n  (inside ~/.shadow/clean/snap)"
     assert apply_render_guards(labeled) == labeled
+
+
+def test_task_id_expansion():
+    bare = "Blocked behind t_fbd28a28 on the board."
+    guarded = apply_render_guards(bare)
+    assert "t_fbd28a28 (a kanban task)" in guarded
+    assert guarded.count("(a kanban task)") == 1  # first occurrence only
+
+    # `card` does not satisfy the rubric's expansion — gloss still lands.
+    carded = "context for (card t_fb55c86f) on the board."
+    assert "(card t_fb55c86f) (a kanban task)" in apply_render_guards(carded)
+
+    # The word `task` in the first id sentence IS the expansion.
+    worded = "Open task t_fbd28a28 and finish it."
+    assert apply_render_guards(worded) == worded
+
+    # An existing paren gloss is left alone.
+    glossed = "See t_fbd28a28 (a kanban task) first."
+    assert apply_render_guards(glossed) == glossed
+
+
+def test_paren_paths_labeled_routes_exempt():
+    # A REAL file path inside prose parentheses is labeled (D decision, t_ca4e2742).
+    real = "Gate after the walkthrough (/Users/leokwan/.hermes/cache/scratch/r334-corrections.md)."
+    guarded = apply_render_guards(real)
+    assert "[r334-corrections.md] → /Users/leokwan/.hermes/cache/scratch/r334-corrections.md" in guarded
+
+    # API routes and slash-commands are not file references — untouched.
+    routes = "Confirm via GET /v1/models and run /amplify; docs/design/x is relative."
+    assert apply_render_guards(routes) == routes
+
+    # A continuation paren group on a labeled line keeps its inner paths verbatim.
+    continuation = "[x] → docs/design/scan-wait-r1/\n  (inside ~/.shadow/clean/snap)"
+    assert apply_render_guards(continuation) == continuation
+
+
+def test_recompose_freehand_to_template():
+    freehand = (
+        "Goal: unblock the ~r334 review lane (card t_fb55c86f), which is waiting on the "
+        "walkthrough. Steps: perform the scan-wait walkthrough and fill out the corrections "
+        "checklist linked from the card. Acceptance: the checklist is completed and posted "
+        "back to t_fb55c86f, ready to fold into the review.\n"
+        "Checklist: /Users/leokwan/.hermes/cache/scratch/r334-corrections.md"
+    )
+    out = apply_render_guards(freehand)
+    headers = [line for line in out.splitlines() if line in SECTION_ORDER]
+    assert headers == list(SECTION_ORDER)  # all six, in order, nothing before STATUS
+    assert "Ready to start." in out  # first action is imperative → honest ready state
+    assert "Perform the scan-wait walkthrough" in out  # own words (prefix-stripped, capped)
+    assert "which is waiting on the walkthrough" in out  # gate state kept
+    assert "(card t_fb55c86f) (a kanban task)" in out  # gloss after the paren group, no nesting
+    assert "r334-corrections.md] →" in out  # path labeling still runs
+
+
+def test_recompose_leaves_short_and_structured_text_alone():
+    one_liner = "Run the gauntlet on the fresh 2.0.4 stamp, then upload."
+    assert apply_render_guards(one_liner) == one_liner  # comment-length: no filler templating
+    structured = GOLDEN_AFTER
+    assert apply_render_guards(structured) == structured  # already carries the template
 
 
 def test_strip_chrome():

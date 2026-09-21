@@ -59,7 +59,7 @@ __all__ = [
     "reset_client",
 ]
 
-PIPELINE_VERSION = "readability-render-v1"
+PIPELINE_VERSION = "readability-render-v2"
 
 _DEFAULT_MAX_CHARS = 12000
 _SEEN_CAP = 4096

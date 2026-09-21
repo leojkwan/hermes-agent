@@ -1304,7 +1304,9 @@ def test_get_task_guards_body_and_comments(client):
     detail = client.get(f"/api/plugins/kanban/tasks/{created['id']}").json()
 
     shown = detail["task"]["body"]
-    assert "Shadow entity 9c83f1f4, Shadow plan row (~r334)." in shown  # hash truncated + token expanded
+    # "Shadow entity …" already expands the row token in its sentence (rubric
+    # §3a) — compliant as-is; the hash truncates to 8.
+    assert "Shadow entity 9c83f1f4, row ~r334." in shown
     assert "9c83f1f418" not in shown
     assert "ESTIMATE" not in shown and "COMMENTS · 0" not in shown  # chrome stripped
     comment_body = detail["comments"][0]["body"]
