@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Collection, Mapping, Optional, Sequence, TypeVar, Union, overload
+from typing import Callable, Collection, Mapping, Optional, Sequence, TypeVar, Union, overload
 
 _T = TypeVar("_T", bound=Mapping)
 
@@ -96,26 +96,43 @@ def compose_note(sections: Mapping[str, SectionValue]) -> str:
     return "\n\n".join(blocks)
 
 
-@overload
-def apply_render_guards(text: str) -> str: ...
+StageObserver = Callable[[str, str], None]
+"""Observability hook shape: ``(stage_name, text_after_stage)`` per guard."""
 
 
 @overload
-def apply_render_guards(text: None) -> None: ...
+def apply_render_guards(text: str, *, stage_observer: Optional[StageObserver] = ...) -> str: ...
 
 
-def apply_render_guards(text: Optional[str]) -> Optional[str]:
+@overload
+def apply_render_guards(text: None, *, stage_observer: Optional[StageObserver] = ...) -> None: ...
+
+
+def apply_render_guards(text: Optional[str],
+                        *, stage_observer: Optional[StageObserver] = None) -> Optional[str]:
     """Normalize one freehand note for display (presentation only).
 
     Order: hash truncation → row-token expansion → path labeling → chrome
-    strip. Each guard is a no-op on already-conforming text.
+    strip. Each guard is a no-op on already-conforming text. When
+    ``stage_observer`` is given it is called after each transform —
+    observability only; the returned value is computed from the pipeline
+    alone.
     """
     if not text:
         return text
     guarded = _HEX64.sub(lambda match: match.group(0)[:8], text)
+    if stage_observer:
+        stage_observer("hash_truncate", guarded)
     guarded = _expand_row_token(guarded)
+    if stage_observer:
+        stage_observer("row_expansion", guarded)
     guarded = _label_bare_paths(guarded)
-    return strip_board_chrome(guarded)
+    if stage_observer:
+        stage_observer("path_labeling", guarded)
+    guarded = strip_board_chrome(guarded)
+    if stage_observer:
+        stage_observer("chrome_strip", guarded)
+    return guarded
 
 
 def _expand_row_token(text: str) -> str:
