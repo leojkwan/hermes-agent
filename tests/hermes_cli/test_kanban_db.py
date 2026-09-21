@@ -486,6 +486,15 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         ("authentication error from provider", "blocker_auth"),
         ("still authorizing the request", "blocker_auth"),
         ("still authorising the request", "blocker_auth"),
+        ("403 forbidden by provider", "blocker_auth"),
+        # Quota / rate-limit text belongs to the rate-limit cooldown path
+        # (guard section 1), never blocker_auth: a reclaim stamps a newer
+        # non-rate_limited run, and stale quota text would otherwise park the
+        # card forever while quota lasts (observed live 2026-09-21).
+        ("pid 84656 exited rate-limited (quota wall) — requeued", None),
+        ("provider 429 quota exhausted", None),
+        ("rate limit exceeded upstream", None),
+        ("HTTP 429 too many requests", None),
     ],
 )
 def test_respawn_guard_blocker_auth_curated_not_open_stem(
@@ -494,7 +503,9 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
     """``_RESPAWN_BLOCKER_RE`` used to use an open ``auth\\w*`` stem that matched
     ordinary English words like "author"/"authored"/"authoring"/"authoritative"
     in worker progress prose, parking a healthy ``ready`` card forever (#117009).
-    The auth family must be a curated set of real auth-failure tokens."""
+    The auth family must be a curated set of real auth-failure tokens; quota /
+    rate-limit text is deliberately NOT in it — that family is owned by the
+    rate-limit cooldown, which retries forever without counting failures."""
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
 
     with kbc.connect() as conn:
