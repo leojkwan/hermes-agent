@@ -669,6 +669,22 @@ _PROVIDER_ERROR_MARKERS = (
     r"api\s+(?:call\s+)?failed", r"provider\s+authentication\s+failed", r"non-retryable\s+error",
     r"rate\s+limited\s+after\s+\d+\s+retries", r"error\s+code\s*:", r"http\s*\d{3}\b",
     r"incorrect\s+api\s+key", r"invalid\s+api\s+key")
+
+# Terminal failure statuses emitted by
+# ``agent.turn_recovery.max_retries_exhausted_result`` (billing ×2, rate-limit,
+# generic — the only emitter, verified). Each is emitted once when retries,
+# transport recovery and fallback are all exhausted, and the same failed turn
+# then delivers the authoritative final copy (``exhausted_copy`` / billing
+# label). Anchored to the ❌ glyph so ordinary prose or mid-turn retry chatter
+# never matches.
+_GATEWAY_TERMINAL_FAILURE_STATUS_RE = re.compile(
+    r"^\s*❌\s*("
+    r"rate\s+limited\s+after\s+\d+\s+retries"
+    r"|api\s+failed\s+after\s+\d+\s+retries"
+    r"|billing\s+or\s+credits\s+exhausted"
+    r"|provider\s+reported\s+usage/credit\s+exhaustion"
+    r")",
+    re.IGNORECASE)
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"^\s*(\W*\s*)?("
     + "|".join(_PROVIDER_ERROR_MARKERS + _CONNECTION_ERROR_MARKERS[:8] + (r"all\s+connection\s+attempts\s+failed",))
@@ -736,6 +752,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    # A TERMINAL failure status is redundant on chat surfaces: the same failed
+    # turn always follows with the authoritative final copy (exhausted_copy /
+    # billing label), so converting this status through the provider-error
+    # reply table rendered a SECOND failure bubble beside the final (E0919
+    # duplicate-failure render). Suppress it; local surfaces below keep the
+    # raw diagnostic stream.
+    if _GATEWAY_TERMINAL_FAILURE_STATUS_RE.search(text):
+        return None
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
