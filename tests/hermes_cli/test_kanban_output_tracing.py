@@ -133,8 +133,9 @@ def test_guarded_text_emits_root_stage_and_final_spans(fake_client):
     assert root.kwargs["trace_context"]["session_id"] == "kanban-task-t_x"
     assert root.kwargs["metadata"]["pipeline"] == kot.PIPELINE_VERSION
     stage_names = [c.name for c in root.children]
-    assert stage_names == ["stage.hash_truncate", "stage.row_expansion",
-                           "stage.path_labeling", "stage.chrome_strip", "final_output"]
+    assert stage_names == ["stage.recompose", "stage.hash_truncate", "stage.row_expansion",
+                           "stage.task_id_expansion", "stage.path_labeling",
+                           "stage.chrome_strip", "final_output"]
     final = root.children[-1]
     assert final.kwargs["output"] == apply_render_guards(SAMPLE)
     assert final.kwargs["metadata"]["complete_output"] is True

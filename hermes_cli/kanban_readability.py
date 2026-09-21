@@ -6,9 +6,11 @@ card bodies, comments, and task_events are never rewritten in the database.
 Three layers:
 
 - ``compose_note`` builds a canonical note from structured sections (authoring).
+- ``recompose_note`` imposes the same template on freehand text at the read
+  boundary — concerns are routed to sections, never invented (t_ca4e2742).
 - ``apply_render_guards`` normalizes freehand text at display time — entity-hash
-  truncation, one-time row-token expansion, bare absolute paths to labeled
-  links, board-chrome removal.
+  truncation, one-time row-token/task-id expansion, bare absolute paths to
+  labeled links (API routes and slash-commands carved out), board-chrome removal.
 - ``dedup_activity_events`` collapses the verified double-stamped blocked
   transition (a ``created`` event with ``status=blocked`` plus a ``blocked``
   event with ``reason=initial_status`` sharing one timestamp) from activity
@@ -32,6 +34,7 @@ __all__ = [
     "blocked_creator_keys",
     "compose_note",
     "dedup_activity_events",
+    "recompose_note",
     "strip_board_chrome",
 ]
 
@@ -55,7 +58,15 @@ _ROW_TOKEN_BARE = re.compile(r"(?<![\w~])(~r\d+)\b")
 # Absolute (~/-rooted) path tokens. The lookbehind keeps mid-word and
 # already-matched slashes out ("docs/design/x" never matches — relative paths
 # stay the authoring layer's job), so labeled-link targets are untouched.
+# API routes and slash-commands (t_ca4e2742 D decision) are carved out: the
+# decision names exactly /v1/models (API route) and /amplify (slash-command) —
+# endpoint/command names, not file references. Exact-token membership, extend
+# only by spec change; anything else that parses as a path stays a path.
 _PATH_TOKEN = re.compile(r"(?<![\w/])(?:~/|/)(?:[\w.@+-]+/?)+")
+_ROUTE_EXEMPT_PATHS = frozenset({"/v1/models", "/amplify"})
+
+_TASK_ID = re.compile(r"\bt_[0-9a-f]{8,}\b")
+_TASK_WORD = re.compile(r"\btask\b", re.IGNORECASE)
 
 # Full-line board chrome (spec rule 8): UI furniture captured into note bodies —
 # estimate buttons, comment/activity/attachment counters, transition stamps,
@@ -112,20 +123,26 @@ def apply_render_guards(text: Optional[str],
                         *, stage_observer: Optional[StageObserver] = None) -> Optional[str]:
     """Normalize one freehand note for display (presentation only).
 
-    Order: hash truncation → row-token expansion → path labeling → chrome
-    strip. Each guard is a no-op on already-conforming text. When
-    ``stage_observer`` is given it is called after each transform —
-    observability only; the returned value is computed from the pipeline
-    alone.
+    Order: template recomposition → hash truncation → row-token expansion →
+    task-id expansion → path labeling → chrome strip. Each guard is a no-op on
+    already-conforming text. When ``stage_observer`` is given it is called
+    after each transform — observability only; the returned value is computed
+    from the pipeline alone.
     """
     if not text:
         return text
-    guarded = _HEX64.sub(lambda match: match.group(0)[:8], text)
+    guarded = recompose_note(text)
+    if stage_observer:
+        stage_observer("recompose", guarded)
+    guarded = _HEX64.sub(lambda match: match.group(0)[:8], guarded)
     if stage_observer:
         stage_observer("hash_truncate", guarded)
     guarded = _expand_row_token(guarded)
     if stage_observer:
         stage_observer("row_expansion", guarded)
+    guarded = _expand_task_id(guarded)
+    if stage_observer:
+        stage_observer("task_id_expansion", guarded)
     guarded = _label_bare_paths(guarded)
     if stage_observer:
         stage_observer("path_labeling", guarded)
@@ -135,15 +152,30 @@ def apply_render_guards(text: Optional[str],
     return guarded
 
 
+_ROW_EXPANSION_RX = re.compile(
+    r"shadow plan row|shadow entity|shadow row|plan row|\(~r\d+\)", re.I
+)
+
+
 def _expand_row_token(text: str) -> str:
     """One-time glossary expansion of the bare row token (spec rule 2).
 
-    Notes that already carry the labeled form — the canonical KEY LINKS
-    ``[Shadow row] → …`` line or any prose naming the plan — skip expansion
-    so conforming text is never mangled.
+    Skip rule mirrors the scorer's: expansion is redundant only when the FIRST
+    row-token sentence already reads expanded ("Shadow entity …", a
+    parenthesized row gloss, …) or the note carries a labeled ``] →`` glossary
+    line mapping the row (the golden's KEY LINKS ``[Shadow row] → ~r334 …``).
+    A "Shadow plan" mention elsewhere in the note does not satisfy the first
+    occurrence — the first sentence still gains the expansion.
     """
-    if "Shadow plan" in text or "plan row" in text:
+    match = _ROW_TOKEN_BARE.search(text)
+    if not match:
         return text
+    sentence = next((s for s in _sentences(text) if _ROW_TOKEN_BARE.search(s)), "")
+    if _ROW_EXPANSION_RX.search(sentence):
+        return text
+    for line in text.split("\n"):
+        if "] \u2192" in line and "~r" in line and "shadow" in line.lower():
+            return text
     for pattern, replacement in (
         (_ROW_TOKEN_WITH_ROW, r"Shadow plan row (\1)"),
         (_ROW_TOKEN_BARE, r"\1 (a Shadow plan row)"),
@@ -152,6 +184,50 @@ def _expand_row_token(text: str) -> str:
         if count:
             return expanded
     return text
+
+
+def _expand_task_id(text: str) -> str:
+    """One-time glossary expansion of the first bare kanban task id.
+
+    Mirrors ``_expand_row_token`` for the ``t_[0-9a-f]{8,}`` class (rubric
+    §3.2): the first occurrence gains ``(a kanban task)`` unless the sentence
+    already carries the expansion (the word ``task`` — ``card`` and ``cards``
+    do not count per the rubric) or the id already sits in a parenthesized
+    gloss. Later occurrences are unconstrained.
+    """
+    match = _TASK_ID.search(text)
+    if not match:
+        return text
+    sentence = next((s for s in _sentences(text) if _TASK_ID.search(s)), "")
+    if _TASK_WORD.search(sentence):
+        return text
+    tail = text[match.end():]
+    stripped = tail.lstrip(" \n")
+    if stripped.startswith("("):
+        return text  # already a parenthesized gloss
+    head = text[: match.end()]
+    if head.rstrip().endswith("(") or _inside_unclosed_paren(head):
+        # The id sits inside a paren group like "(card t_fb55c86f)": close the
+        # group first, then gloss — never nest.
+        close = tail.find(")")
+        if close != -1:
+            at = match.end() + close + 1
+            return text[:at] + " (a kanban task)" + text[at:]
+    return head + " (a kanban task)" + tail
+
+
+def _inside_unclosed_paren(head: str) -> bool:
+    depth = 0
+    for ch in head:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+    return depth > 0
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+|\n", text) if s.strip()]
 
 
 def strip_board_chrome(text: str) -> str:
@@ -233,27 +309,228 @@ def _filler(name: str) -> str:
     return _NOT_BLOCKED_FILLER if name == "BLOCKED ON / GATE" else _EMPTY_FILLER
 
 
+# --- recomposition (t_ca4e2742): template composition for freehand bodies ---
+#
+# Route-only, non-fabricating: freehand concerns are sorted into the canonical
+# sections, kept in their own words, one concern per line. Nothing is
+# paraphrased, summarized, or invented; a section with nothing found prints the
+# honest filler via compose_note. Notes that already carry two exact section
+# header lines pass through untouched (the golden note must stay byte-exact).
+
+_SECTION_HEADER_RX = re.compile(
+    r"^\s*(STATUS|BLOCKED ON / GATE|NEXT ACTION|KEY LINKS|CORRECTIONS CHECKLIST|"
+    r"NOTES[/\\] ?PARKED|NOTES / PARKED)\s*:?\s*$",
+    re.I,
+)
+_LABEL_LINE_RX = re.compile(r"^\s*\[[^\]\n]+\]\s*(?:\u2192|->)\s*")
+_PATHISH_RX = re.compile(
+    r"(?<![\w/])(?:~/|/)(?:[\w.@+-]+/?)+"
+    r"|\b[\w.-]+\.(?:md|html?|py|json|ya?ml|sh|txt|toml|cfg|ini|sqlite|db|pdf|png|jpe?g|gif|mp4|mov|fcpxmld)\b"
+)
+_RECEIPT_LINE_RX = re.compile(r"^\s*(?:t_[0-9a-f]{8,}|~r\d+)\s+\u2014\s+")
+_STRUCTURED_PREFIX_RX = re.compile(
+    r"^(?:goal|context|approach|steps?|acceptance(?:\s+criteria)?|deliverables?|"
+    r"output|background|source(?:\s+content)?|summary|outcome|now|risk|decision|"
+    r"note|notes)\s*:\s*",
+    re.I,
+)
+_GATE_RX = re.compile(
+    r"\bgate\b|\bblocked\b|\bwaiting on\b|\bfreezes?\b|\bstale\b|\btrap\b"
+    r"|\bwalkthrough\b|\bapproval\b|\bacceptance\b",
+    re.I,
+)
+_PARKED_RX = re.compile(r"\bparked\b|\bdeferred\b|\bheld back\b|\bout of scope\b", re.I)
+_ACTION_RX = re.compile(
+    r"^(?:read|run|review|verify|survey|check|open|locate|probe|define|write|add|"
+    r"rewrite|map|identify|confirm|produce|draft|shortlist|return|go|cut|schedule|"
+    r"perform|fill|emit|triage|keep|unblock|eliminate|re-?establish|implement|"
+    r"close|complete|decide|create|install|integrate|build|compare|rebuild|"
+    r"publish|update|stage|land|record|mark|drop|move|ensure|document|commit|"
+    r"resume|deliver|show|set|enumerate|query)\b",
+    re.I,
+)
+_SENT_SPLIT_RX = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9~`\[])|(?<=;)\s+")
+_LIST_ITEM_RX = re.compile(r"^\s*(?:[-*\u2022\u2023\u25e6\u2043\u2219]|\d+[.)])\s+(.*)$")
+
+
+def _looks_structured(text: str) -> bool:
+    return sum(1 for ln in text.split("\n") if _SECTION_HEADER_RX.match(ln)) >= 2
+
+
+def _normalize_source_line(line: str) -> Optional[str]:
+    line = line.replace("\t", " ").replace("\u00a0", " ").rstrip()
+    if not line.strip():
+        return None
+    if any(p.fullmatch(line.strip()) for p in _CHROME_LINE_PATTERNS):
+        return None
+    return line
+
+
+def _prose_sentences(line: str) -> list[str]:
+    return [p.strip() for p in _SENT_SPLIT_RX.split(line) if p and p.strip()]
+
+
+def _strip_structured_prefix(sentence: str) -> str:
+    body = _STRUCTURED_PREFIX_RX.sub("", sentence, count=1).strip()
+    if not body:
+        return ""
+    return body[0].upper() + body[1:]
+
+
+def _collapse(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _ensure_period(sentence: str) -> str:
+    sentence = _collapse(sentence).rstrip()
+    return sentence if sentence.endswith((".", "!", "?")) else sentence + "."
+
+
+def _status_line(action_lines: Sequence[str]) -> str:
+    if action_lines and _ACTION_RX.match(action_lines[0]):
+        return "Ready to start."
+    return "In progress."
+
+
+# Recomposition applies to note-length bodies only: a one-line comment
+# templated into six sections (five ``None.`` fillers) is worse, not better.
+# Shortest corpus note is ~290 chars; comment-length texts stay on the
+# token guards alone.
+_WORTH_STRUCTURING = 240
+
+
+def recompose_note(text: str) -> str:
+    """Impose the canonical template on freehand text (read-path only).
+
+    A note already carrying two exact section header lines is returned
+    unchanged, and so is comment-length text (below ``_WORTH_STRUCTURING``).
+    Otherwise each source line lands in exactly one place: labeled
+    ``[label] →`` lines, board receipt rows (``t_… —``, ``~rN —``), and
+    path-bearing reference sentences go to KEY LINKS verbatim; list items under
+    a checklist header keep their text under CORRECTIONS CHECKLIST; parked
+    items go to NOTES / PARKED; imperative sentences route to NEXT ACTION;
+    gate/state sentences to BLOCKED ON / GATE. Concerns are routed in their own
+    words — never paraphrased, never invented. STATUS states the first action's
+    readiness ("Ready to start." / "In progress.").
+    """
+    if len(text) < _WORTH_STRUCTURING or _looks_structured(text):
+        return text
+    lines = [ln for ln in (_normalize_source_line(raw) for raw in text.split("\n")) if ln]
+    if not lines:
+        return text
+    gate: list[str] = []
+    actions: list[str] = []
+    parked: list[str] = []
+    links: list[str] = []
+    checklist: list[str] = []
+    current: Optional[str] = None  # None | "checklist" | "parked" | "links"
+    for line in lines:
+        header = _SECTION_HEADER_RX.match(line)
+        if header:
+            name = header.group(1).upper()
+            if name.startswith("NOTES"):
+                current = "parked"
+            elif name == "CORRECTIONS CHECKLIST":
+                current = "checklist"
+            elif name == "KEY LINKS":
+                current = "links"
+            else:
+                current = None
+            continue
+        if current == "checklist":
+            item = _LIST_ITEM_RX.match(line)
+            checklist.append(_collapse(item.group(1) if item else line))
+            continue
+        if current == "parked":
+            item = _LIST_ITEM_RX.match(line)
+            parked.append(_collapse(item.group(1) if item else line))
+            continue
+        if current == "links":
+            links.append(line)
+            continue
+        if _LABEL_LINE_RX.match(line) or _RECEIPT_LINE_RX.match(line):
+            links.append(line)
+            continue
+        for sentence in _prose_sentences(line):
+            prefix = _STRUCTURED_PREFIX_RX.match(sentence)
+            body = _strip_structured_prefix(sentence)
+            marker = _LIST_ITEM_RX.match(body)
+            if marker:
+                body = marker.group(1).strip()
+                body = body[:1].upper() + body[1:] if body else body
+            if not body:
+                continue
+            if _LABEL_LINE_RX.match(body):
+                links.append(body)
+                continue
+            if prefix and prefix.group(0).lower().startswith(("acceptance", "deliverable")):
+                checklist.append(_collapse(body))  # acceptance criteria are checkable items
+                continue
+            if _ACTION_RX.match(body):
+                actions.append(body)
+                continue
+            if _PATHISH_RX.search(body):
+                links.append(body)  # reference sentence: keep verbatim for KEY LINKS
+                continue
+            if _GATE_RX.search(body):
+                if gate:
+                    parked.append(body)  # one gate state per note; extras stay visible, parked
+                else:
+                    gate.append(body)
+                continue
+            parked.append(body)  # context/notes default: never a fabricated gate claim
+    sections: dict[str, SectionValue] = {"STATUS": _status_line(actions)}
+    if gate:
+        sections["BLOCKED ON / GATE"] = "\n".join(_ensure_period(s) for s in gate)
+    if actions:
+        sections["NEXT ACTION"] = "\n".join(_ensure_period(_collapse(a)) for a in actions)
+    if links:
+        sections["KEY LINKS"] = links
+    if checklist:
+        sections["CORRECTIONS CHECKLIST"] = checklist
+    if parked:
+        sections["NOTES / PARKED"] = parked
+    return compose_note(sections)
+
+
 def _label_bare_paths(text: str) -> str:
-    return "\n".join(_label_line_paths(line) for line in text.split("\n"))
+    labeled_prev = False
+    out = []
+    for line in text.split("\n"):
+        out.append(_label_line_paths(line, prev_line_labeled=labeled_prev))
+        labeled_prev = "] \u2192" in line
+    return "\n".join(out)
 
 
-def _label_line_paths(line: str) -> str:
-    spans = _paren_spans(line)
+def _label_line_paths(line: str, *, prev_line_labeled: bool = False) -> str:
+    # Paren policy (t_ca4e2742 D decision): a REAL file path is labeled wherever
+    # it appears, including inside prose parentheses — the reader still needs to
+    # find the file. Exemptions keep conforming text byte-exact: (1) a paren
+    # group on a labeled line or its wrapped continuation (the golden's
+    # ``(inside the r334 clean snapshot ~/.shadow/clean/...)`` — a second label
+    # on the same path is pure noise); (2) labeled-link targets. API routes and
+    # slash-commands (/v1/models, /amplify) are carved out — endpoint or
+    # command names, not file references.
+    p_open = _paren_open_spans(line)
+    has_label = "] \u2192" in line or prev_line_labeled
 
     def convert(match: re.Match[str]) -> str:
-        if any(start <= match.start() < end for start, end in spans):
-            return match.group(0)
-        if line[: match.start()].rstrip().endswith("→"):
+        if line[: match.start()].rstrip().endswith("\u2192"):
             return match.group(0)  # already a labeled link's target
         path = match.group(0)
+        if path in _ROUTE_EXEMPT_PATHS:
+            return path
+        start = match.start()
+        if has_label and any(o <= start < e for o, e in p_open):
+            return path  # continuation inside a labeled line's paren group
         label = path.rstrip("/").rsplit("/", 1)[-1]
-        return f"[{label}] → {path}"
+        return f"[{label}] \u2192 {path}"
 
     return _PATH_TOKEN.sub(convert, line)
 
 
-def _paren_spans(line: str) -> list[tuple[int, int]]:
-    """Spans of balanced ``(...)`` groups; paths inside parens are prose, not pointers."""
+def _paren_open_spans(line: str) -> list[tuple[int, int]]:
+    """Spans from each ``(`` to the end of its balanced ``(...)`` group."""
     spans: list[tuple[int, int]] = []
     depth = 0
     start = 0
@@ -266,4 +543,6 @@ def _paren_spans(line: str) -> list[tuple[int, int]]:
             depth -= 1
             if depth == 0:
                 spans.append((start, i + 1))
+    if depth:  # unclosed group: treat as open to end of line
+        spans.append((start, len(line)))
     return spans
