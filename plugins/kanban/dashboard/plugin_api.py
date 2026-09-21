@@ -30,8 +30,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_output_tracing as kot
 from hermes_cli.kanban_readability import (
-    apply_render_guards,
     blocked_creator_keys,
     dedup_activity_events,
 )
@@ -305,7 +305,9 @@ def get_board(
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            preview = full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
+            d = _task_dict(t, latest_summary=preview)
+            kot.record_emission(surface="card_preview", task_id=t.id, output=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -362,18 +364,22 @@ def get_task(
         # double-stamped initial blocked transition is collapsed from activity.
         task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
         if task_d.get("body"):
-            task_d["body"] = apply_render_guards(task_d["body"])
+            task_d["body"] = kot.guarded_text(task_d["body"], surface="task_body", task_id=task_id)
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
         comments = kanban_db.list_comments(conn, task_id)
         for comment in comments:
-            comment.body = apply_render_guards(comment.body)
+            comment.body = kot.guarded_text(comment.body, surface="comment_body", task_id=task_id)
+        raw_events = [asdict(e) for e in kanban_db.list_events(conn, task_id)]
+        deduped_events = dedup_activity_events(raw_events)
+        kot.record_emission(surface="activity_dedup", task_id=task_id,
+                            counts={"events_in": len(raw_events), "events_out": len(deduped_events)})
         return {
             "task": task_d,
             "comments": [asdict(c) for c in comments],
-            "events": dedup_activity_events([asdict(e) for e in kanban_db.list_events(conn, task_id)]),
+            "events": deduped_events,
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": [
@@ -1709,7 +1715,12 @@ class _EventTail:
                 payload = None
             out.append({**dict(r), "payload": payload})
         self._blocked_creators.extend(blocked_creator_keys(out))
-        return (rows[-1]["id"] if rows else cursor), dedup_activity_events(out, self._blocked_creators)
+        deduped = dedup_activity_events(out, self._blocked_creators)
+        if out:
+            kot.record_emission(surface="ws_activity_dedup", task_id=str(self._board or "default"),
+                                counts={"events_in": len(out), "events_out": len(deduped),
+                                        "through_event_id": rows[-1]["id"]})
+        return (rows[-1]["id"] if rows else cursor), deduped
 
     def _close(self) -> None:
         if self._conn is not None:
