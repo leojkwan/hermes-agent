@@ -79,12 +79,15 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     """Workers must end with a terminal board tool (kanban_complete / kanban_block /
     kanban_request_review / kanban_request_changes); a narrated stop is recorded
-    as protocol_violation, so nudge once or twice first."""
+    as protocol_violation, so nudge once or twice first. A lane with no board
+    tools bound gets the workspace-terminal-marker nudge instead (its compliant
+    exit path), and the marker alone satisfies the guard."""
     try:
-        from agent.kanban_stop import build_kanban_stop_nudge
+        from agent.kanban_stop import agent_has_kanban_tools, build_kanban_stop_nudge
 
         return build_kanban_stop_nudge(
-            messages=messages, attempts=getattr(agent, "_kanban_stop_nudges", 0)
+            messages=messages, attempts=getattr(agent, "_kanban_stop_nudges", 0),
+            lane_has_kanban_tools=agent_has_kanban_tools(agent),
         )
     except Exception:
         logger.debug("kanban stop-loop check failed", exc_info=True)
@@ -165,7 +168,8 @@ def apply_stop_gates(
         )
         agent._emit_diagnostic_status(
             "⚠️ Kanban worker tried to exit without a terminal board call "
-            "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
+            "(kanban_complete/kanban_request_review/kanban_request_changes/kanban_block) "
+            "— nudging to finish"
         )
         return verdict
     return StopGateVerdict(
