@@ -155,3 +155,79 @@ def _reset_prompt_toolkit_output_cache():
     _clear()
     yield
     _clear()
+
+
+# ---- cli module-state isolation for stubbed-reload test files ----
+# Several Tier-1 test files below build a real HermesCLI via the
+# ``_make_cli()`` pattern: ``importlib.reload(cli)`` while every
+# prompt_toolkit module is a MagicMock stub. ``patch.dict(sys.modules)``
+# restores ``sys.modules`` on exit but NOT the ~20 names the reload already
+# bound on the ``cli`` module (``_pt_print``, ``_PT_ANSI``, a rebuilt
+# ``HermesCLI`` class, ...), so later tests rendering through cli see
+# silently empty output — the order-dependent failure class first proven on
+# test_skill_collision_visibility (t_41a981d1). The shared snapshot/restore
+# helper (``_cli_state_restore.py``) puts the ORIGINAL objects back; see that
+# module's docstring for the mechanism and the deliberately-chosen no-reload
+# restore.
+#
+# The fixtures below apply it ONLY to the files on these allowlists — tests
+# in the other files of this directory are untouched (no behavior change, no
+# per-test overhead beyond one filename check).
+#
+# ``test_prompt_stash_cli.py`` gets the module-scoped variant because its
+# module-scoped ``cli`` fixture reloads once per file and shares one
+# HermesCLI across tests: a function-scoped restore there would snapshot
+# AFTER that reload and never clean it. Autouse module-scoped fixtures
+# instantiate before the module's ``cli`` fixture and are finalized after it
+# (LIFO), so the reload lands inside the snapshot window and the original
+# state comes back at module end.
+#
+# The original single-file fixture lived in test_cli_preloaded_skills.py
+# (t_41a981d1) and was hoisted here — same snapshot/restore body, verbatim.
+
+_CLI_STATE_RESTORE_FILES = frozenset(
+    {
+        "test_cli_background_busy_path.py",
+        "test_cli_steer_busy_path.py",
+        "test_cli_interrupt_drain_regression.py",
+        "test_cli_extension_hooks.py",
+        "test_cli_new_session.py",
+        "test_cli_interrupt_ack_race.py",
+        "test_cli_user_message_preview.py",
+        "test_cli_preloaded_skills.py",
+        "test_tool_progress_scrollback.py",
+    }
+)
+_CLI_STATE_RESTORE_MODULE_FILES = frozenset({"test_prompt_stash_cli.py"})
+
+
+@pytest.fixture(autouse=True)
+def _restore_cli_module_state(request):
+    """Per-test snapshot/restore of the state the stubbed reload poisons."""
+    if request.path.name not in _CLI_STATE_RESTORE_FILES:
+        yield
+        return
+    from tests.hermes_cli._cli_state_restore import (
+        restore_cli_module_state,
+        snapshot_cli_module_state,
+    )
+
+    saved = snapshot_cli_module_state()
+    yield
+    restore_cli_module_state(saved)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_cli_module_state_per_module(request):
+    """Module-scoped variant for files whose module-scoped fixture reloads cli."""
+    if request.path.name not in _CLI_STATE_RESTORE_MODULE_FILES:
+        yield
+        return
+    from tests.hermes_cli._cli_state_restore import (
+        restore_cli_module_state,
+        snapshot_cli_module_state,
+    )
+
+    saved = snapshot_cli_module_state()
+    yield
+    restore_cli_module_state(saved)
