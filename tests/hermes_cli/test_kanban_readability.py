@@ -193,14 +193,23 @@ def test_task_id_expansion():
 
 
 def test_paren_paths_labeled_routes_exempt():
-    # A REAL file path inside prose parentheses is labeled (D decision, t_ca4e2742).
+    # A REAL file path inside prose parentheses is restructured into the
+    # labeled shape (D decision, t_ca4e2742): label arrow first, then the
+    # remaining paren prose as continuation.
     real = "Gate after the walkthrough (/Users/leokwan/.hermes/cache/scratch/r334-corrections.md)."
     guarded = apply_render_guards(real)
-    assert "[r334-corrections.md] → /Users/leokwan/.hermes/cache/scratch/r334-corrections.md" in guarded
+    assert "walkthrough [r334-corrections.md] → /Users/leokwan/.hermes/cache/scratch/r334-corrections.md." in guarded
 
-    # API routes and slash-commands are not file references — untouched.
-    routes = "Confirm via GET /v1/models and run /amplify; docs/design/x is relative."
-    assert apply_render_guards(routes) == routes
+    # Paren-wrapped with prose: every word kept, path labeled.
+    wrapped = "Confirm the shape (e.g., GET /v1/models) before cutting over."
+    labeled = apply_render_guards(wrapped)
+    assert "[models] → /v1/models (e.g., GET)" in labeled
+    assert "before cutting over." in labeled
+
+    # Slash-command tokens are labeled like any other path — the rubric counts
+    # them bare otherwise.
+    cmd = "(the /amplify goal above, with claim commands)"
+    assert "[amplify] → /amplify (the goal above, with claim commands)" in apply_render_guards(cmd)
 
     # A continuation paren group on a labeled line keeps its inner paths verbatim.
     continuation = "[x] → docs/design/scan-wait-r1/\n  (inside ~/.shadow/clean/snap)"
