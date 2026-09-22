@@ -28,10 +28,14 @@ def test_two_intervals_fire_proportionally_and_cancel_stops_one():
 
     h_fast.cancel(wait=1.0)
     n_fast = len(fast)
-    # Wait (don't fixed-sleep) for more sibling ticks: under runner load a 0.05s-interval
-    # callback can jitter >100ms between ticks, so a 0.1s window can land zero new ones
-    # (observed: tick at +0.125s) even though the sibling is alive and firing.
-    assert _wait_until(lambda: len(slow) >= 5), "sibling callback stopped when another was cancelled"
+    n_slow = len(slow)
+    # Wait for ticks RELATIVE to the cancel (not an absolute count): the window must stay
+    # open long enough to catch a cancelled callback still firing. An absolute bound can
+    # already be satisfied at cancel time and return instantly, leaving the `fast` check
+    # below no elapsed time to observe. Under runner load a 0.05s-interval callback can
+    # jitter >100ms between ticks, so a fixed 0.1s sleep lands zero ticks (observed at
+    # +0.125s) even though the sibling is alive and firing.
+    assert _wait_until(lambda: len(slow) >= n_slow + 2), "sibling callback stopped when another was cancelled"
     assert len(fast) == n_fast, "cancelled callback kept firing"
     h_slow.cancel(wait=1.0)
     # With every handle quiesced, scheduling + cancelling adds no persistent thread.
