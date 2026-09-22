@@ -2019,6 +2019,6 @@ def _join_auto_title_threads(monkeypatch):
 
             logging.getLogger(__name__).debug(
                 "auto-title threads still alive at teardown: %s",
-                [th.name for th in still],
+                [getattr(th, "name", repr(th)) for th in still],
             )
 
