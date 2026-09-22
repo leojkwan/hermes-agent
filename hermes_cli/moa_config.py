@@ -197,7 +197,7 @@ def validate_moa_payload(raw: Any) -> list[str]:
 
         refs = preset.get("reference_models")
         if not isinstance(refs, list):
-            refs = [refs] if isinstance(refs, dict) else []
+            refs = [refs] if isinstance(refs) else []
         issues = [(index, _slot_problem(slot)) for index, slot in enumerate(refs)]
         problems.extend(f"preset '{label}' reference {index + 1}: {issue}" for index, issue in issues if issue)
         if all(issue for _, issue in issues):
@@ -206,6 +206,39 @@ def validate_moa_payload(raw: Any) -> list[str]:
         agg_issue = _slot_problem(preset.get("aggregator"))
         if agg_issue:
             problems.append(f"preset '{label}' aggregator: {agg_issue}")
+        else:
+            # An enabled advisor on the aggregator's own provider makes the fan-out compete
+            # with the acting model for the same quota seat (MoA brief finding #1 — the
+            # session-limit crashes that parked work for hours came from exactly this shape).
+            agg_provider = str(preset["aggregator"].get("provider") or "").strip().lower()
+            for index, slot in enumerate(refs):
+                if isinstance(slot, dict) and _coerce_bool(slot.get("enabled"), True) \
+                        and str(slot.get("provider") or "").strip().lower() == agg_provider:
+                    problems.append(
+                        f"preset '{label}' reference {index + 1}: enabled advisor provider "
+                        f"'{slot.get('provider')}' matches the aggregator's provider — same-seat "
+                        f"quota contention; move the advisor to an independent provider"
+                    )
+
+        problems.extend(f"preset '{label}' gate: {issue}" for issue in _gate_problems(preset.get("gate")))
+    return problems
+
+
+def _gate_problems(raw: Any) -> list[str]:
+    """Write-time problems for a preset's ``gate`` block (empty = valid)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return ["must be an object ({mode, min_chars})"]
+    problems: list[str] = []
+    mode = raw.get("mode")
+    if mode is not None and str(mode).strip().lower() not in ("always", "heuristic"):
+        problems.append(f"mode must be 'always' or 'heuristic' (got {mode!r})")
+    min_chars = raw.get("min_chars")
+    if min_chars is not None:
+        number = _coerce_number(min_chars, int)
+        if number is None or number < 1:
+            problems.append(f"min_chars must be a positive integer (got {min_chars!r})")
     return problems
 
 
@@ -216,6 +249,14 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
     cleaned = (_clean_slot(item, include_enabled=True) for item in _reference_slots(raw.get("reference_models")))
     refs = [item for item in cleaned if item is not None]
     policy = str(raw.get("degraded_reference_policy") or "loud").strip().lower()
+    gate = raw.get("gate") if isinstance(raw.get("gate"), dict) else None
+    gate_clean: dict[str, Any] | None = None
+    if gate:
+        mode = str(gate.get("mode") or "always").strip().lower()
+        gate_clean = {"mode": mode if mode in ("always", "heuristic") else "always"}
+        min_chars = _coerce_number(gate.get("min_chars"), int)
+        if gate_clean["mode"] == "heuristic" and min_chars and min_chars > 0:
+            gate_clean["min_chars"] = int(min_chars)
     return {
         "enabled": _coerce_bool(raw.get("enabled"), True),
         "reference_models": refs or _default_reference_models(),
@@ -226,6 +267,8 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         "reference_timeout": _coerce_reference_timeout(raw.get("reference_timeout")),
         # Failed-advisor disclosure policy; unknown values fail loud.
         "degraded_reference_policy": policy if policy in {"loud", "silent"} else "loud",
+        # Engagement gate (None = always fan out on on-cadence turns, current behavior).
+        "gate": gate_clean,
 
         # "user_turn" (default, cheapest): advisors run ONCE per user turn; "per_iteration": every
         # tool iteration; "every_n:<N>": first iteration of each turn and every Nth after.
@@ -235,7 +278,7 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
 _FLAT_PRESET_KEYS = (
     "reference_models", "aggregator", "reference_temperature", "aggregator_temperature",
     "reference_timeout", "degraded_reference_policy",
-    "fanout", "enabled")
+    "fanout", "gate", "enabled")
 
 
 # When the reference fan-out runs. "user_turn" (default) runs the advisors ONCE per user turn (the original

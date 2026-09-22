@@ -172,6 +172,8 @@ class _RefAccounting:
     model: str | None = None
     provider: str | None = None
     temperature: Any = None
+    # Wall-clock seconds of the advisor call (None when unmeasured).
+    latency_s: Any = None
 
 
 # Per-tool-result char budget for the advisory view: tool CALLS are kept in full,
@@ -376,36 +378,41 @@ def _run_reference(
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
-    try:
-        # Trim to THIS model's window (advisors may be smaller than the aggregator); the
-        # advisory view is append-only across iterations, so cache_control lets
-        # iteration N+1 replay N's cached prefix.
-        # Reference models may have a smaller window than the aggregator (e.g. kimi-k2.7-code @ 262K
-        # advising a glm-5.2 @ 1M conversation); without this trim the provider returns a hard HTTP 400
-        # which the except below silently converts to a [failed: …] note (issue #60345). Estimated AFTER the
-        # advisory system prompt is prepended so its tokens count against the budget too.
-        trimmed = _trim_messages_for_reference(
-            messages, slot, runtime, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache,
-        )
-        trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
+    # Trim to THIS model's window (advisors may be smaller than the aggregator); the
+    # advisory view is append-only across iterations, so cache_control lets
+    # iteration N+1 replay N's cached prefix.
+    # Reference models may have a smaller window than the aggregator (e.g. kimi-k2.7-code @ 262K
+    # advising a glm-5.2 @ 1M conversation); without this trim the provider returns a hard HTTP 400
+    # which the except below silently converts to a [failed: …] note (issue #60345). Estimated AFTER the
+    # advisory system prompt is prepended so its tokens count against the budget too.
+    trimmed = _trim_messages_for_reference(
+        messages, slot, runtime, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache,
+    )
+    trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
 
-        # Copilot gates premium models on request attribution; MoA fan-out serves the
-        # user's current turn, so mirror the main agent's x-initiator header.
-        from agent.auxiliary_client import _normalize_aux_provider
-        is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
+    # Copilot gates premium models on request attribution; MoA fan-out serves the
+    # user's current turn, so mirror the main agent's x-initiator header.
+    from agent.auxiliary_client import _normalize_aux_provider
+    is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
+    _t0 = time.monotonic()
+    try:
         response = call_llm(
             task="moa_reference", messages=trimmed, temperature=temperature,
             max_tokens=max_tokens,
             timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
             extra_headers={"x-initiator": "user"} if is_copilot else None, **runtime,
         )
+        latency_s = time.monotonic() - _t0
         output_text = _extract_text(response) or "(empty response)"
-        acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
+        acct = _RefAccounting(
+            *_price_reference_response(response, slot, runtime),
+            messages=trimmed, output=output_text, latency_s=latency_s, **trace_fields,
+        )
         return label, output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
         note = f"[failed: {exc}]"
-        return label, note, _RefAccounting(CanonicalUsage(), messages=messages, output=note, **trace_fields)
+        return label, note, _RefAccounting(CanonicalUsage(), messages=messages, output=note, latency_s=time.monotonic() - _t0, **trace_fields)
 
 
 # Output headroom reserved in the reference window when reference_max_tokens is unset.
@@ -790,6 +797,96 @@ def _degraded_notice(failed_labels: list[str], policy: str) -> str:
     return f"[Reference models unavailable: {', '.join(failed_labels)}]"
 
 
+# Default minimum length (chars) of the last real user message below which the
+# gating heuristic routes the turn straight to the acting model. Short messages
+# ("ok", "thanks", "ship it") don't benefit from advisory synthesis; the gate
+# keeps them snappy. Config-driven per preset (moa.presets.<name>.gate.min_chars).
+_DEFAULT_GATE_MIN_CHARS = 120
+
+
+def _gate_decision(preset: dict[str, Any], ref_messages: list[dict[str, Any]]) -> tuple[bool, dict[str, Any]]:
+    """Engagement-gate decision for this turn: ``(bypass, decision_record)``.
+
+    ``gate.mode``: ``"always"`` (default — current behavior, fan out on every
+    on-cadence turn) or ``"heuristic"`` (bypass trivial turns: last real user
+    message shorter than ``gate.min_chars`` chars). Unknown modes never bypass
+    (they fail toward today's behavior) but are reported in the record.
+    """
+    gate = preset.get("gate") if isinstance(preset.get("gate"), dict) else {}
+    mode = str((gate or {}).get("mode") or "always").strip().lower()
+    record: dict[str, Any] = {"mode": mode or "always"}
+    if mode != "heuristic":
+        if mode not in ("", "always"):
+            record["unknown_mode"] = True
+        return False, record
+    min_chars = _DEFAULT_GATE_MIN_CHARS
+    raw_min = (gate or {}).get("min_chars")
+    if isinstance(raw_min, (int, float)) and raw_min > 0:
+        min_chars = int(raw_min)
+    record["min_chars"] = min_chars
+    # Last REAL user message (the synthetic advisory marker must not count).
+    last_user = next(
+        (m for m in reversed(ref_messages)
+         if m.get("role") == "user" and m.get("content") != _ADVISORY_INSTRUCTION),
+        None,
+    )
+    text = flatten_message_text(last_user.get("content")) if last_user else ""
+    record["user_chars"] = len(text)
+    bypass = len(text) < min_chars
+    record["bypass"] = bypass
+    return bypass, record
+
+
+def _fanout_summary(
+    preset_name: str, reference_outputs: list[tuple[str, str, Any]], wall_clock_s: float,
+) -> dict[str, Any]:
+    """One structured record per fan-out: proposer latencies, token counts,
+    estimated cost, which proposers contributed, and the fan-out wall clock.
+
+    Emitted as a single JSON log line (``moa_fanout …``) and persisted in the
+    turn trace (``fanout_summary``) so the topology can be tuned from evidence.
+    Cost/status None means unmeasured, not free.
+    """
+    slots: dict[str, Any] = {}
+    usage = CanonicalUsage()
+    cost: Any = None
+    priced = False
+    contributing: list[str] = []
+    failed: list[str] = []
+    for label, text, acct in reference_outputs:
+        u = getattr(acct, "usage", None)
+        slot_cost = getattr(acct, "cost_usd", None)
+        entry: dict[str, Any] = {
+            "latency_s": getattr(acct, "latency_s", None),
+            "input_tokens": getattr(u, "input_tokens", 0) if u is not None else 0,
+            "output_tokens": getattr(u, "output_tokens", 0) if u is not None else 0,
+            "cost_usd": slot_cost,
+            "cost_status": getattr(acct, "cost_status", None),
+            "cost_source": getattr(acct, "cost_source", None),
+        }
+        slots[label] = entry
+        if isinstance(u, CanonicalUsage):
+            usage = usage + u
+        if slot_cost is not None:
+            cost = (cost or 0) + slot_cost
+            priced = True
+        (failed if _is_failed_reference(text) else contributing).append(label)
+    return {
+        "preset": preset_name,
+        "wall_clock_s": round(wall_clock_s, 3),
+        "slots": len(reference_outputs),
+        "contributing": contributing,
+        "failed": failed,
+        "totals": {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cost_usd": cost if priced else None,
+            "cost_status": "measured" if priced else "unpriced",
+        },
+        "per_slot": slots,
+    }
+
+
 def _slot_labels(slots: list[dict[str, Any]]) -> str:
     return ", ".join(_slot_label(slot) for slot in slots)
 
@@ -1042,6 +1139,8 @@ class MoAChatCompletions:
                 aggregator_provider=agg_slot.get("provider"), aggregator_temperature=pending.get("aggregator_temperature"),
                 aggregator_input_messages=pending.get("aggregator_input_messages"),
                 aggregator_output=agg_output, aggregator_streamed=bool(pending.get("aggregator_streamed")),
+                fanout_summary=pending.get("fanout_summary"),
+                aggregator_latency_s=pending.get("aggregator_latency_s"),
             )
         except Exception as exc:  # pragma: no cover - tracing must never break a turn
             logger.debug("MoA trace flush failed: %s", exc)
@@ -1139,8 +1238,13 @@ class MoAChatCompletions:
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,
         )
+        if trace is not None:
+            trace["aggregator_latency_s"] = None
+        _agg_t0 = time.monotonic()
         try:
             agg_response = send(messages=agg_messages)
+            if trace is not None:
+                trace["aggregator_latency_s"] = time.monotonic() - _agg_t0
         except Exception as exc:
             # Strict-alternation template rejected ``user(task), user(guidance)``: merge the pair for
             # THIS destination only and retry once; remember it so later iterations pre-merge.
@@ -1244,6 +1348,7 @@ class MoAChatCompletions:
         is never capped. None timeout = inherit auxiliary.moa_reference.timeout.
         """
         raw_reference_timeout = preset.get("reference_timeout")
+        _fanout_t0 = time.monotonic()
         reference_outputs = _run_references_parallel(
             reference_models, ref_messages, temperature=_preset_temperature(preset, "reference_temperature"),
 
@@ -1251,6 +1356,11 @@ class MoAChatCompletions:
             reference_timeout=float(raw_reference_timeout) if raw_reference_timeout else None,
             agent=self._agent, late_accounting_sink=self._record_late_reference_accounting,
         )
+        fanout_wall_clock_s = time.monotonic() - _fanout_t0
+        # One structured record per fan-out (proposer latencies, tokens, estimated
+        # cost, contributors, wall clock) — the observability the topology is tuned from.
+        self._last_fanout_summary = _fanout_summary(self.preset_name, reference_outputs, fanout_wall_clock_s)
+        logger.info("moa_fanout %s", json.dumps(self._last_fanout_summary, ensure_ascii=False, default=str))
         # An interrupted fan-out is a partial snapshot: never cache it (a HIT would
         # replay placeholder notes every iteration).
         interrupted = any(text == _INTERRUPTED_REFERENCE_NOTE for _lbl, text, _acct in reference_outputs)
@@ -1267,6 +1377,7 @@ class MoAChatCompletions:
         self._pending_trace = {
             "preset": self.preset_name, "reference_outputs": trace_refs,
             "aggregator_slot": aggregator, "aggregator_temperature": aggregator_temperature,
+            "fanout_summary": getattr(self, "_last_fanout_summary", None),
         }
         # Derived from the privacy-redacted trace_refs.
         try:
@@ -1345,6 +1456,22 @@ class MoAChatCompletions:
             slot for slot in (preset.get("reference_models") or []) if slot.get("enabled", True)
         ] if preset.get("enabled", True) else []
         aggregator = preset.get("aggregator") or {}
+        # Never place an advisor on the aggregator's own provider: the fan-out would
+        # compete with the acting model for the same quota seat (MoA brief finding #1 —
+        # two session-limit crashes came from exactly this shape). Warn loudly at
+        # runtime; the write-boundary validator (validate_moa_payload) rejects it.
+        agg_provider = str(aggregator.get("provider") or "").strip().lower()
+        colliding = [
+            _slot_label(slot) for slot in reference_models
+            if agg_provider and str(slot.get("provider") or "").strip().lower() == agg_provider
+        ]
+        if colliding and not getattr(self, "_warned_same_provider", False):
+            self._warned_same_provider = True
+            logger.warning(
+                "MoA preset '%s': advisor slot(s) %s share the aggregator's provider '%s' — "
+                "same-seat quota contention; move the advisor to an independent provider",
+                self.preset_name, ", ".join(colliding), agg_provider,
+            )
         # The MoA path's virtual model/provider have no pricing entry; expose the real slot.
         self.last_aggregator_slot = dict(aggregator) if aggregator else None
         # None = provider default (see _preset_temperature); the acting agent's own
@@ -1362,7 +1489,17 @@ class MoAChatCompletions:
             reference_outputs = list(self._ref_cache_outputs)
             self._pending_trace = None
         else:
-            reference_outputs = self._run_fanout(preset, ref_messages, reference_models, aggregator, aggregator_temperature, cache_key)
+            bypass, gate_record = _gate_decision(preset, ref_messages)
+            if bypass:
+                # Trivial turn: skip the fan-out entirely and let the acting model
+                # answer alone (fast path). Not cached — a later, larger turn is
+                # re-evaluated; the decision is deterministic per turn so no spend.
+                reference_outputs = []
+                self._pending_trace = None
+                self._last_fanout_summary = None
+                logger.info("moa_gate_bypass %s", json.dumps({"preset": self.preset_name, **gate_record}))
+            else:
+                reference_outputs = self._run_fanout(preset, ref_messages, reference_models, aggregator, aggregator_temperature, cache_key)
 
         agg_messages = [dict(m) for m in messages]
         guidance = self._build_guidance(

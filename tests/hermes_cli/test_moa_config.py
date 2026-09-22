@@ -133,7 +133,9 @@ def _preset(**extra):
 
 def _valid_preset_payload():
     return {
-        "reference_models": [{"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}],
+        # Advisor on an independent provider: same-provider advisors are rejected by
+        # validate_moa_payload (same-seat quota contention, MoA brief finding #1).
+        "reference_models": [{"provider": "zai", "model": "glm-5.3"}],
         "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
     }
 

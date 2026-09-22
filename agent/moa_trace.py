@@ -45,7 +45,7 @@ def _sanitize_session_id(session_id: Optional[str]) -> str:
 
 
 _USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
-_ACCT_FIELDS = ("model", "provider", "temperature")
+_ACCT_FIELDS = ("model", "provider", "temperature", "latency_s")
 _COST_FIELDS = ("cost_usd", "cost_status", "cost_source")
 
 
@@ -76,7 +76,8 @@ def save_moa_turn(
     *, session_id: Optional[str], preset_name: str, reference_outputs: list[tuple[str, str, Any]],
     aggregator_label: str, aggregator_model: Optional[str], aggregator_provider: Optional[str],
     aggregator_temperature: Any, aggregator_input_messages: Any, aggregator_output: Optional[str],
-    aggregator_streamed: bool,
+    aggregator_streamed: bool, fanout_summary: Optional[dict[str, Any]] = None,
+    aggregator_latency_s: Optional[float] = None,
 ) -> None:
     """Append one full MoA turn record to the session's trace JSONL, if enabled.
 
@@ -102,9 +103,11 @@ def save_moa_turn(
             "session_id": session_id,
             "preset": preset_name,
             "references": [_slot_trace(acct, label) for label, _text, acct in reference_outputs],
+            "fanout_summary": fanout_summary,
             "aggregator": {
                 "label": aggregator_label, "model": aggregator_model,
                 "provider": aggregator_provider, "temperature": aggregator_temperature,
+                "latency_s": aggregator_latency_s,
                 "input_messages": aggregator_input_messages, "output": aggregator_output,
                 "streamed": aggregator_streamed, "output_location": output_location,
             },
