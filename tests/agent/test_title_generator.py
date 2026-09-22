@@ -430,7 +430,10 @@ class TestMaybeAutoTitle:
             {"role": "user", "content": "hello"},
         ]
 
-        with patch("agent.title_generator.auto_title_session") as mock_auto:
+        # The conftest sandbox defaults the upgrade THREAD off (its forced failure print
+        # segfaults workers mid-capture-swap); this test IS about the thread spawn, so force it on.
+        with patch("agent.title_generator._model_title_upgrade_enabled", return_value=True), \
+             patch("agent.title_generator.auto_title_session") as mock_auto:
             import threading
             called = threading.Event()
             mock_auto.side_effect = lambda *a, **k: called.set()
@@ -507,7 +510,8 @@ class TestMaybeAutoTitle:
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="child-1", source="kanban")
 
-        with delegated_child_context(), patch("agent.title_generator.auto_title_session") as mock_auto:
+        with patch("agent.title_generator._model_title_upgrade_enabled", return_value=True), \
+             delegated_child_context(), patch("agent.title_generator.auto_title_session") as mock_auto:
             maybe_auto_title(db, "child-1", "research the auth flow for the parent", [])
 
         assert db.get_session_title("child-1") != "Kanban task t_parent"
@@ -824,7 +828,8 @@ class TestRuntimeValidator:
         def _v():
             return True
 
-        with patch("agent.title_generator.auto_title_session") as mock_auto:
+        with patch("agent.title_generator._model_title_upgrade_enabled", return_value=True), \
+             patch("agent.title_generator.auto_title_session") as mock_auto:
             import threading
             called = threading.Event()
             mock_auto.side_effect = lambda *a, **k: called.set()
@@ -899,7 +904,8 @@ class TestModelSwitchMarkerNotTitleable:
             {"role": "user", "content": "南京市秦淮区 小时级天气预报"},
         ]
 
-        with patch("agent.title_generator.auto_title_session") as mock_auto:
+        with patch("agent.title_generator._model_title_upgrade_enabled", return_value=True), \
+             patch("agent.title_generator.auto_title_session") as mock_auto:
             import threading
 
             called = threading.Event()

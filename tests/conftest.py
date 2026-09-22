@@ -96,6 +96,19 @@ def _hermes_home_points_at_production(value: str) -> bool:
 if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+    # Kill the stage-2 model-upgrade TITLE THREAD for the whole pytest session: it outlives
+    # its test and its failure callback forced-prints to a stdout object another thread is
+    # concurrently replacing/closing in pytest's capture swap — a CPython 3.11/darwin SEGFAULT,
+    # reproduced ~1-in-6 in isolation (faulthandler frame: title_generator._report_failure ->
+    # status_output._safe_print on the auto-title thread). Titler tests patch the flags they
+    # exercise, so coverage is unchanged; this stops REAL thread spawns from incidental turns.
+    try:
+        with open(os.path.join(_SESSION_HERMES_HOME, "config.yaml"), "w", encoding="utf-8") as _cfg:
+            _cfg.write(
+                "auxiliary:\n  title_generation:\n    model_upgrade_enabled: false\n"
+            )
+    except Exception:
+        pass
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
 # Subprocess-surviving isolation marker (#82770). PYTEST_CURRENT_TEST /
@@ -498,6 +511,17 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
+    # Stage-2 title THREAD OFF by default in the per-test home too (see session-sandbox note):
+    # the daemon thread outliving its test forced-prints during pytest capture swaps and SEGFAULTS
+    # the worker on darwin/CPython 3.11 (~1-in-6 isolated). Titler tests patch the flags they
+    # exercise, so coverage is unchanged.
+    try:
+        (fake_hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  title_generation:\n    model_upgrade_enabled: false\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
     # Keep the subprocess-surviving isolation marker pointed at THIS test's
     # home (#82770): children spawned by the test inherit it by default, so
@@ -1950,3 +1974,50 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _join_auto_title_threads(monkeypatch):
+    """Drain in-flight auto-title upgrade threads at test teardown.
+
+    The conftest sandbox homes default ``auxiliary.title_generation.model_upgrade_enabled``
+    to false, so incidental agent turns never spawn the stage-2 titler thread (its forced
+    failure print during pytest's capture swap SEGFAULTs the worker on darwin/CPython 3.11 —
+    reproduced ~1-in-6 on tests/gateway/test_timestamp_sidecar_replay.py; faulthandler frame:
+    status_output._safe_print <- run_agent._emit_auxiliary_failure <- title_generator
+    ._report_failure on the auto-title thread). This join is the second line of defense for
+    tests that explicitly re-enable the thread: the production ``wait_for_title_upgrades``
+    join only runs on the ``-z`` oneshot path.
+    """
+    import agent.memory_provider as _mp
+
+    _spawned = []
+    _orig_spawn = _mp.spawn_context_thread
+
+    def _spy(target, **kw):
+        th = _orig_spawn(target, **kw)
+        _spawned.append(th)
+        return th
+
+    monkeypatch.setattr(_mp, "spawn_context_thread", _spy)
+    try:
+        yield
+    finally:
+        deadline = None
+        for th in _spawned:
+            if deadline is None:
+                import time as _time
+
+                deadline = _time.monotonic() + 5.0
+            th.join(timeout=max(0.0, deadline - _time.monotonic()))
+        still = [th for th in _spawned if th.is_alive()]
+        if still:
+            # Last resort so a straggler cannot print into a torn-down capture: the
+            # daemon thread dies with the process anyway; nothing user-visible is lost.
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "auto-title threads still alive at teardown: %s",
+                [th.name for th in still],
+            )
+
