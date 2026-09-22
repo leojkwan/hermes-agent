@@ -152,7 +152,14 @@ class TestWorkerTeardownOnCeiling:
             worker=stuck_worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
+            # Idle expiry must stay out of this total-ceiling test under
+            # runner load: a starved worker thread that misses its 0.02s
+            # progress cadence by >idle_timeout trips the idle path, which
+            # legitimately releases the lease and defeats the pin. A wide
+            # idle window (2.0s > 0.3s ceiling) leaves only the TOTAL
+            # ceiling able to expire — same guard as the sibling
+            # cooperative test above.
+            idle_timeout_seconds=2.0,
             total_ceiling_seconds=0.3,
             fence=fence,
             stall_fallback=False,
