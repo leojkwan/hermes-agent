@@ -41,9 +41,16 @@ def test_swap_retries_transient_permission_error_then_promotes(tmp_path, monkeyp
     desktop_dir, staging, live_exe, slept = _staged_over_live(tmp_path, monkeypatch)
     real_rename = os.rename
     locked = {"n": 0}
+    # The rename unit is the unpacked ROOT (mac-arm64 / win-unpacked /
+    # linux-unpacked): production swaps that directory whole. On linux/win
+    # the exe sits directly in it, so live_exe.parent is the root; on darwin
+    # the exe lives inside the .app bundle (Contents/MacOS), so the root is
+    # live_exe.parents[3] and the old parent gate never matched — no
+    # PermissionError, no retries, empty `slept`.
+    locked_dst = live_exe.parent if sys.platform != "darwin" else live_exe.parents[3]
 
     def scanner_locked_rename(src, dst):
-        if Path(dst) == live_exe.parent and locked["n"] < 2:
+        if Path(dst) == locked_dst and locked["n"] < 2:
             locked["n"] += 1
             raise PermissionError(32, "being used by another process")
         return real_rename(src, dst)
