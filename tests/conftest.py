@@ -511,21 +511,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
-    # Stage-2 title THREAD OFF by default in the per-test home too (see session-sandbox note):
-    # the daemon thread outliving its test forced-prints during pytest capture swaps and SEGFAULTS
-    # the worker on darwin/CPython 3.11 (~1-in-6 isolated). Titler tests patch the flags they
-    # exercise, so coverage is unchanged.
-    try:
-        (fake_hermes_home / "config.yaml").write_text(
-            "auxiliary:\n  title_generation:\n    model_upgrade_enabled: false\n",
-            encoding="utf-8",
-        )
-        # The sandbox must never read as repo dirt: tests that create a git repo in tmp_path
-        # (e.g. the ZIP-overlay guard) run `git status --untracked-files=all` from tmp_path, and
-        # an untracked hermes_test/ entry fails their clean-tree assertion. Self-ignore instead.
-        (fake_hermes_home / ".gitignore").write_text("*\n", encoding="utf-8")
-    except Exception:
-        pass
+    # NOTE: the sandbox stays DIRS-ONLY deliberately. Tests use tmp_path as a repo or a search
+    # root; any sandbox FILE inside it leaks into `git status` (untracked dirt) or grep count
+    # output (zero-count keys). The stage-2 titler default-off is done by monkeypatching the
+    # flag reader in _join_auto_title_threads below, not by writing config.yaml here.
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
     # Keep the subprocess-surviving isolation marker pointed at THIS test's
     # home (#82770): children spawned by the test inherit it by default, so
@@ -1995,6 +1984,12 @@ def _join_auto_title_threads(monkeypatch):
     """
     import agent.memory_provider as _mp
 
+    # Default the stage-2 titler THREAD off for every test: the flag is read per-call from
+    # config, and the per-test sandbox home is dirs-only (see NOTE above), so patch the reader.
+    import agent.title_generator as _tg
+
+    monkeypatch.setattr(_tg, "_model_title_upgrade_enabled", lambda: False)
+
     _spawned = []
     _orig_spawn = _mp.spawn_context_thread
 
@@ -2009,12 +2004,14 @@ def _join_auto_title_threads(monkeypatch):
     finally:
         deadline = None
         for th in _spawned:
+            if not hasattr(th, "join"):
+                continue  # test doubles (e.g. _ImmediateThread) run inline and need no reaping
             if deadline is None:
                 import time as _time
 
                 deadline = _time.monotonic() + 5.0
             th.join(timeout=max(0.0, deadline - _time.monotonic()))
-        still = [th for th in _spawned if th.is_alive()]
+        still = [th for th in _spawned if hasattr(th, "is_alive") and th.is_alive()]
         if still:
             # Last resort so a straggler cannot print into a torn-down capture: the
             # daemon thread dies with the process anyway; nothing user-visible is lost.
