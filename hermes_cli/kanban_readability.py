@@ -349,6 +349,54 @@ _ACTION_RX = re.compile(
 _SENT_SPLIT_RX = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9~`\[])|(?<=;)\s+")
 _LIST_ITEM_RX = re.compile(r"^\s*(?:[-*\u2022\u2023\u25e6\u2043\u2219]|\d+[.)])\s+(.*)$")
 
+# A checklist sentence names its items in a trailing parenthetical, so the whole
+# line routes to KEY LINKS on its path and CORRECTIONS CHECKLIST prints "None." —
+# the buried-checklist failure this template exists to remove. Splitting is keyed
+# on the LABEL, never on "a paren holding commas": the same note carries
+# ``…/scan-wait-r1/ (contract, prototype, state images)`` on its gate line, and a
+# paren-shaped heuristic would shred that into bullets and make the gate worse.
+_CHECKLIST_LABEL_RX = re.compile(r"^(?:corrections\s+checklist|checklist|fixes|to-?dos?)\s*:", re.I)
+_TRAILING_PAREN_RX = re.compile(r"\s*\(([^()]*)\)\s*\.?\s*$")
+_CHECKLIST_ITEM_MAX = 60
+
+
+def _split_checklist_line(body: str) -> tuple[Optional[str], list[str]]:
+    """Split ``Checklist: <path> (a, b, c)`` into its link half and its items.
+
+    Returns ``(link_text, items)``; ``(None, [])`` when the line is not a
+    checklist enumeration, so the caller falls through to normal routing. Every
+    item is a verbatim substring of the author's own words — this re-routes, it
+    never paraphrases or invents.
+    """
+    if not _CHECKLIST_LABEL_RX.match(body):
+        return None, []
+    match = _TRAILING_PAREN_RX.search(body)
+    if not match:
+        return None, []
+    items = [part.strip() for part in re.split(r"[,;]", match.group(1)) if part.strip()]
+    # Guards: an enumeration, not prose. Three-plus short fragments, none of
+    # which carries sentence-terminal punctuation.
+    if len(items) < 3:
+        return None, []
+    if any(len(item) > _CHECKLIST_ITEM_MAX or item.endswith((".", "!", "?")) for item in items):
+        return None, []
+    return body[: match.start()].strip() or None, items
+
+
+_ACTION_CONNECTIVE_RX = re.compile(
+    r"^(?:then|next|also|first|finally|afterwards)\b[,:;]?\s+", re.I
+)
+
+
+def _is_action_sentence(body: str) -> bool:
+    """Imperative match, including after a leading sequencing connective.
+
+    ``Then run the walkthrough.`` is an instruction, not a gate — but a
+    position-0 verb match misses it and the gate regex then eats it on
+    ``walkthrough``, flipping an actionable note to Blocked.
+    """
+    return bool(_ACTION_RX.match(body) or _ACTION_RX.match(_ACTION_CONNECTIVE_RX.sub("", body, count=1)))
+
 
 def _looks_structured(text: str) -> bool:
     return sum(1 for ln in text.split("\n") if _SECTION_HEADER_RX.match(ln)) >= 2
@@ -379,13 +427,26 @@ def _collapse(text: str) -> str:
 
 
 def _ensure_period(sentence: str) -> str:
-    sentence = _collapse(sentence).rstrip()
+    # A clause split off mid-sentence keeps its ';'/',' and reads as a fragment;
+    # the terminator belongs to the sentence it was cut from, not to this line.
+    sentence = _collapse(sentence).rstrip().rstrip(";,")
     return sentence if sentence.endswith((".", "!", "?")) else sentence + "."
 
 
-def _status_line(action_lines: Sequence[str]) -> str:
+def _status_line(action_lines: Sequence[str], *, gated: bool = False, parked: bool = False) -> str:
+    """One honest line about the note's own routing outcome.
+
+    A note whose content routed to BLOCKED ON / GATE is not "In progress" — it is
+    waiting on someone. Claiming progress on gated work is the exact dishonesty
+    this template exists to remove, so STATUS is derived from where the content
+    actually landed, never assumed.
+    """
+    if gated:
+        return "Blocked — awaiting gate."
     if action_lines and _ACTION_RX.match(action_lines[0]):
         return "Ready to start."
+    if parked:
+        return "Parked."
     return "In progress."
 
 
@@ -460,10 +521,19 @@ def recompose_note(text: str) -> str:
             if _LABEL_LINE_RX.match(body):
                 links.append(body)
                 continue
+            link_half, items = _split_checklist_line(body)
+            if items:
+                checklist.extend(items)
+                if link_half:
+                    # Verbatim, like every other KEY LINKS entry. Adding a period
+                    # here puts it *inside* the filename that path labeling later
+                    # matches, yielding "[r334-corrections.md.]".
+                    links.append(link_half)
+                continue
             if prefix and prefix.group(0).lower().startswith(("acceptance", "deliverable")):
                 checklist.append(_collapse(body))  # acceptance criteria are checkable items
                 continue
-            if _ACTION_RX.match(body):
+            if _is_action_sentence(body):
                 actions.append(body)
                 continue
             if _PATHISH_RX.search(body):
@@ -476,17 +546,25 @@ def recompose_note(text: str) -> str:
                     gate.append(body)
                 continue
             parked.append(body)  # context/notes default: never a fabricated gate claim
-    sections: dict[str, SectionValue] = {"STATUS": _status_line(actions)}
+    sections: dict[str, SectionValue] = {
+        "STATUS": _status_line(actions, gated=bool(gate), parked=bool(parked))
+    }
     if gate:
         sections["BLOCKED ON / GATE"] = "\n".join(_ensure_period(s) for s in gate)
     if actions:
         sections["NEXT ACTION"] = "\n".join(_ensure_period(_collapse(a)) for a in actions)
+    elif gate:
+        # Navigational chrome, the same class of thing the "None." filler already
+        # is — it points at the section that holds the answer. Synthesizing an
+        # imperative out of the gate sentence would be paraphrase, which this
+        # layer does not do.
+        sections["NEXT ACTION"] = "Blocked — see BLOCKED ON / GATE."
     if links:
         sections["KEY LINKS"] = links
     if checklist:
         sections["CORRECTIONS CHECKLIST"] = checklist
     if parked:
-        sections["NOTES / PARKED"] = parked
+        sections["NOTES / PARKED"] = [_ensure_period(p) for p in parked]
     return compose_note(sections)
 
 

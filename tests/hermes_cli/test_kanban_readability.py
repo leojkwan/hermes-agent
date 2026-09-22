@@ -289,3 +289,90 @@ def test_dedup_keeps_genuine_blocks_and_parses_string_payloads():
     ]
     kept = dedup_activity_events(events)
     assert [e["id"] for e in kept] == [1, 3, 4]  # twin dropped; unparsed + other-second stay
+
+
+# --- v3 render fixes: checklist routing, honest STATUS, NEXT ACTION pointer ---
+
+_BURIED_NOTE = (
+    "Shadow entity 9c83f1f418d2ef8350d99ef94ee3b95cea2cd1538eabf61ee705224994ab9927, row ~r334. "
+    "Gate: Leo approval after walkthrough of docs/design/review-center/scan-wait-r1/ "
+    "(contract, prototype, state images). "
+    "Corrections checklist: /Users/leokwan/.hermes/cache/scratch/r334-corrections.md "
+    "(Spanish title collision, SVG contrast tokens, 44pt Done target, fact rotation). "
+    "~r335 production UI stays parked until acceptance."
+)
+
+
+def test_buried_checklist_items_route_to_their_section():
+    # Items named in a trailing parenthetical after the checklist's own label are
+    # enumerations, not prose: they belong in CORRECTIONS CHECKLIST, not welded to
+    # the path in KEY LINKS. Keyed on the LABEL — never on "a paren with commas".
+    out = apply_render_guards(_BURIED_NOTE)
+    checklist = out.split("CORRECTIONS CHECKLIST\n", 1)[1].split("\n\n", 1)[0]
+    assert "Spanish title collision" in checklist
+    assert "44pt Done target" in checklist
+    assert "fact rotation" in checklist
+    links = out.split("KEY LINKS\n", 1)[1].split("\n\n", 1)[0]
+    assert "r334-corrections.md" in links
+
+
+def test_gate_paren_with_commas_is_never_shredded_into_checklist_items():
+    # The gate line also carries a comma-paren. Splitting on paren shape would
+    # turn the gate into bullets; only the checklist-labeled line may split.
+    out = apply_render_guards(_BURIED_NOTE)
+    gate = out.split("BLOCKED ON / GATE\n", 1)[1].split("\n\n", 1)[0]
+    assert "(contract, prototype, state images)." in gate
+    assert "contract, prototype, state images" not in out.split(
+        "CORRECTIONS CHECKLIST\n", 1
+    )[1].split("\n\n", 1)[0]
+
+
+def test_gated_note_status_is_not_in_progress():
+    # A note whose content routed to BLOCKED ON / GATE is waiting on someone.
+    # STATUS claiming "In progress." on gated work is the dishonesty the
+    # template exists to remove.
+    out = apply_render_guards(_BURIED_NOTE)
+    status = out.split("STATUS\n", 1)[1].split("\n\n", 1)[0]
+    assert status == "Blocked — awaiting gate."
+
+
+def test_gated_note_next_action_points_at_the_gate():
+    # "None." on the highest-value line is worse than a pointer. The pointer is
+    # navigational chrome (same class as the "None." filler); it does not invent
+    # an imperative from the gate sentence.
+    out = apply_render_guards(_BURIED_NOTE)
+    action = out.split("NEXT ACTION\n", 1)[1].split("\n\n", 1)[0]
+    assert action == "Blocked — see BLOCKED ON / GATE."
+
+
+def test_checklist_link_half_stays_verbatim():
+    # Adding a period to the link half lands it INSIDE the filename
+    # ("[r334-corrections.md.]") once path labeling matches. Links are verbatim.
+    out = apply_render_guards(_BURIED_NOTE)
+    assert "r334-corrections.md." not in out.replace("r334-corrections.md →", "")
+
+
+def test_routed_fragment_terminators_are_not_copied():
+    # A clause split off mid-sentence keeps its ';' — the terminator belongs to
+    # the sentence it was cut from.
+    from hermes_cli.kanban_readability import _ensure_period
+
+    assert _ensure_period("the corpus folds into this acceptance;") == (
+        "the corpus folds into this acceptance."
+    )
+    assert _ensure_period("already done.") == "already done."
+
+
+def test_action_backed_note_keeps_ready_status():
+    # A note that DOES route an imperative keeps the Ready status — the gate-aware
+    # STATUS must not flatten an actionable note into "Blocked". (Note body must
+    # clear _WORTH_STRUCTURING, or recomposition correctly never runs.)
+    note = (
+        "Checklist: /tmp/fixes.md (alpha one, beta two, gamma three, delta four). "
+        "Read the contract first, then review the design folder top to bottom. "
+        "Then run the walkthrough with the full corrections list attached and "
+        "record every answer in the ledger before moving on to the next card."
+    )
+    out = apply_render_guards(note)
+    status = out.split("STATUS\n", 1)[1].split("\n\n", 1)[0]
+    assert status == "Ready to start."
