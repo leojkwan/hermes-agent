@@ -925,8 +925,16 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4)),
+        help=(
+            "Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count). "
+            "Was cpu_count*2: at 48 workers on a 24-core Studio that also runs the "
+            "live gateway/dashboard/Langfuse stack, fork-exec pressure produced "
+            "reproducible interpreter segfaults in subprocess._execute_child "
+            "(tests/agent/test_run_agent.py, darwin) plus ~27 -j48-only failures "
+            "that all pass at -j4. cpu_count is the safe default; set "
+            "HERMES_TEST_WORKERS to override."
+        ),
     )
     parser.add_argument(
         "--paths",

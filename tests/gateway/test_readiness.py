@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from gateway.readiness import collect_runtime_readiness
+import gateway.readiness as _readiness_module
 
 
 def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monkeypatch):
@@ -18,6 +19,14 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
     with sqlite3.connect(home / "state.db") as conn:
         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # The disk check reads the HOST volume, not the test home. On a busy dev
+    # machine above the degraded threshold (93.2% on the Studio) it flipped
+    # the overall status and failed this healthy-runtime pin. Host disk
+    # pressure is not part of the contract here — the assertion below already
+    # accepts either state for the check itself.
+    monkeypatch.setattr(
+        _readiness_module, "_probe_disk", lambda _home: {"status": "ok"}
+    )
 
     result = collect_runtime_readiness(
         configured_model="test/model",

@@ -11,6 +11,7 @@ probe), not specific config snapshots.
 """
 
 import os
+import sys
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -237,6 +238,12 @@ class TestEmbeddedDaemonOverlayFlag:
             cua_backend_driver,
             "_resolve_mcp_invocation",
             return_value=("/usr/bin/cua-driver", ["mcp"]),
+        ), patch(
+            "tools.computer_use.cua_backend_daemon._resolve_cua_driver_app_path",
+            return_value="/Applications/CuaDriver.app",
+        ), patch(
+            "tools.computer_use.cua_backend_daemon._validate_cua_driver_app_signature",
+            return_value=None,
         ), patch.object(
             cua_backend, "_cua_no_overlay", return_value=True,
         ), patch.object(
@@ -249,5 +256,14 @@ class TestEmbeddedDaemonOverlayFlag:
             daemon.start()
 
         command = popen.call_args.args[0]
-        assert command[:2] == ["/usr/bin/cua-driver", "serve"]
+        if sys.platform == "darwin":
+            # macOS launches the signed app bundle via open(1) so TCC stays
+            # attached to com.trycua.driver; the driver binary and serve args
+            # ride after --args (the stubs above supply the app path).
+            assert command[:2] == ["/usr/bin/open", "-n"]
+            assert "/Applications/CuaDriver.app" in command
+            assert "--args" in command
+            assert "serve" in command
+        else:
+            assert command[:2] == ["/usr/bin/cua-driver", "serve"]
         assert "--no-overlay" in command

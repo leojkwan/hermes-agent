@@ -122,7 +122,10 @@ def test_heartbeat_touches_periodically_and_stops():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.12)
+    # ≥6 intervals: under a fully loaded runner (pytest -j 24 on a busy
+    # Studio) a 0.12s window can miss the second touch and fail the ≥2
+    # assertion spuriously. The stop-liveness property is unchanged.
+    time.sleep(0.35)
     stop.set()
     thread.join(timeout=1.0)
 
@@ -157,16 +160,18 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=_slow_execute(delay=0.4),
         display_index=1,
     )
 
     assert json.loads(result.result) == {"ok": True}
 
-    # Start stamp + at least one heartbeat mid-call (0.25s run, 0.05s cadence).
+    # Start stamp + at least one heartbeat mid-call (0.4s run, 0.05s cadence).
     assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
     spread = touches[-1] - touches[0]
-    assert spread >= 0.15, f"touches not spread across the call: {spread:.3f}s"
+    # ≥half the call: generous headroom so scheduler jitter under a loaded
+    # runner can't fail the spread property.
+    assert spread >= 0.2, f"touches not spread across the call: {spread:.3f}s"
 
 
 def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
@@ -297,7 +302,9 @@ def test_heartbeat_exits_once_worker_tid_is_interrupted():
     )
     thread.start()
     try:
-        time.sleep(0.12)
+        # ≥2 intervals of headroom: under a fully loaded runner the first
+        # stamp can otherwise land after this window and fail spuriously.
+        time.sleep(0.25)
         assert touches, "heartbeat never stamped while the worker was live"
         set_interrupt(True, fake_worker_tid)
         thread.join(timeout=1.0)

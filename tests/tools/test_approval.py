@@ -115,7 +115,21 @@ class TestDetectDangerousRm:
 
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+        # The detector resolves the temp dir through os.path.realpath, which on
+        # macOS turns any candidate into /private/tmp; stub both layers so the
+        # pinned candidate path (/tmp/hermes-verify-*) is the one inspected.
+        real_realpath = os.path.realpath
+
+        def _tmp_realpath(p, **k):
+            # Pretend /tmp is a real directory, not a symlink to /private/tmp:
+            # the pinned operand spelling must equal realpath(gettempdir()).
+            if isinstance(p, str) and (p == "/tmp" or p.startswith("/tmp/")):
+                return p
+            return real_realpath(p, **k)
+
+        with mock_patch("tempfile.gettempdir", return_value="/tmp"), mock_patch(
+            "os.path.realpath", side_effect=_tmp_realpath
+        ):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
                 assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
                     False,

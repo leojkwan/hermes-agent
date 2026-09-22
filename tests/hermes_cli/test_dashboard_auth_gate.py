@@ -143,6 +143,17 @@ def _stub_uvicorn_run(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
+    # start_server probes the real port before handing off to uvicorn; the
+    # probe is NOT stubbed here, so these tests fail with SystemExit(75)
+    # BACKEND_PORT_IN_USE on any machine where the live Hermes dashboard
+    # already listens on 9119 (i.e. the project's own dev machine). Stub it
+    # alongside the server: probe coverage lives in test_serve_port_in_use.py.
+    monkeypatch.setattr(
+        _web_server_lifecycle, "_port_bind_conflict", lambda host, port: False
+    )
+    monkeypatch.setattr(
+        web_server, "_port_bind_conflict", lambda host, port: False
+    )
     return captured
 
 
