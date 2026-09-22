@@ -184,6 +184,7 @@ import {
 } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { SidebarVoiceSection } from './voice-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { useEnteredProjectSessions } from './use-entered-project-sessions'
 
@@ -449,6 +450,11 @@ export function ChatSidebar({
   const focusedSessionIsTile = useStore($focusedSessionIsTile)
   const currentView = focusedSessionIsTile ? 'chat' : routeView
   const sessions = useStore($sessions)
+  const voiceSessions = useMemo(
+    () => sessions.filter((session) => (session.source ?? '').startsWith('voice')),
+    [sessions]
+  )
+  const [voiceOpen, setVoiceOpen] = useState(true)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
   const messagingSessions = useStore($messagingSessions)
@@ -1998,6 +2004,15 @@ export function ChatSidebar({
                 onToggle={() => setSidebarCronOpen(!cronOpen)}
                 onTriggerJob={onTriggerCronJob}
                 open={cronOpen}
+              />
+            )}
+            {!trimmedQuery && !worktreeGroupingActive && voiceSessions.length > 0 && (
+              <SidebarVoiceSection
+                label="Voice"
+                onOpenSession={onResumeSession}
+                onToggle={() => setVoiceOpen(!voiceOpen)}
+                open={voiceOpen}
+                sessions={voiceSessions}
               />
             )}
           </div>
