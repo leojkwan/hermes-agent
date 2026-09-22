@@ -3681,10 +3681,14 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        # Sleeps are 5x the timeout so the "bailed early" upper bound below keeps a wide
+        # margin from the full-stream duration: under runner load (-j8) scheduler jitter
+        # pushed a 0.03s/event stream past the old 0.14s bound (observed 0.164s) even
+        # though the 0.05s total timeout was honored.
         class _SlowAliveCreateStream:
             def __iter__(self):
                 for _ in range(5):
-                    time.sleep(0.03)
+                    time.sleep(0.1)
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3703,7 +3707,7 @@ class TestCodexAuxiliaryAdapterTimeout:
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert time.monotonic() - started < 0.25
 
     def test_no_progress_timeout_kwarg_overrides_default_window(self):
         """#108104: an explicit ``no_progress_timeout`` kwarg (the task-scoped
