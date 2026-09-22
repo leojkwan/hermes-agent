@@ -483,6 +483,13 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     import tools.process_registry as process_registry
 
+    # Pin the platform seam FIRST: the managed-gateway topology check is
+    # Linux-only by design (_IS_LINUX short-circuits to in_process on darwin
+    # before any patched seam is consulted), which made the boundary return
+    # normally on macOS and tripped this test's own unreachable-guard as a
+    # charged card failure. Forcing the flag exercises the same production
+    # branch the systemd scenario runs on Linux.
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)

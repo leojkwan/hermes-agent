@@ -225,6 +225,13 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     import hermes_cli.session_lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    # find_sqlite3_cli is only HALF the discovery surface: session_recovery
+    # also consults find_sqlite3_cli_refusal(), which still holds the refusal
+    # recorded by the module-level HAVE_SQLITE3_CLI probe (macOS's
+    # /usr/bin/sqlite3 is wal_reset_vulnerable on this host). Without
+    # clearing it, the "unsafe CLI" branch hijacks the message this test
+    # exists to pin. Stub BOTH so the process looks CLI-less from a clean slate.
+    monkeypatch.setattr(laf, "_last_cli_refusal", {})
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,

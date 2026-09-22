@@ -6,6 +6,7 @@ AUTHOR_MAP dict in scripts/release.py is frozen; release.py merges both at
 import time with the directory winning on duplicates.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -157,7 +158,18 @@ def test_add_contributor_refuses_a_case_collision(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "EMAILS_DIR", d)
 
     assert mod.add_contributor("agent@example-host.local", "otherperson") == 1
-    assert not (d / "agent@example-host.local").exists()
+    # Probe the filesystem directly: on a case-insensitive volume (APFS
+    # default, Windows) the refused spelling resolves to the EXISTING file,
+    # so `exists()` is trivially true there, and the contract under test is
+    # the rc=1 refusal with no second mapping written. The "no new file
+    # appeared" assertion only applies where the two spellings are distinct
+    # files. (realpath does NOT normalize case on APFS — probed 9/22: it
+    # echoes the existing entry's spelling, so it cannot detect this.)
+    probe = tmp_path / "_case_probe"
+    probe.mkdir()
+    (probe / "CaseProbe").write_text("x")
+    if not (probe / "caseprobe").exists():
+        assert not (d / "agent@example-host.local").exists()
 
 
 def test_add_contributor_refuses_case_collision_even_for_same_login(emails_dir, capsys):

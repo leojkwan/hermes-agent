@@ -79,6 +79,15 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
     """
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    # Env isolation: this test pins the STATIC dict-format models contract.
+    # A dev host running a real Ollama on localhost:11434 makes production's
+    # native-catalog probe (probe_ollama_local_models) and generic /models
+    # fetch return live data that would replace the fixture list. Pretend the
+    # endpoint is not an Ollama server and has no live /models; discovery
+    # finding nothing is what leaves the dict keys as the row.
+    monkeypatch.setattr(
+        "hermes_cli.models_local.probe_ollama_local_models", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *a, **k: None)
 
     user_providers = {
         "local-ollama": {
@@ -521,6 +530,14 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
     """
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    # Env isolation: on a host running a REAL Ollama on localhost:11434,
+    # production's native-catalog sniff (should_use_ollama_native_catalog ->
+    # probe_ollama_local_models, a live /api/tags call) resolves this
+    # keyless 11434 URL as an Ollama server and routes discovery to the
+    # native fetch, which never reaches the /v1/models fetch under test.
+    # Pretend no Ollama is listening so the generic fetch path runs.
+    monkeypatch.setattr(
+        "hermes_cli.models_local.probe_ollama_local_models", lambda *a, **k: None)
 
     probed = {}
 

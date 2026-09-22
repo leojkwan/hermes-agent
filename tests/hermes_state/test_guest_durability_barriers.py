@@ -8,6 +8,7 @@ the guest entry point applies it directly.
 """
 
 import sqlite3
+import sys
 
 import pytest
 
@@ -47,7 +48,12 @@ def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA synchronous=1")
         apply_durability_barriers(conn)
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        # With database.synchronous unset, config application is a no-op — but
+        # the macOS durability floor (_enforce_macos_synchronous_full inside
+        # _reapply_durability_barriers) still bumps NORMAL->FULL on darwin by
+        # design (Darwin fsync does not order writes; see hermes_state_wal).
+        expected = 2 if sys.platform == "darwin" else 1
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == expected
     finally:
         conn.close()
 

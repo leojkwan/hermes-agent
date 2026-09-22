@@ -85,10 +85,16 @@ class TestTranscriptWritePatience:
         """When patience genuinely runs out, the error must say the lock was
         held by another process — not read like disk/permission damage."""
         monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
+        # 6s hold, not 2s: this host's SQLite busy handler keeps polling well
+        # past the connection's 1.0s timeout (measured give-up ~2.5-3.2s on
+        # darwin/sqlite 3.53), so a 2s hold releases BEFORE the first
+        # BEGIN IMMEDIATE raises and short-circuit patience is never consulted.
+        # 6s exceeds that worst-case handler window, guaranteeing the first
+        # attempt fails and the 0.2s patience path is what runs out.
 
         started = threading.Event()
         holder = threading.Thread(
-            target=_hold_write_lock, args=(db.db_path, 2.0, started)
+            target=_hold_write_lock, args=(db.db_path, 6.0, started)
         )
         holder.start()
         try:

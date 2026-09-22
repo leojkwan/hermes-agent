@@ -404,11 +404,15 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
                 t.join()
         self.assertEqual([r["status"] for r in results], ["success"] * 6)
         self.assertEqual(len(_KERNELS), 1)
+        # BSD pgrep (macOS) has no -c (count) flag — the Linux invocation exits
+        # 2 with a usage error and empty stdout, failing the assert on darwin
+        # before the ownership contract is even exercised. Count lines instead.
         live = subprocess.run(
-            ["pgrep", "-fc", "-P", str(os.getpid()), "hermes_kernel_runner"],
+            ["pgrep", "-f", "-P", str(os.getpid()), "hermes_kernel_runner"],
             capture_output=True, text=True,
-        ).stdout.strip()
-        self.assertEqual(live, "1")
+        )
+        count = len([ln for ln in live.stdout.splitlines() if ln.strip()])
+        self.assertEqual(count, 1)
 
 
 class TestPerCellRpcAuthority(unittest.TestCase):
