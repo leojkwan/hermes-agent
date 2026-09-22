@@ -413,8 +413,12 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # Same FILE, not the same spelling: the shared registry
+                # canonicalizes alias paths (macOS /var/tmp -> /private/var/tmp)
+                # via resolve(), so compare resolved paths — string equality
+                # would pin the /var spelling and fail on darwin only.
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    Path(child_db.db_path).resolve(), Path(parent_db.db_path).resolve()
                 )
             finally:
                 if child_db is not None:
