@@ -52,6 +52,9 @@ def test_auto_title_thread_runs_in_the_turns_profile_scope(served_home, monkeypa
     seen, done = {}, threading.Event()
     monkeypatch.setattr(tg, "auto_title_session", lambda *args, **kwargs: _observe_scope(seen, done))
     monkeypatch.setattr(tg, "apply_instant_title", lambda *args, **kwargs: None)
+    # conftest defaults the stage-2 titler thread off (its failure print segfaults workers under
+    # capture swaps); this test IS about that thread's profile scope, so force it back on.
+    monkeypatch.setattr(tg, "_model_title_upgrade_enabled", lambda: True)
     db = MagicMock()
     db.get_session_title.return_value = None
     home_token = set_hermes_home_override(str(b))
