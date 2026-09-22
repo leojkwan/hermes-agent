@@ -777,13 +777,22 @@ def _kill_process_group_posix(proc) -> None:
         descendants = []
     try:
         os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
-        if not _wait_for_group_exit(proc, pgid, 1.0):
-            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
-            _wait_for_group_exit(proc, pgid, 2.0)
-            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-                proc.wait(timeout=0.2)
     except ProcessLookupError:
-        pass
+        return  # group already gone — nothing to kill
+    except PermissionError:
+        # darwin race: the group dissolved (or its pgid was recycled) between
+        # getpgid and killpg. If the wrapper itself has exited there is
+        # nothing left to signal; only a *live* wrapper we cannot signal is a
+        # real error worth raising.
+        if proc.poll() is None:
+            raise
+    if not _wait_for_group_exit(proc, pgid, 1.0):
+        try:
+            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
+        except (ProcessLookupError, PermissionError):
+            pass  # group raced to exit / recycled pgid — treat as exited
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.wait(timeout=0.2)
     _sweep_escaped_descendants(descendants, pgid)
 
 
