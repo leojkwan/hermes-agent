@@ -768,6 +768,14 @@ def _kill_process_group_posix(proc) -> None:
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
+        # Wrapper already reaped — but its group may still hold escapees.
+        # Fall back to the recorded pgid; if none was recorded there is
+        # nothing this process ever owned, so the kill is a no-op.
+        if (pgid := getattr(proc, "_hermes_pgid", None)) is None:
+            return
+    except PermissionError:
+        # darwin zombie window: the process is a child but ps/proc_info-based
+        # getpgid can transiently fail after exit on macOS. Same fallback.
         if (pgid := getattr(proc, "_hermes_pgid", None)) is None:
             raise
     try:  # psutil children snapshot; empty on any failure (must never break the kill)
