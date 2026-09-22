@@ -520,6 +520,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
             "auxiliary:\n  title_generation:\n    model_upgrade_enabled: false\n",
             encoding="utf-8",
         )
+        # The sandbox must never read as repo dirt: tests that create a git repo in tmp_path
+        # (e.g. the ZIP-overlay guard) run `git status --untracked-files=all` from tmp_path, and
+        # an untracked hermes_test/ entry fails their clean-tree assertion. Self-ignore instead.
+        (fake_hermes_home / ".gitignore").write_text("*\n", encoding="utf-8")
     except Exception:
         pass
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
