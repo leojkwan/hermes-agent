@@ -71,7 +71,7 @@ def test_reasoning_required_400_steps_effort_up_to_the_floor_and_remembers_the_r
 def test_glm_thinking_only_400_steps_effort_up_to_the_floor():
     """Databricks GLM says the model is thinking-only rather than using the Nous wording."""
     client = MagicMock()
-    client.base_url = "https://dbc-893e3b89-1353.cloud.databricks.com/ai-gateway/openai/v1"
+    client.base_url = "https://dbc-example.cloud.databricks.com/ai-gateway/openai/v1"
     client.chat.completions.create.side_effect = [RuntimeError(_GLM_THINKING_ONLY_400), {"ok": True}]
 
     assert _call(client) == {"ok": True}
