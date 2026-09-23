@@ -47,6 +47,10 @@ def _sanitize_session_id(session_id: Optional[str]) -> str:
 _USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _ACCT_FIELDS = ("model", "provider", "temperature")
 _COST_FIELDS = ("cost_usd", "cost_status", "cost_source")
+# Per-backend health: success/failure, failure bucket (4xx vs 5xx vs timeout vs
+# transport vs circuit_open), the status code and wall latency. Without these a sick
+# reference seat is invisible on a dashboard until it has already degraded a whole run.
+_HEALTH_FIELDS = ("ok", "failure_class", "status_code", "latency_ms")
 
 
 def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
@@ -58,6 +62,7 @@ def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
         "input_messages": getattr(acct, "messages", None), "output": getattr(acct, "output", None),
         "usage": {f: getattr(usage, f, 0) for f in _USAGE_FIELDS} if usage is not None else {},
         **{f: getattr(acct, f, None) for f in _COST_FIELDS},
+        **{f: getattr(acct, f, None) for f in _HEALTH_FIELDS},
     }
 
 

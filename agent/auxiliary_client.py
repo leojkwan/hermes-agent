@@ -3279,11 +3279,25 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     """One-off transport blip worth retrying on the SAME provider: connection/stream-close errors plus pure 5xx/408.
 
     Deliberately narrow: payment/auth/rate-limit errors switch provider, refresh creds, or rotate the pool.
+
+    A 5xx whose BODY carries a deterministic 4xx rejection is NOT transient: shim/proxy
+    layers re-raise an upstream 400 as their own 500, so the status lies. Retrying spends
+    the full backoff budget to reach an identical failure and, for a pinned MoA advisor
+    (where provider fallback is not a meaningful recovery), silently loses that advisor.
     """
     if _is_connection_error(exc):
         return True
     status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+    if not (isinstance(status, int) and (status == 408 or 500 <= status < 600)):
+        return False
+    from agent.error_classifier import wraps_deterministic_rejection
+    if wraps_deterministic_rejection(str(exc)):
+        logger.info(
+            "Auxiliary: HTTP %s wraps a deterministic upstream rejection — failing fast "
+            "instead of retrying an identical request: %.200s", status, exc,
+        )
+        return False
+    return True
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
@@ -7987,8 +8001,13 @@ def _call_llm_impl(
                 raise
             _max_transient_retries = _transient_retry_count()
             _last_transient = transient_err
+            from agent.retry_utils import jittered_backoff
             for _attempt in range(1, _max_transient_retries + 1):
-                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
+                # Jittered so parallel callers sharing one sick backend (a MoA fan-out
+                # retries N advisors at once) do not re-dial it in lockstep and
+                # synchronise a thundering herd on the recovering endpoint.
+                _backoff = jittered_backoff(
+                    _attempt, base_delay=_TRANSIENT_RETRY_BACKOFF_BASE, max_delay=8.0, jitter_ratio=0.25)
                 logger.info("Auxiliary %s: transient transport error (attempt %d/%d); "
                             "retrying same provider after %.1fs before fallback: %s",
                             task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)

@@ -257,3 +257,46 @@ So MoA does not sacrifice prompt caching on either call type. Its only real cost
 - Credential failures on one reference model do not abort the turn. Hermes includes the failure in the reference context and continues with whatever models returned.
 - MoA increases model-call count. A single model iteration can involve multiple reference calls plus the aggregator call.
 - A preset can be a fallback entry (`fallback_providers: [{provider: moa, model: <preset>}]`). When the primary fails, Hermes activates the preset itself — references and aggregator, with `moa://local` as the virtual endpoint — the same way `/model <preset> --provider moa` does. The entry is skipped when the preset does not resolve or its aggregator has no credentials.
+
+## Unhealthy reference backends
+
+A reference model is advisory: the aggregator is the acting model, references never
+receive tools and never take actions. So a sick reference degrades the *quality* of a
+turn, never its correctness — and MoA is built to keep going rather than fail closed.
+
+**Minimum viable quorum is one.** If at least one reference returns successfully, Hermes
+aggregates over the successes and names the ones it did not hear from in the guidance
+block:
+
+```
+[Reference models unavailable: vertex-shim:claude-opus-5]
+```
+
+Set `degraded_reference_policy: silent` on a preset to suppress that notice (the
+surviving references are still used); the default, `loud`, reports it. When *every*
+reference fails, Hermes skips the aggregator's synthesis step entirely — synthesizing
+over nothing would block for the full provider timeout — and tells the acting model to
+proceed on its own judgment.
+
+**Deterministic failures are not retried.** Hermes retries a reference on transient
+transport errors and genuine 5xx responses, with bounded exponential backoff plus jitter
+(so parallel advisors hitting one sick backend do not re-dial it in lockstep). It does
+*not* retry a deterministic rejection such as `400 INVALID_ARGUMENT`, which would fail
+identically every time and only add latency. This includes a 5xx envelope that merely
+*wraps* an upstream 4xx — the shape a local shim or proxy produces when it catches the
+upstream's error and re-raises it as its own 500. The status code alone would read as
+"transient"; Hermes reads the body.
+
+**A persistently failing backend is benched.** After 3 consecutive failures, a
+(provider, model) backend's circuit breaker trips and Hermes stops dialing it for 120
+seconds, logging on both trip and reset. This matters because
+`auxiliary.moa_reference.timeout` defaults to 900s: without a breaker, a *hanging* seat
+would stall every turn for the full window. A benched slot is reported exactly like any
+other unavailable reference, so the partial-quorum behaviour above still applies. The
+streak counts *consecutive* failures, so an intermittently flapping backend stays in
+rotation — one success closes the breaker.
+
+**Per-backend health is observable.** Each reference reports `ok`, `failure_class`
+(`4xx` / `5xx` / `timeout` / `transport` / `circuit_open`), `status_code` and
+`latency_ms` through the observability hook and MoA traces, so a sick seat is visible on
+a dashboard before it degrades a whole run.

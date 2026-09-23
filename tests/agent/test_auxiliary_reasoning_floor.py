@@ -20,6 +20,12 @@ _PORTAL_400 = (
     "other parameters. Additional info: Reasoning is mandatory for this endpoint and cannot be disabled.'}"
 )
 
+_GLM_THINKING_ONLY_400 = (
+    "Error code: 400 - {'error_code': 'BAD_REQUEST', 'message': '{\"error\":\"Upstream error: "
+    "INVALID_ARGUMENT: reasoning_effort=\\\"none\\\" is not supported by glm-5-3: "
+    "it is a thinking-only model.\"}'}"
+)
+
 
 @pytest.fixture(autouse=True)
 def _fresh_memo():
@@ -60,6 +66,17 @@ def test_reasoning_required_400_steps_effort_up_to_the_floor_and_remembers_the_r
     assert client.chat.completions.create.call_count == 3
     upfront = client.chat.completions.create.call_args_list[2].kwargs
     assert upfront["reasoning_effort"] == auxiliary_reasoning_floor.REASONING_FLOOR_EFFORT
+
+
+def test_glm_thinking_only_400_steps_effort_up_to_the_floor():
+    """Databricks GLM says the model is thinking-only rather than using the Nous wording."""
+    client = MagicMock()
+    client.base_url = "https://dbc-893e3b89-1353.cloud.databricks.com/ai-gateway/openai/v1"
+    client.chat.completions.create.side_effect = [RuntimeError(_GLM_THINKING_ONLY_400), {"ok": True}]
+
+    assert _call(client) == {"ok": True}
+    retry = client.chat.completions.create.call_args_list[1].kwargs
+    assert retry["reasoning_effort"] == auxiliary_reasoning_floor.REASONING_FLOOR_EFFORT
 
 
 def test_field_rejection_still_strips_instead_of_stepping_up():

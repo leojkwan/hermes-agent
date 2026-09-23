@@ -153,6 +153,78 @@ _RUNTIME_CACHE_TTL_SECONDS = 300.0
 _MAX_REFERENCE_WORKERS = 8
 
 
+# ── Per-backend circuit breaker ─────────────────────────────────────────
+#
+# Fail-fast classification (agent.error_classifier.wraps_deterministic_rejection) stops a
+# DETERMINISTIC sick backend from burning the retry budget, but it does not help the other
+# failure mode: a backend that HANGS. ``auxiliary.moa_reference.timeout`` defaults to 900s,
+# so a wedged seat stalls every turn for the full window before the fan-out can aggregate —
+# and the advisory view is rebuilt per user turn, so it pays that cost again and again.
+#
+# The breaker trips after _BREAKER_FAILURE_THRESHOLD consecutive failures for one
+# (provider, model) and short-circuits further dials for _BREAKER_COOLDOWN_SECONDS. A tripped
+# slot returns a labelled "[failed: …]" note immediately, which the EXISTING partial-quorum
+# path (_guidance_inputs) already filters out and reports as degraded — so tripping degrades
+# the fan-out gracefully instead of dropping the slot silently.
+#
+# State is process-global and keyed per backend (not per facade) because every MoA turn builds
+# a fresh facade; per-facade state would forget a sick seat between turns, which is exactly the
+# window this is meant to close.
+_BREAKER_FAILURE_THRESHOLD = 3
+_BREAKER_COOLDOWN_SECONDS = 120.0
+
+_breaker_lock = threading.Lock()
+# (provider, model) -> {"failures": int, "open_until": float}
+_breaker_state: dict[tuple[str, str], dict[str, float]] = {}
+
+
+def _breaker_key(slot: dict[str, Any]) -> tuple[str, str]:
+    return (str(slot.get("provider") or "").strip(), str(slot.get("model") or "").strip())
+
+
+def reset_reference_breakers() -> None:
+    """Clear all breaker state (test seam; also lets an operator un-bench a seat)."""
+    with _breaker_lock:
+        _breaker_state.clear()
+
+
+def _breaker_blocked_for(slot: dict[str, Any]) -> float:
+    """Seconds remaining on an OPEN breaker for this slot, else 0.0."""
+    key = _breaker_key(slot)
+    now = time.monotonic()
+    with _breaker_lock:
+        entry = _breaker_state.get(key)
+        if not entry:
+            return 0.0
+        remaining = entry.get("open_until", 0.0) - now
+        if remaining > 0:
+            return remaining
+        # Cooldown elapsed: half-open — allow one probe and reset the streak so a single
+        # further failure re-trips rather than requiring another full threshold.
+        if entry.get("open_until"):
+            logger.info("MoA circuit breaker RESET for %s:%s — cooldown elapsed, probing again", *key)
+            _breaker_state.pop(key, None)
+        return 0.0
+
+
+def _breaker_record(slot: dict[str, Any], *, ok: bool) -> None:
+    """Fold one reference outcome into its backend's breaker state."""
+    key = _breaker_key(slot)
+    with _breaker_lock:
+        if ok:
+            if _breaker_state.pop(key, None) is not None:
+                logger.info("MoA circuit breaker CLOSED for %s:%s — backend healthy again", *key)
+            return
+        entry = _breaker_state.setdefault(key, {"failures": 0.0, "open_until": 0.0})
+        entry["failures"] = entry.get("failures", 0.0) + 1
+        if entry["failures"] >= _BREAKER_FAILURE_THRESHOLD and not entry.get("open_until"):
+            entry["open_until"] = time.monotonic() + _BREAKER_COOLDOWN_SECONDS
+            logger.warning(
+                "MoA circuit breaker TRIPPED for %s:%s after %d consecutive failures — "
+                "not dialing it for %.0fs", *key, int(entry["failures"]), _BREAKER_COOLDOWN_SECONDS,
+            )
+
+
 @dataclass(slots=True)
 class _RefAccounting:
     """Per-reference usage, cost and full trace (third slot of a reference-output tuple).
@@ -160,6 +232,12 @@ class _RefAccounting:
     Cost is priced at the advisor's OWN rate and summed in dollars (advisors may run
     on a different model than the aggregator). Trace fields are only populated when
     tracing is on.
+
+    ``ok`` / ``failure_class`` / ``status_code`` / ``latency_ms`` are the per-backend
+    health signals: without them a sick seat is invisible to a dashboard until it has
+    already eaten a whole run (the fan-out degrades silently by design). They ride the
+    accounting because that is what ``moa_trace.slot_metrics`` already hands to the
+    observability hook.
     """
 
     usage: Any
@@ -172,6 +250,10 @@ class _RefAccounting:
     model: str | None = None
     provider: str | None = None
     temperature: Any = None
+    ok: bool | None = None
+    failure_class: str | None = None
+    status_code: int | None = None
+    latency_ms: int | None = None
 
 
 # Per-tool-result char budget for the advisory view: tool CALLS are kept in full,
@@ -364,18 +446,56 @@ def _price_reference_response(
         return usage, None, None, None
 
 
+def _classify_reference_failure(exc: Exception) -> tuple[str, int | None]:
+    """``(failure_class, status_code)`` for one failed advisor call.
+
+    Classes are the dashboard buckets the card asks for: ``timeout``, ``4xx``
+    (deterministic — will fail identically), ``5xx`` (transient) and ``transport``.
+    A 5xx envelope wrapping a deterministic upstream 4xx is bucketed as ``4xx``, so a
+    misconfigured seat is not filed under "flaky server".
+    """
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    status = status if isinstance(status, int) else None
+    text = str(exc).lower()
+    if status == 408 or "timeout" in type(exc).__name__.lower() or "timed out" in text:
+        return "timeout", status
+    if isinstance(status, int) and 400 <= status < 500:
+        return "4xx", status
+    if isinstance(status, int) and 500 <= status < 600:
+        from agent.error_classifier import wraps_deterministic_rejection
+        return ("4xx" if wraps_deterministic_rejection(text) else "5xx"), status
+    return "transport", status
+
+
 def _run_reference(
     slot: dict[str, Any], ref_messages: list[dict[str, Any]], *, temperature: float | None = None,
     max_tokens: int | None = None, reference_timeout: float | None = None, context_length_cache: Any = None,
     cache_disabled: bool | None = None, cache_ttl: str | None = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
-    a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
+    a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool.
+
+    A backend whose breaker is OPEN is not dialed at all — it returns the same labelled
+    note immediately, which the partial-quorum path already treats as an unavailable
+    reference. Every outcome (including the short-circuit) updates the breaker and
+    records per-backend health on the accounting.
+    """
     label = _slot_label(slot)
     runtime = _slot_runtime(slot)
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
+
+    blocked_for = _breaker_blocked_for(slot)
+    if blocked_for > 0:
+        note = f"[failed: circuit breaker open for {label} — retrying in {blocked_for:.0f}s]"
+        logger.warning("MoA reference %s skipped: circuit breaker open for another %.0fs", label, blocked_for)
+        return label, note, _RefAccounting(
+            CanonicalUsage(), messages=messages, output=note, ok=False,
+            failure_class="circuit_open", latency_ms=0, **trace_fields,
+        )
+
+    started = time.monotonic()
     try:
         # Trim to THIS model's window (advisors may be smaller than the aggregator); the
         # advisory view is append-only across iterations, so cache_control lets
@@ -400,12 +520,22 @@ def _run_reference(
             extra_headers={"x-initiator": "user"} if is_copilot else None, **runtime,
         )
         output_text = _extract_text(response) or "(empty response)"
-        acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
+        _breaker_record(slot, ok=True)
+        acct = _RefAccounting(
+            *_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text,
+            ok=True, latency_ms=int((time.monotonic() - started) * 1000), **trace_fields,
+        )
         return label, output_text, acct
     except Exception as exc:
-        logger.warning("MoA reference model %s failed: %s", label, exc)
+        failure_class, status_code = _classify_reference_failure(exc)
+        _breaker_record(slot, ok=False)
+        logger.warning("MoA reference model %s failed (%s): %s", label, failure_class, exc)
         note = f"[failed: {exc}]"
-        return label, note, _RefAccounting(CanonicalUsage(), messages=messages, output=note, **trace_fields)
+        return label, note, _RefAccounting(
+            CanonicalUsage(), messages=messages, output=note, ok=False,
+            failure_class=failure_class, status_code=status_code,
+            latency_ms=int((time.monotonic() - started) * 1000), **trace_fields,
+        )
 
 
 # Output headroom reserved in the reference window when reference_max_tokens is unset.

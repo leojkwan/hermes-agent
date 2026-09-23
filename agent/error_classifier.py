@@ -318,6 +318,38 @@ _REQUEST_VALIDATION_PATTERNS = (
     "invalid_request_error", "unknown_parameter", "unsupported_parameter",
 )
 
+# A 5xx envelope whose BODY carries a deterministic 4xx rejection. Shim/proxy layers
+# (a local Vertex shim, LiteLLM, an Anthropic-compat bridge) catch the upstream's 4xx
+# and re-raise it as their own 500, e.g.
+#   Error code: 500 - {'type': 'api_error', 'message':
+#       "Error code: 400 - [{'error': {'code': 400, 'status': 'INVALID_ARGUMENT'}}]"}
+# The outer status says "transient, retry me"; the inner one says "this request is
+# malformed and will be rejected identically forever". Retrying burns the backoff
+# budget to reach a guaranteed failure and, in a MoA fan-out, silently drops that
+# advisor for the turn. Status-only checks cannot see the inner verdict, so we read it.
+#
+# Nested "Error code: 4xx" from the SDK's own error formatting. 408 (timeout) and 429
+# (rate limit) are excluded: those are genuinely worth retrying.
+_NESTED_4XX_RE = re.compile(r"error code:\s*4(?!08\b|29\b)\d\d\b")
+
+# Canonical google.rpc.Code names that are deterministic for a given request. The
+# retryable siblings (UNAVAILABLE, INTERNAL, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED,
+# ABORTED, UNKNOWN) are deliberately absent.
+_DETERMINISTIC_RPC_STATUSES = (
+    "invalid_argument", "failed_precondition", "out_of_range", "unimplemented",
+)
+
+
+def wraps_deterministic_rejection(error_text: str) -> bool:
+    """True when a 5xx envelope's text carries a deterministic 4xx/gRPC rejection.
+
+    Callers must already know the OUTER status is 5xx; this only reads the body.
+    """
+    text = (error_text or "").lower()
+    if not text:
+        return False
+    return bool(_NESTED_4XX_RE.search(text)) or any(s in text for s in _DETERMINISTIC_RPC_STATUSES)
+
 # Parameters Hermes sends on SOME routes only → hosts where that is deliberate.
 # A rejection from any other host means the provider's gateway injected the
 # field itself: a server-side flake, not our request shape. prompt_cache_retention
@@ -519,7 +551,7 @@ _REASONING_PARAM_REJECTION = re.compile(
 
 _REASONING_REQUIRED_MARKERS = (
     "mandatory", "cannot be disabled", "can't be disabled", "must be enabled", "is required",
-    "always enabled", "cannot be turned off",
+    "always enabled", "cannot be turned off", "thinking-only model",
 )
 
 
@@ -1067,6 +1099,11 @@ def _status_5xx(c: _Ctx) -> Verdict:
     # retry-flooding — unless the parameter was injected server-side.
     validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
+        return _V_FORMAT_ERROR
+    # A shim/proxy that re-raises an upstream 4xx as its own 5xx (e.g. a local Vertex
+    # shim wrapping 400 INVALID_ARGUMENT). Deterministic for this request shape, so
+    # retrying only spends the backoff budget to fail identically.
+    if wraps_deterministic_rejection(c.msg):
         return _V_FORMAT_ERROR
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
 
