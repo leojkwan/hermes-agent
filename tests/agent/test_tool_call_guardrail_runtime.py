@@ -511,6 +511,39 @@ def test_unattended_turn_of_varied_calls_stops_at_step_cap_with_spoken_reason():
     assert not set("`*#[]{}_") & set(reply), reply  # spoken aloud: no markdown, JSON or decision codes
 
 
+def test_step_cap_counts_one_turn_so_keep_going_starts_fresh():
+    """The cap is per turn: a voice session that has made 100 calls across two 50-call turns still
+    answers both. A counter that outlived its turn would block every call after the 60th for the
+    rest of the session, and "keep going" after a step-cap stop would stop again at once."""
+    agent = _make_agent(
+        "execute_code", "vision_analyze", "terminal", max_iterations=500,
+        config={"tool_loop_guardrails": {"hard_stop_enabled": True}}, platform="voice-safari",
+    )
+    agent._disable_streaming = True
+    agent.client.chat.completions.create.side_effect = [
+        *(_varied_tool_round(i) for i in range(50)), _mock_response(content="first done"),
+        *(_varied_tool_round(i) for i in range(50, 100)), _mock_response(content="second done"),
+    ]
+    calls: list[str] = []
+
+    def handle(name, args, *_a, **_kw):
+        calls.append(name)
+        return json.dumps({"status": "success", "output": f"attempt {len(calls)}: nothing yet"})
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=handle),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        first = agent.run_conversation("sort the photos from today")
+        second = agent.run_conversation("keep going")
+
+    assert agent._tool_guardrails.config.loop_caps.max_tool_calls == 60
+    assert (first["final_response"], second["final_response"]) == ("first done", "second done")
+    assert len(calls) == 100
+
+
 @pytest.mark.parametrize("platform, rounds", [("voice-safari", 40), ("desktop", 150)])
 def test_step_cap_leaves_normal_work_and_attended_surfaces_untouched(platform, rounds):
     """~40 calls is ordinary unattended work; attended surfaces show every call live (and run
