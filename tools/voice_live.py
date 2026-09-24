@@ -84,14 +84,23 @@ VOICE_LIVE_TURN_NOTE = (
     "before it actually did.]"
 )
 
+# Closes the spoken-context block. The note (block included) is prepended to the request, so "above" is the
+# block and "below" is the request; without this a held ask answered, and re-ran, every other ask in the block.
+VOICE_LIVE_CONTEXT_CLAUSE = (
+    "[Answer only the request below. The conversation above is background for understanding it: every other "
+    "request in it is handled separately, so do not do, answer, repeat or mention any of them.]"
+)
+
 
 def voice_live_turn_note(context: str = "") -> str:
     """The per-turn note plus, when the client sent one, the recent spoken exchange the delegation
-    refers to (the user's last words alone are often "yes" or "Thursday, not Friday")."""
+    refers to (the user's last words alone are often "yes" or "Thursday, not Friday"), marked as
+    background for the request that follows."""
     context = context.strip()
     if not context:
         return VOICE_LIVE_TURN_NOTE
-    return f"{VOICE_LIVE_TURN_NOTE}\n[Recent spoken conversation, newest last:\n{context}]"
+    return (f"{VOICE_LIVE_TURN_NOTE}\n[Recent spoken conversation, newest last:\n{context}]\n"
+            f"{VOICE_LIVE_CONTEXT_CLAUSE}")
 
 
 def _voice_section() -> Dict[str, Any]:
