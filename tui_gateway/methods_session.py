@@ -502,6 +502,20 @@ def _(rid, params: dict) -> dict:
 
 
 # ── session.resume ───────────────────────────────────────────────────
+def _restorable_runtime_overrides(row: dict | None) -> dict:
+    """The row's persisted runtime, restoring its model ONLY together with the provider it ran on. A row naming no
+    provider (bare ``custom`` billing bucket, model-only create) ran on whatever config selected back then; resolving
+    that model against today's provider sent a llama.cpp model name to openai-codex (400 on every turn), so such a
+    resume adopts the configured default pair. /model picks persist their provider, so they restore unchanged;
+    reasoning/tier handling is untouched."""
+    overrides = _stored_session_runtime_overrides(row)
+    if (override := overrides.get("model_override")) and not override.get("provider"):
+        overrides.pop("model_override")
+        logger.info("resume %s: stored model %r names no provider; using the configured default",
+                    (row or {}).get("id"), override.get("model"))
+    return overrides
+
+
 class _Resume:
     """Per-call ``session.resume`` state. ``owns_db``: the DEDICATED profile handle is ours
     to close (handler ``finally``) until handed to the hydration worker or the agent."""
@@ -775,7 +789,7 @@ def _resume_deferred(ctx: _Resume) -> dict:
     """Bounded ack; the transcript hydrates in the background (the ONE history read) and pages over REST."""
     sid, source, cwd = ctx.mint()
     with _profile_build_scope(ctx.profile_home):
-        overrides = _stored_session_runtime_overrides(ctx.found)
+        overrides = _restorable_runtime_overrides(ctx.found)
     record = ctx.record(source, cwd, [], overrides)
     record.update(resume_history_ready=threading.Event(), resume_hydrating=True,
                   resume_message_count=int(ctx.found.get("message_count") or 0))
@@ -801,7 +815,7 @@ def _resume_cold(ctx: _Resume) -> dict:
     except Exception as e:
         return _err(ctx.rid, 5000, resume_failed_message(e))
     with _profile_build_scope(ctx.profile_home):
-        overrides = _stored_session_runtime_overrides(ctx.found)
+        overrides = _restorable_runtime_overrides(ctx.found)
     record = ctx.record(source, cwd, history, overrides, display_history_prefix=ctx.display_prefix(),
                         todo_state=_todo_state_from_history(history))
     if (reused := ctx.claim(sid, record)) is not None:
@@ -822,7 +836,7 @@ def _resume_eager(ctx: _Resume) -> dict:
             display_history_prefix = ctx.display_prefix()
             # Profile db so turns persist to the right state.db; stored runtime identity so switching chats does
             # not inherit another chat's global model.
-            stored_runtime_overrides = _stored_session_runtime_overrides(ctx.found)
+            stored_runtime_overrides = _restorable_runtime_overrides(ctx.found)
             agent = _make_agent_in_context(
                 sid, ctx.target, session_db=ctx.db, platform_override=source,
                 cwd_override=ctx.profile_resume_cwd or None,
