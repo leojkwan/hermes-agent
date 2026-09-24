@@ -5,6 +5,8 @@ method_ctx.bind_module), so they reference server.py globals bare.
 """
 
 import contextlib
+import re
+import threading
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -1011,21 +1013,49 @@ def _side_agent_args(rid, params, prefix):
     return session, text, parent, f"{prefix}_{uuid.uuid4().hex[:6]}", None
 
 
+_BACKGROUND_TASK_ID = re.compile(r"bg_[0-9a-f]{6}")  # the ids ``prompt.background`` mints
+_background_tasks_lock = threading.Lock()
+
+
 @method("prompt.background")
 def _(rid, params: dict) -> dict:
+    """``continue_task_id`` runs the ask as the next turn of a background session this live session
+    started: a fresh agent on that row (its compression tip) with the durable transcript replayed,
+    once the previous turn has finished (FIFO). ``session["background_tasks"]`` maps each id to its
+    latest turn's done-event, so another session's id, or any id after a restart, is "not found"."""
+    cont = params.get("continue_task_id")
+    if cont is not None and not (isinstance(cont, str) and _BACKGROUND_TASK_ID.fullmatch(cont)):
+        return _err(rid, 4004, "continue_task_id must be a task_id returned by prompt.background")
     session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
     if err:
         return err
+    # Held across the spawn: a turn becomes the tail only once it exists, so a failed spawn leaves
+    # nothing registered and nobody queued behind it.
+    with _background_tasks_lock:
+        tasks = session.get("background_tasks", {})
+        if cont is not None and cont not in tasks:
+            return _err(rid, 4040, "background task not found in this session")
+        task_id, prev, done = cont or task_id, tasks.get(cont), threading.Event()
 
-    def body():
-        from run_agent import AIAgent
-        kwargs = _background_agent_kwargs(session["agent"], task_id)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
-            result = AIAgent(**{**kwargs, "session_db": session_db}).run_conversation(
-                user_message=text, task_id=task_id)
-        return _final_response_text(result)
+        def body():
+            if prev is not None:
+                prev.wait()  # this background session's previous turn has finished
+            from run_agent import AIAgent
+            kwargs = _background_agent_kwargs(session["agent"], task_id)
+            with _side_agent_session_db(kwargs.get("session_db")) as session_db:
+                history = None
+                if prev is not None and session_db is not None:
+                    kwargs["session_id"] = session_db.resolve_resume_session_id(task_id)
+                    history = canonicalize_replay_history(
+                        session_db.get_messages_as_conversation(kwargs["session_id"], repair_alternation=True))
+                result = AIAgent(**{**kwargs, "session_db": session_db}).run_conversation(
+                    user_message=text, task_id=task_id, conversation_history=history)
+            return _final_response_text(result)
 
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
+        response = _spawn_side_agent(rid, session, task_id, parent, "background.complete", body, cleanup=done.set)
+        if "error" not in response:
+            session.setdefault("background_tasks", {})[task_id] = done
+    return response
 
 
 @method("prompt.btw")

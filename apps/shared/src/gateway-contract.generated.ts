@@ -2560,14 +2560,21 @@ export interface InputDetectDropResult {
   count?: number | null
   text?: string | null
 }
-export interface SideAgentParams {
+/** ``continue_task_id``: a ``task_id`` an earlier ``prompt.background`` on THIS session returned. The ask runs as that background session's next turn (same row, its transcript replayed), queued behind a turn still running; the result echoes the same ``task_id``. Malformed → ``4004``, unknown or another session's → ``4040``. */
+export interface BackgroundParams {
   session_id: string
   profile?: string | null
   text: string
+  continue_task_id?: string | null
 }
 /** The side agent runs detached; its answer lands on the parent session as an event carrying this ``task_id``. */
 export interface TaskIdResult {
   task_id: string
+}
+export interface SideAgentParams {
+  session_id: string
+  profile?: string | null
+  text: string
 }
 export interface PreviewRestartParams {
   session_id: string
@@ -4946,8 +4953,8 @@ export interface RpcMethods {
   'projects.tree': { params: ProjectsTreeParams; result: ProjectsTreeResult }
   /** Patch a project's display fields; answers the refreshed project. */
   'projects.update': { params: ProjectsUpdateParams; result: ProjectResult }
-  /** Run a task on a fresh agent in the background; the answer arrives as background.complete. */
-  'prompt.background': { params: SideAgentParams; result: TaskIdResult }
+  /** Run a task on a background agent (a fresh session, or with continue_task_id the next turn of an earlier one); the answer arrives as background.complete. */
+  'prompt.background': { params: BackgroundParams; result: TaskIdResult }
   /** Side question over a snapshot of the live conversation; the answer arrives as btw.complete. */
   'prompt.btw': { params: SideAgentParams; result: TaskIdResult }
   /** Send a user turn to a live session; busy sessions queue / steer / redirect instead of refusing. */
