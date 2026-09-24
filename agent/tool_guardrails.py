@@ -79,6 +79,16 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# Every tool call in one unattended turn (voice, chat gateways, cron), where nobody can /stop a model
+# that keeps trying something new: varied calls that mostly succeed match no replay detector, and
+# max_iterations (500 model calls by default, unlimited for some gateway and cron runs) sits far above
+# a voice turn. Sep 2026 logs, 1,002 user turns: median 3 tool calls, p95 46; 5 of 224 unattended turns
+# passed 60, one a 198-call voice runaway (41 min). Attended surfaces default off: they show every
+# call live and run 100-250 call coding turns.
+_DEFAULT_UNATTENDED_MAX_TOOL_CALLS_PER_TURN = 60
+# The step-cap reply is spoken on voice surfaces: one error line, not a traceback.
+_SPOKEN_ERROR_MAX_CHARS = 160
+_SPOKEN_ERROR_KEYS = ("user_summary", "error", "message", "output", "stderr")
 
 # Interactive surfaces plus bounded supervised task loops (subagent stopped by its parent;
 # api_server has a live client) doing real edit -> re-run work keep the warn-only default.
@@ -99,18 +109,21 @@ def _is_non_interactive_platform(platform: str | None) -> bool:
 
 @dataclass(frozen=True)
 class LoopCapConfig:
-    """Per-turn hard ceilings on web_search calls / subagent spawns; count total calls (not
-    repeats), fire regardless of ``hard_stop_enabled``; ``0`` disables a cap."""
+    """Per-turn hard ceilings on web_search calls / subagent spawns / all tool calls; count total
+    calls (not repeats), fire regardless of ``hard_stop_enabled``; ``0`` disables a cap.
+    ``max_tool_calls`` defaults on only for unattended platforms."""
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_tool_calls: int = 0
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
+    def from_mapping(cls, data: Mapping[str, Any] | None, *, unattended: bool = False) -> "LoopCapConfig":
         """Build config from the ``tool_loop_guardrails.loop_caps`` section."""
+        default = cls(max_tool_calls=_DEFAULT_UNATTENDED_MAX_TOOL_CALLS_PER_TURN) if unattended else cls()
         if not isinstance(data, Mapping):
-            return cls()
-        return cls(**{f.name: _int_at_least(data.get(f.name), f.default, 0) for f in fields(cls)})
+            return default
+        return cls(**{f.name: _int_at_least(data.get(f.name), getattr(default, f.name), 0) for f in fields(cls)})
 
 
 @dataclass(frozen=True)
@@ -140,7 +153,8 @@ class ToolCallGuardrailConfig:
             data = {}
         d = cls()
         flags = {name: _as_bool(data.get(name), getattr(d, name)) for name in _BOOL_FIELDS}
-        if flags["non_interactive_hard_stop_enabled"] and _is_non_interactive_platform(platform):
+        unattended = flags["non_interactive_hard_stop_enabled"] and _is_non_interactive_platform(platform)
+        if unattended:
             flags["hard_stop_enabled"] = True
 
         def threshold(name: str, section_name: str, key: str) -> int:
@@ -149,7 +163,8 @@ class ToolCallGuardrailConfig:
             return _int_at_least(nested, getattr(d, name), 1)
 
         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
-        return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
+        loop_caps = LoopCapConfig.from_mapping(data.get("loop_caps"), unattended=unattended)
+        return cls(loop_caps=loop_caps, **flags, **thresholds)
 
 
 @dataclass(frozen=True)
@@ -279,6 +294,10 @@ _DECISION_MESSAGES: dict[str, str] = {
         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
     ),
+    "loop_tool_call_cap": (
+        "Blocked {tool_name}: this turn has already made {cap} tool calls without a final answer, the "
+        "per-turn limit. The turn ends here; the user decides whether to keep going or try another way."
+    ),
 }
 
 _IDENTICAL_CALL_NOTICE = (
@@ -335,10 +354,17 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_tool_calls = 0
+        self._last_error = ""
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    @property
+    def last_error(self) -> str:
+        """One sayable line from this turn's most recent failed call; "" when none failed."""
+        return self._last_error
 
     def _decide(
         self, action: str, code: str, tool_name: str, count: int, signature: ToolCallSignature,
@@ -381,6 +407,7 @@ class ToolCallGuardrailController:
         warnings = self.config.warnings_enabled
 
         if failed:
+            self._last_error = _spoken_error_line(result) or f"{tool_name.replace('_', ' ')} failed"
             # An identical failing call is only a REPLAY if nothing landed in between;
             # a mutation since the last identical failure restarts the exact-args streak.
             if self._progress_since_failure.pop(signature, False):
@@ -547,6 +574,10 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision | None:
         """Block once a per-turn cap is reached (BEFORE the call, so the (cap+1)-th is refused), else advance
         the counter and return None. delegate_task control actions spawn nothing and keep working after the cap."""
+        step_cap = self.config.loop_caps.max_tool_calls
+        if step_cap and self._turn_tool_calls >= step_cap:
+            return self._decide("block", "loop_tool_call_cap", tool_name, self._turn_tool_calls, signature, cap=step_cap)
+        self._turn_tool_calls += 1
         spec = _LOOP_CAPS.get(tool_name)
         if spec is None:
             return None
@@ -570,6 +601,27 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
         return result
     label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
     return (result or "") + f"\n\n[{label}: {decision.code}; count={decision.count}; {decision.message}]"
+
+
+def step_cap_reply(steps: int, last_error: str) -> str:
+    """The turn's answer when the step cap ends it; voice surfaces speak it, so plain words only."""
+    reason = (f"the last error was {last_error}" if last_error
+              else "nothing reported an error, I just never reached an answer")
+    return f"I stopped after {steps} steps without getting there: {reason}. Want me to keep going or try another way?"
+
+
+def _spoken_error_line(result: Any) -> str:
+    """A failed result's human summary or error, else the last line of its output (a traceback's
+    exception, a command's final stderr line), on one line and capped; "" when there is none."""
+    if not isinstance(result, str):
+        return ""
+    data = safe_json_loads(result)
+    text = result
+    if isinstance(data, dict):
+        text = next((v for k in _SPOKEN_ERROR_KEYS if isinstance(v := data.get(k), str) and v.strip()), "")
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    line = lines[-1].rstrip(" .") if lines else ""
+    return line if len(line) <= _SPOKEN_ERROR_MAX_CHARS else line[: _SPOKEN_ERROR_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:

@@ -448,3 +448,75 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def _varied_tool_round(i: int):
+    """One round of a runaway that never repeats itself: a new script, screenshot or command."""
+    name, args = (
+        ("execute_code", {"code": f"print('attempt {i}')"}),
+        ("vision_analyze", {"image_url": f"/tmp/screen-{i}.png", "question": "What is on screen?"}),
+        ("terminal", {"command": f"echo attempt {i}"}),
+    )[i % 3]
+    return _mock_response(
+        content="", finish_reason="tool_calls", tool_calls=[_mock_tool_call(name, json.dumps(args), f"c{i}")]
+    )
+
+
+def _run_varied_turn(platform: str, rounds: int, failing_call: int | None = None):
+    """``rounds`` varied tool rounds, then a final answer; every call succeeds except the ``failing_call``-th."""
+    agent = _make_agent(
+        "execute_code", "vision_analyze", "terminal", max_iterations=500,
+        config={"tool_loop_guardrails": {"hard_stop_enabled": True}}, platform=platform,
+    )
+    agent._disable_streaming = True
+    agent.client.chat.completions.create.side_effect = [
+        *(_varied_tool_round(i) for i in range(rounds)), _mock_response(content="done"),
+    ]
+    calls: list[str] = []
+
+    def handle(name, args, *_a, **_kw):
+        calls.append(name)
+        if len(calls) == failing_call:
+            return json.dumps({"status": "error", "output": (
+                "Traceback (most recent call last):\n  File \"script.py\", line 3\n"
+                "RuntimeError: Mail is waiting on a permission prompt\n"
+            )})
+        return json.dumps({"status": "success", "output": f"attempt {len(calls)}: nothing yet"})
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=handle),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("reply to the newest email in Mail")
+    return agent, result, calls
+
+
+def test_unattended_turn_of_varied_calls_stops_at_step_cap_with_spoken_reason():
+    """A voice turn scripted Mail behind a permission prompt for 198 calls (41 min) with hard stops on:
+    no call repeated and almost none failed, so no replay detector matched, and max_iterations (500)
+    sat far above it. A per-turn step cap ends it with a reply voice can say."""
+    agent, result, calls = _run_varied_turn("voice-safari", rounds=150, failing_call=10)
+
+    assert result["turn_exit_reason"] == "guardrail_halt", f"{len(calls)} varied tool calls ran unstopped"
+    cap = agent._tool_guardrails.config.loop_caps.max_tool_calls
+    assert len(calls) == cap
+    # The blocked (cap+1)-th call ends the turn: no further model call is spent.
+    assert agent.client.chat.completions.create.call_count == cap + 1
+    reply = result["final_response"]
+    assert reply.startswith(f"I stopped after {cap} steps without getting there: ")
+    assert "RuntimeError: Mail is waiting on a permission prompt" in reply
+    assert reply.endswith("Want me to keep going or try another way?")
+    assert not set("`*#[]{}_") & set(reply), reply  # spoken aloud: no markdown, JSON or decision codes
+
+
+@pytest.mark.parametrize("platform, rounds", [("voice-safari", 40), ("desktop", 150)])
+def test_step_cap_leaves_normal_work_and_attended_surfaces_untouched(platform, rounds):
+    """~40 calls is ordinary unattended work; attended surfaces show every call live (and run
+    100-250 call coding turns), so they get no default step cap even with hard stops on."""
+    _agent, result, calls = _run_varied_turn(platform, rounds=rounds)
+
+    assert len(calls) == rounds
+    assert result["final_response"] == "done"
+    assert "guardrail" not in result

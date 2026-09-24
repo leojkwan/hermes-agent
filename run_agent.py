@@ -151,7 +151,9 @@ from agent.codex_responses_adapter import (
     _split_responses_tool_id as _codex_split_responses_tool_id,
     _summarize_user_message_for_log,
 )
-from agent.tool_guardrails import ToolGuardrailDecision, append_toolguard_guidance, toolguard_synthetic_result
+from agent.tool_guardrails import (
+    ToolGuardrailDecision, append_toolguard_guidance, step_cap_reply, toolguard_synthetic_result,
+)
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens
 
 
@@ -1263,6 +1265,8 @@ class AIAgent(
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         # Shown to the user as the reply, so no decision codes; the code stays in result["guardrail"].
+        if decision.code == "loop_tool_call_cap":
+            return step_cap_reply(decision.count, self._tool_guardrails.last_error)
         return (
             f"I stopped retrying because I kept running {decision.tool_name or 'the same tool'} "
             f"{decision.count} times without making progress. The last result above shows what "
