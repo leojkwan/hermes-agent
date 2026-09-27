@@ -96,6 +96,13 @@ class GoalContinuationMixin:
         pending = state.pending_continuation
         if not isinstance(pending, dict) or pending.get("goal_id") != state.goal_id:
             return None
+        try:
+            valid_due = math.isfinite(float(pending.get("due_at") or 0))
+        except (TypeError, ValueError, OverflowError):
+            valid_due = False
+        if not valid_due:
+            self._pause_state("invalid continuation deadline; resume the goal to recreate its intent")
+            return None
         return dict(pending)
 
     def prepare_continuation(
@@ -124,7 +131,7 @@ class GoalContinuationMixin:
     def claim_continuation(self, intent_id: str, *, recover=False, now=None) -> dict | None:
         """Caller must first hold the native writer/turn admission. ``recover`` additionally
         requires no marker-owned turn; the existing session lease, not a new lease, owns liveness."""
-        if not self._reload_goal_record() or not self.is_active():
+        if self.get_pending_continuation() is None or self._state.goal_id != self._bound_goal_id:
             return None
         state = self._state
         pending = state.pending_continuation
