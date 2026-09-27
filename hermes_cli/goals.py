@@ -44,6 +44,8 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# One advisory refusal can be premature; repeated usable blocked verdicts stop recovery.
+DEFAULT_MAX_CONSECUTIVE_BLOCKED_VERDICTS = 3
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -409,6 +411,7 @@ class GoalState:
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
+    consecutive_blocked_verdicts: int = 0     # usable refusals, never reset by judge failure
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -436,7 +439,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_blocked_verdicts", "waiting_on_delegations")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -1174,6 +1177,7 @@ class GoalManager:
         self._state.status = "active"
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
+        self._state.consecutive_blocked_verdicts = 0
         if reset_budget:
             self._state.turns_used = 0
         return self._save()
@@ -1294,6 +1298,8 @@ class GoalManager:
             gate.last_exit_code = exit_code
             gate.last_output_tail = tail
             if passed:
+                if gate.attempts:
+                    state.consecutive_blocked_verdicts = 0
                 gate.attempts = 0
                 continue
 
@@ -1486,19 +1492,39 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
+        # Wording changes are not progress. Failed judge calls also provide no
+        # evidence that a previous blocker was resolved.
+        if not parse_failed and not transport_failed:
+            state.consecutive_blocked_verdicts = (
+                state.consecutive_blocked_verdicts + 1 if verdict == "blocked" else 0)
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
             if parked is not None:
                 return parked
 
-        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
-        # instead of burning turns on an unachievable goal or waving it through as complete.
-        # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
-        # of scope, needs user input). See #100954.
-        if verdict == "blocked":
-            return self._pause_decision(
-                f"judged unachievable: {reason}", "blocked", reason,
-                f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
+        if verdict == "blocked" and not parse_failed and not transport_failed:
+            count = state.consecutive_blocked_verdicts
+            if count >= DEFAULT_MAX_CONSECUTIVE_BLOCKED_VERDICTS:
+                return self._pause_decision(
+                    f"judged unachievable after {count} consecutive blocked verdicts: {reason}",
+                    "blocked", reason,
+                    f"🚫 Goal judged unachievable — paused after {count} blocked checks: {reason} "
+                    "Re-scope with /goal set, or override with /goal resume.",
+                )
+            if state.turns_used >= state.max_turns:
+                return self._budget_pause(state, "blocked", reason)
+            self._save()
+            prompt = self.next_continuation_prompt() + (
+                f"\n\nThe goal judge reported a possible blocker ({count}/"
+                f"{DEFAULT_MAX_CONSECUTIVE_BLOCKED_VERDICTS} checks): {reason}\n"
+                "Verify the blocker and finish any independent work still reachable. "
+                "Respect the completion contract and existing permissions. Do not bypass "
+                "credentials, approval, spending, or publication gates. A rewritten status "
+                "report is not progress; name the concrete result or the remaining gate.")
+            return _decision(
+                "active", True, prompt, "blocked", reason,
+                f"↻ Checking possible goal blocker ({count}/"
+                f"{DEFAULT_MAX_CONSECUTIVE_BLOCKED_VERDICTS}): {reason}",
             )
 
         if verdict == "done":
