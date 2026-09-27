@@ -696,12 +696,21 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     emitted = session.setdefault("_notification_emitted", set())
     handle = lambda events, deferred: _notif_handle_ready(  # noqa: E731
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
-    last_kanban_poll = last_loop_poll = last_bot_poll = 0.0
+    last_kanban_poll = last_loop_poll = last_bot_poll = last_goal_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
         if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
             last_bot_poll = now
             _poll_bot_live_delivery_guarded(sid, session, now)
+        if now - last_goal_poll >= _LOOP_POLL_SECONDS:
+            last_goal_poll = now
+            # Goal continuations use the same profile scoped idle poller as other
+            # wakeups; a current crash marker remains the first recovery source.
+            try:
+                if (goal_key := str(session.get("session_key") or "")):
+                    _maybe_schedule_auto_continue(sid, session, goal_key)
+            except Exception as goal_exc:
+                _notif_log_failure("goal continuation poll failed", goal_exc)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:

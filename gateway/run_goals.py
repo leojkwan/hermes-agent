@@ -270,6 +270,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
+        turn_result: Any = None, admitted_goal_id: Any = None, goal_was_bound: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -280,6 +281,36 @@ class GatewayGoalsMixin:
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
+            return
+        if goal_was_bound:
+            current_goal_id = getattr(getattr(mgr, "state", None), "goal_id", None)
+            if current_goal_id != admitted_goal_id:
+                logger.info("skipping stale goal post-turn result for replaced goal generation")
+                return
+
+        # A failed turn is lifecycle evidence, not a judge input.  Preserve the typed result even
+        # when the visible response is empty so GoalManager can apply its bounded retry/pause policy.
+        failed_turn = isinstance(turn_result, dict) and (
+            turn_result.get("success") is False
+            or turn_result.get("failed") is True
+            or turn_result.get("compression_exhausted") is True
+            or turn_result.get("interrupted") is True
+            or turn_result.get("cancelled") is True
+        )
+        if failed_turn and not turn_result.get("completed", False):
+            recorder = getattr(mgr, "record_turn_failure", None)
+            if callable(recorder):
+                failure = recorder(turn_result)
+                if isinstance(failure, dict):
+                    msg = failure.get("message") or ""
+                    if msg and source is not None:
+                        await self._defer_goal_status_notice_after_delivery(source, msg)
+                    prompt = failure.get("pending_continuation")
+                    if failure.get("should_continue") and prompt and source is not None:
+                        await self._persist_and_enqueue_goal_continuation(
+                            mgr, source, session_entry, prompt,
+                            kind="continue", reason=failure.get("reason", ""),
+                        )
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -303,17 +334,56 @@ class GatewayGoalsMixin:
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
-        prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
+        prompt = decision.get("continuation_prompt") or decision.get("pending_continuation") or ""
+        if not prompt or source is None:
             return
-        # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
+        if not decision.get("should_continue") and decision.get("kind") not in {"wait", "continue"}:
+            return
+        await self._persist_and_enqueue_goal_continuation(
+            mgr, source, session_entry, prompt,
+            kind=decision.get("kind", "continue"), reason=decision.get("reason", ""),
+            due_at=decision.get("due_at"),
+        )
+
+    async def _persist_and_enqueue_goal_continuation(
+        self, mgr: Any, source: Any, session_entry: Any, prompt: str, *,
+        kind: str = "continue", reason: str = "", due_at: Any = None,
+    ) -> bool:
+        """Persist intent before exposing it to the adapter FIFO.
+
+        The persisted prompt is authoritative: the event carries it as a convenience only, and the
+        pre-model claim path replaces any tampered/duplicate event text with this stored value.
+        A future due time stays in the manager's durable queue for the existing watcher to notice.
+        """
+        prepare = getattr(mgr, "prepare_continuation", None)
+        if not callable(prepare):
+            logger.error("goal continuation API unavailable; refusing transient enqueue")
+            return False
+        try:
+            intent = prepare(prompt, kind=kind or "continue", reason=reason or "", due_at=due_at)
+        except Exception:
+            logger.warning("goal continuation persistence failed", exc_info=True)
+            return False
+        if not isinstance(intent, dict) or not intent.get("id"):
+            return False
+        if due_at is not None and time.time() < float(due_at):
+            return True
         try:
             adapter = self._delivery_adapter_for(source)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
-        except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            quick_key = self._session_key_for_source(source)
+            if not adapter or not quick_key:
+                return False
+            event = self._synthetic_prompt_event(source, str(intent.get("prompt") or prompt))
+            event._goal_continuation_generated = True
+            event.metadata["goal_continuation_intent_id"] = str(intent["id"])
+            event.metadata["goal_continuation_session_id"] = str(getattr(session_entry, "session_id", ""))
+            event.metadata["goal_continuation_prompt"] = str(intent.get("prompt") or prompt)
+            event.metadata["goal_continuation_recover"] = False
+            self._enqueue_fifo(quick_key, event, adapter)
+            return True
+        except Exception:
+            logger.debug("goal continuation enqueue failed", exc_info=True)
+            return False
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
@@ -330,11 +400,23 @@ class GatewayGoalsMixin:
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip():
+        typed_failure = isinstance(agent_result, dict) and (
+            agent_result.get("success") is False
+            or agent_result.get("failed") is True
+            or agent_result.get("compression_exhausted") is True
+            or agent_result.get("interrupted") is True
+            or agent_result.get("cancelled") is True
+        ) and not agent_result.get("completed", False) and not agent_result.get("goal_continuation_stale")
+        if final_text.strip() or typed_failure:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(
+                    session_entry=session_entry, source=source, final_response=final_text,
+                    turn_result=agent_result,
+                    admitted_goal_id=getattr(event, "_gateway_admitted_goal_id", None),
+                    goal_was_bound=hasattr(event, "_gateway_admitted_goal_id"),
+                )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 
@@ -354,6 +436,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
+        turn_result: Any = None, admitted_goal_id: Any = None, goal_was_bound: bool = False,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
@@ -450,6 +533,37 @@ class GatewayGoalsMixin:
             with suppress(Exception):
                 mgr.abandon_tick()
 
+    async def _goal_wakeup_fire_one(self, entry: Any, source: Any) -> None:
+        """Expose one due persisted goal intent to the normal adapter FIFO."""
+        try:
+            from hermes_cli.goals import GoalManager
+            pending = GoalManager(entry.session_id).get_pending_continuation()
+            if not isinstance(pending, dict) or not pending.get("id"):
+                return
+            due_at = pending.get("due_at")
+            if due_at is not None and time.time() < float(due_at):
+                return
+            quick_key = self._session_key_for_source(source)
+            adapter = self._delivery_adapter_for(source)
+            if not adapter or not quick_key or self._is_session_running(quick_key):
+                return
+            if quick_key in adapter._active_sessions or self._queue_depth(quick_key, adapter=adapter):
+                return
+            event = self._synthetic_prompt_event(source, str(pending.get("prompt") or ""))
+            event._goal_continuation_generated = True
+            event.metadata["goal_continuation_intent_id"] = str(pending["id"])
+            event.metadata["goal_continuation_session_id"] = str(entry.session_id)
+            event.metadata["goal_continuation_prompt"] = str(pending.get("prompt") or "")
+            # A prior process may have died after claiming but before its durable turn marker. The
+            # watcher only marks this recoverable when the persisted session has no marker and the
+            # native runner has no live lease.
+            event.metadata["goal_continuation_recover"] = bool(
+                pending.get("claim_token") and not getattr(entry, "active_turn_token", None)
+            )
+            self._enqueue_fifo(quick_key, event, adapter)
+        except Exception:
+            logger.debug("goal wakeup failed for %s", getattr(entry, "session_id", "?"), exc_info=True)
+
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
         (SessionDB ``loop:*`` rows) and injects each due prompt via the synthetic-message path.
@@ -461,7 +575,7 @@ class GatewayGoalsMixin:
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
         from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
-        from gateway.run_idle_gates import profile_has_active_loop
+        from gateway.run_idle_gates import profile_has_active_loop, profile_has_pending_goal
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
@@ -484,6 +598,19 @@ class GatewayGoalsMixin:
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
+            try:
+                from hermes_cli.goals import list_pending_goal_session_ids
+                pending_ids = await self._run_in_executor_with_context(list_pending_goal_session_ids)
+                entries = {entry.session_id: entry for entry in self.session_store.list_sessions()}
+                for sid in pending_ids or ():
+                    entry = entries.get(sid)
+                    if entry is None or entry.origin is None or entry.suspended:
+                        continue
+                    source = self._restored_source(entry)
+                    if source is not None:
+                        await self._goal_wakeup_fire_one(entry, source)
+            except Exception:
+                logger.debug("goal continuation scan failed", exc_info=True)
 
         while self._running:
             try:
@@ -491,7 +618,7 @@ class GatewayGoalsMixin:
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
                     # no active loop. The root scan (None) is unscoped and stays cheap.
                     if profile_home is not None and not await self._run_in_executor_with_context(
-                            profile_has_active_loop, profile_home):
+                            lambda: profile_has_active_loop(profile_home) or profile_has_pending_goal(profile_home)):
                         continue
                     async with _scope(profile_home):
                         await _scan_one_store(profile_name)

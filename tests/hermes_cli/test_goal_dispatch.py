@@ -82,6 +82,12 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
             state = asdict(state)
             for key in ('created_at', 'updated_at', 'waiting_since'):
                 state.pop(key, None)
+            if pending := state.get('pending_continuation'):
+                assert pending['goal_id'] == state['goal_id']
+                assert pending['id']
+                for key in ('id', 'goal_id', 'due_at'):
+                    pending.pop(key)
+            state.pop('goal_id')
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]
 
