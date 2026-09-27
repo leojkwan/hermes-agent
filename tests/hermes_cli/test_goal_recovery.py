@@ -134,3 +134,9 @@ def test_durable_intent_lifecycle_survives_reload_and_limits_failed_turns():
     assert goals.GoalManager("invalid-deadline").claim_continuation("invalid-deadline") is None
     assert goals.load_goal("invalid-deadline").status == "paused"
     assert "valid-sibling" in goals.list_pending_goal_session_ids()
+
+    good.wait_for_seconds(30, "pending work")
+    good.prepare_continuation(good.next_continuation_prompt(), kind="wait", due_at=good.state.waiting_until)
+    assert good.stop_waiting()
+    ready = good.get_pending_continuation()
+    assert good.claim_continuation(ready["id"])
