@@ -53,6 +53,18 @@ def profile_has_active_loop(profile_home: Path) -> bool:
     return _gate(profile_home, store_has_active_loop)
 
 
+def profile_has_pending_goal(profile_home: Path) -> bool:
+    """Admit a profile to the existing wakeup sweep when durable goal work is due/pending."""
+    def _has_pending(db: Any) -> bool:
+        from hermes_cli.goals import list_pending_goal_session_ids
+        try:
+            return bool(list_pending_goal_session_ids(db=db))
+        except TypeError:
+            return bool(list_pending_goal_session_ids())
+
+    return _gate(profile_home, _has_pending)
+
+
 def profile_has_pending_handoff(profile_home: Path) -> bool:
     return _gate(profile_home, lambda db: db.has_pending_handoffs())
 

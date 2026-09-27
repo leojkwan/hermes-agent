@@ -2092,9 +2092,27 @@ class GatewayTurnMixin:
 
         await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
 
+        # Bind this admitted turn to the exact goal generation in the resolved session. The
+        # post-turn hook uses this fence to ignore a response produced for a goal replaced mid-turn.
+        event._gateway_resolved_session_id = session_entry.session_id
+        try:
+            from hermes_cli.goals import GoalManager
+            _admitted_goal = GoalManager(session_entry.session_id).state
+            event._gateway_admitted_goal_id = getattr(_admitted_goal, "goal_id", None)
+        except Exception:
+            event._gateway_admitted_goal_id = None
+
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        if not await self._mark_durable_active_turn(event, session_entry.session_key):
+            self._clear_session_env(_session_env_tokens)
+            return {
+                "success": False,
+                "failure_retryable": False,
+                "failure_reason": "goal continuation admission failed before model execution",
+                "goal_continuation_stale": bool(getattr(event, "_goal_continuation_claim_failed", False)),
+                "final_response": "",
+            }, _session_env_tokens
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
