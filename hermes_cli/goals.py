@@ -1426,6 +1426,7 @@ class GoalManager(GoalContinuationMixin):
         if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
             return False
         s.clear_wait()
+        s.pending_continuation = None
         self._save()
         return True
 

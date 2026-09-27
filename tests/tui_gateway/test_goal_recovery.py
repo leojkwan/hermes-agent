@@ -119,6 +119,23 @@ def test_profile_a_b_a_keeps_same_sid_isolated_and_foreign_pending_unrunnable(
     assert restored_a and restored_a["id"] == pending_a["id"]
     assert restored_a["prompt"] == "continue profile A"
 
+    from tui_gateway import server
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    session_b = {"session_key": sid, "profile_home": str(profile_b)}
+    claim_b = server._goal_claim_for_dispatch(session_b, pending_b)
+    assert claim_b and claim_b["id"] == pending_b["id"]
+    assert GoalManager(sid).get_pending_continuation()["claim_token"] is None
+    assert server._goal_ack_claim(session_b, {
+        "continuation_id": claim_b["id"], "continuation_claim_token": claim_b["claim_token"],
+    })
+    token = set_hermes_home_override(profile_b)
+    try:
+        assert GoalManager(sid).get_pending_continuation() is None
+    finally:
+        reset_hermes_home_override(token)
+    assert GoalManager(sid).get_pending_continuation()["id"] == pending_a["id"]
+
 
 def test_failure_recovery_is_finite_and_nonretryable_failure_pauses(isolated_goal_home):
     """Only structured retryable failures get three persisted attempts."""

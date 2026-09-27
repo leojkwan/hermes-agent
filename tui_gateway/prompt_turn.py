@@ -87,8 +87,9 @@ def _persist_goal_continuation(session: dict, prompt: str, *, kind: str = "conti
     """
     if not prompt or not str(session.get("session_key") or ""):
         return None
-    record = _goal_manager(session).prepare_continuation(
-        prompt, kind=kind, reason=reason, due_at=due_at)
+    with _session_profile_runtime_scope(session):
+        record = _goal_manager(session).prepare_continuation(
+            prompt, kind=kind, reason=reason, due_at=due_at)
     if not record:
         return None
     session["_goal_followup_record"] = dict(record)
@@ -98,21 +99,23 @@ def _persist_goal_continuation(session: dict, prompt: str, *, kind: str = "conti
 def _goal_claim_for_dispatch(session: dict, record: dict | None):
     if not isinstance(record, dict) or not record.get("id"):
         return None
-    return _goal_manager(session).claim_continuation(str(record["id"]))
+    with _session_profile_runtime_scope(session):
+        return _goal_manager(session).claim_continuation(str(record["id"]))
 
 
 def _goal_release_claim(session: dict, claim: dict | None) -> None:
     if not isinstance(claim, dict) or not claim.get("id") or not claim.get("claim_token"):
         return
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception), _session_profile_runtime_scope(session):
         _goal_manager(session).release_continuation(str(claim["id"]), str(claim["claim_token"]))
 
 
 def _goal_ack_claim(session: dict, metadata: dict | None) -> bool:
     if not isinstance(metadata, dict) or not metadata.get("continuation_id"):
         return True
-    return bool(_goal_manager(session).acknowledge_continuation(
-        str(metadata["continuation_id"]), str(metadata.get("continuation_claim_token") or "")))
+    with _session_profile_runtime_scope(session):
+        return bool(_goal_manager(session).acknowledge_continuation(
+            str(metadata["continuation_id"]), str(metadata.get("continuation_claim_token") or "")))
 
 
 def _goal_release_metadata(session: dict, metadata: dict | None) -> None:
