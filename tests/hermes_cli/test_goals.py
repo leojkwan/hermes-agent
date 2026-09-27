@@ -912,27 +912,63 @@ class TestBlockedVerdict:
         assert reason == "the repo was deleted"
         assert parse_failed is False
 
-    def test_blocked_verdict_pauses_goal_instead_of_done(self, hermes_home):
-        from unittest.mock import patch
-        from hermes_cli.goals import GoalManager
+    def test_blocked_audit_survives_reload_and_rephrasing(self, hermes_home):
+        from hermes_cli import goals
 
-        mgr = GoalManager(session_id="blocked-sid")
-        mgr.set("delete a repository that does not exist")
-        with patch(
-            "hermes_cli.goals.judge_goal",
-            return_value=("blocked", "the repo does not exist", False, None, False),
-        ):
-            decision = mgr.evaluate_after_turn(
-                "The repo cannot be deleted: it does not exist."
-            )
+        sid = "blocked-sid"
+        mgr = goals.GoalManager(session_id=sid)
+        mgr.set("repair the missing source")
+        for strike, response in enumerate((
+            "The source is missing.", "I still cannot find the source.",
+            "The required repository remains unavailable."
+        ), 1):
+            with patch("hermes_cli.goals.judge_goal", return_value=(
+                "blocked", response, False, None, False
+            )):
+                decision = mgr.evaluate_after_turn(response)
+            assert decision["status"] == ("paused" if strike == 3 else "active")
+            assert decision["should_continue"] is (strike < 3)
+            stored = json.loads(goals._get_session_db().get_meta("goal:" + sid))
+            assert stored["consecutive_blocked_verdicts"] == strike
+            mgr = goals.GoalManager(session_id=sid)
+            assert mgr.state.status != "done"
 
-        assert decision["verdict"] == "blocked"
-        assert decision["status"] == "paused"
-        assert decision["should_continue"] is False
-        assert "unachievable" in decision["message"].lower()
-        assert mgr.state is not None
-        assert mgr.state.status == "paused"
-        assert "unachievable" in (mgr.state.paused_reason or "").lower()
+    def test_blocked_audit_requires_usable_progress_and_honors_controls(self, hermes_home):
+        from hermes_cli import goals
+
+        assert goals.GoalState.from_json('{"goal": "legacy"}').consecutive_blocked_verdicts == 0
+        mgr = goals.GoalManager(session_id="blocked-recovery")
+        mgr.set("repair the missing repo", max_turns=12)
+        outcomes = (
+            ("blocked", "missing repo", False, None, False),
+            ("continue", "bad judge JSON", True, None, False),
+            ("continue", "judge offline", False, None, True),
+            ("continue", "source found", False, None, False),
+        )
+        for expected, outcome in zip((1, 1, 1, 0), outcomes):
+            with patch("hermes_cli.goals.judge_goal", return_value=outcome):
+                assert mgr.evaluate_after_turn(outcome[1])["should_continue"]
+                assert mgr.state.consecutive_blocked_verdicts == expected
+        blocked = ("blocked", "missing repo", False, None, False)
+        with patch("hermes_cli.goals.judge_goal", return_value=blocked):
+            mgr.evaluate_after_turn("source missing")
+            mgr.evaluate_after_turn("still missing")
+        with patch("hermes_cli.goals.judge_goal", return_value=(
+            "wait", "a source fetch is running", False, {"seconds": 30}, False
+        )):
+            assert not mgr.evaluate_after_turn("fetch launched")["should_continue"]
+            assert mgr.state.consecutive_blocked_verdicts == 0
+        mgr.stop_waiting()
+        with patch("hermes_cli.goals.judge_goal", return_value=blocked):
+            assert mgr.evaluate_after_turn("missing source")["should_continue"]
+            mgr.pause()
+            assert not mgr.evaluate_after_turn("still missing")["should_continue"]
+            mgr.resume(reset_budget=False)
+            assert mgr.state.consecutive_blocked_verdicts == 0
+            mgr.state.max_turns = mgr.state.turns_used + 1
+            decision = mgr.evaluate_after_turn("missing source")
+            assert decision["status"] == "paused"
+            assert "budget" in mgr.state.paused_reason
 
 
 def test_goal_session_db_is_the_registry_shared_handle(hermes_home):
