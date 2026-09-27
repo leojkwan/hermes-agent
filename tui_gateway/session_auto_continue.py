@@ -55,6 +55,61 @@ def _auto_continue_note(prompt: str) -> str:
             f"finish the task. The interrupted request was:]\n\n{prompt}")
 
 
+def _maybe_schedule_pending_goal(sid: str, session: dict) -> dict | None:
+    """Restore one durable goal continuation when no crash marker owns recovery."""
+    session_key = str(session.get("session_key") or "")
+    if not session_key or session.get("source") == "bot_room":
+        return None
+    with _session_profile_runtime_scope(session):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_key)
+        pending = mgr.get_pending_continuation()
+        if read_turn_marker(_session_home(session), session_key) is not None:
+            return None
+        if session.get("queued_prompt") or session.get("queued_prompts"):
+            return None
+    if not isinstance(pending, dict) or not pending.get("id") or not pending.get("prompt"):
+        return None
+    if session.get("_auto_continue_scheduled"):
+        return None
+    session["_auto_continue_scheduled"] = True
+
+    def kickoff() -> None:
+        try:
+            with _session_profile_runtime_scope(session):
+                if read_turn_marker(_session_home(session), session_key) is not None:
+                    return
+                _start_agent_build(sid, session)
+                if _wait_agent(session, f"__goal_continue__{int(time.time() * 1000)}", timeout=120.0):
+                    return
+                with _session_turn_admission(session) as admitted:
+                    if not admitted or session.get("running") or session.get("_closing") or session.get("_finalized"):
+                        return
+                    session["running"] = True
+                claimed = mgr.claim_continuation(str(pending["id"]), recover=True)
+                if not claimed:
+                    _notif_release_turn(session)
+                    return
+                metadata = {"continuation_id": claimed["id"],
+                            "continuation_claim_token": claimed["claim_token"]}
+                started = _run_prompt_submit(
+                    f"__goal_continue__{int(time.time() * 1000)}", sid, session,
+                    str(claimed["prompt"]), display_metadata=metadata)
+                if not started:
+                    mgr.release_continuation(str(claimed["id"]), str(claimed["claim_token"]))
+                    _notif_release_turn(session)
+        except Exception:
+            logger.warning("pending goal continuation dispatch failed for %s", session_key, exc_info=True)
+            _notif_release_turn(session)
+        finally:
+            session.pop("_auto_continue_scheduled", None)
+
+    if _start_session_work(kickoff, name=f"goal-continue-{sid}") is None:
+        session.pop("_auto_continue_scheduled", None)
+        return None
+    return {"id": pending["id"], "attempt": pending.get("attempt", 0)}
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
     """Kick off a continuation turn for a crash-interrupted session (session.resume cold paths). Returns a descriptor
     for the resume payload when scheduled, else None. The turn runs on a background thread after the deferred agent
@@ -65,7 +120,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     home = _session_home(session)
     if (marker := read_turn_marker(home, session_key)) is None:
-        return None
+        return _maybe_schedule_pending_goal(sid, session)
     if not marker.get("auto_continue", True):
         return None  # The mailbox owns recovery and receipt identity for imported turns.
     # Ownership, not forensics: a sibling backend sharing this HERMES_HOME can be mid-turn on this very session, so

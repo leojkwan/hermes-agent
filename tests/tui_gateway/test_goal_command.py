@@ -337,6 +337,50 @@ def test_iteration_limit_fallback_is_judged_and_can_continue(
     assert [p["status"] for p in completes] == ["complete", "complete"]
 
 
+def test_claim_ack_failure_stops_before_turn_input_or_model_call(
+    server, turn_env, monkeypatch
+):
+    """The durable marker owns recovery if continuation ACK fails mid-dispatch."""
+    from hermes_cli.goals import GoalManager
+    from tui_gateway.turn_marker import read_turn_marker
+
+    session_key = "goal-ack-race"
+    manager = GoalManager(session_key)
+    manager.set("finish the task")
+    pending = manager.prepare_continuation("continue after restart")
+    claim = manager.claim_continuation(pending["id"])
+    assert claim
+
+    model_calls = []
+    agent = types.SimpleNamespace(
+        session_id=session_key,
+        clear_interrupt=lambda: None,
+        run_conversation=lambda *args, **kwargs: model_calls.append((args, kwargs)),
+    )
+    session = _turn_session(agent, session_key)
+    prepared = []
+    monkeypatch.setattr(server, "_goal_ack_claim", lambda *_args: False)
+    monkeypatch.setattr(
+        server,
+        "_prepare_turn_input",
+        lambda *args: prepared.append(args) or (_ for _ in ()).throw(AssertionError("must not prepare")),
+    )
+
+    assert server._run_prompt_submit(
+        "rid", "sid", session, claim["prompt"],
+        display_metadata={
+            "continuation_id": claim["id"],
+            "continuation_claim_token": claim["claim_token"],
+        },
+    )
+
+    assert prepared == []
+    assert model_calls == []
+    assert read_turn_marker(server._hermes_home, session_key) is not None
+    stored = GoalManager(session_key).get_pending_continuation()
+    assert stored and stored["claim_token"] == claim["claim_token"]
+
+
 # ── active-goal recovery after compression exhaustion ───────────────
 
 

@@ -1371,6 +1371,8 @@ class GatewayInboundMixin:
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
+        except Exception:
+            raise
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
@@ -1389,6 +1391,78 @@ class GatewayInboundMixin:
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+
+    def _claim_goal_continuation_before_model(self, event: Any, session_key: str):
+        """Claim a persisted synthetic goal intent after session admission, before model work."""
+        metadata = getattr(event, "metadata", None) or {}
+        intent_id = metadata.get("goal_continuation_intent_id")
+        if not intent_id:
+            return None
+        if not getattr(event, "internal", False) and not getattr(event, "_goal_continuation_generated", False):
+            logger.warning("refusing goal intent metadata on an untrusted external event")
+            return None
+        try:
+            from hermes_cli.goals import GoalManager
+            # The resolved session id is installed by _hmwa_prepare_turn; event metadata is only
+            # an intent selector and cannot choose another session's goal record.
+            session_id = getattr(event, "_gateway_resolved_session_id", None)
+            if not session_id:
+                session_id = self.session_store.peek_session_id(session_key)
+            if not session_id:
+                return None
+            claimed = GoalManager(session_id=session_id).claim_continuation(
+                str(intent_id), recover=bool(metadata.get("goal_continuation_recover", False))
+            )
+            if not isinstance(claimed, dict):
+                return None
+            prompt = str(claimed.get("prompt") or "").strip()
+            if not prompt:
+                return None
+            event.text = prompt
+            event._goal_continuation_intent_id = str(intent_id)
+            event._goal_continuation_claim_token = claimed.get("claim_token")
+            event._goal_continuation_session_id = str(session_id)
+            return claimed
+        except Exception:
+            logger.warning("goal continuation claim failed; refusing synthetic turn", exc_info=True)
+            return None
+
+    def _discard_goal_continuation_for_human(self, session_key: str) -> None:
+        try:
+            from hermes_cli.goals import GoalManager
+            session_id = self.session_store.peek_session_id(session_key)
+            if session_id:
+                GoalManager(session_id=session_id).discard_continuation()
+        except Exception:
+            logger.debug("human goal continuation invalidation failed", exc_info=True)
+
+    def _release_goal_continuation_claim(self, event: Any) -> None:
+        intent_id = getattr(event, "_goal_continuation_intent_id", None)
+        token = getattr(event, "_goal_continuation_claim_token", None)
+        sid = getattr(event, "_goal_continuation_session_id", None)
+        if not intent_id or not token or not sid:
+            return
+        try:
+            from hermes_cli.goals import GoalManager
+            GoalManager(session_id=sid).release_continuation(intent_id, token)
+        except Exception:
+            logger.warning("goal continuation claim release failed", exc_info=True)
+
+    def _ack_goal_continuation_claim(self, event: Any) -> bool:
+        intent_id = getattr(event, "_goal_continuation_intent_id", None)
+        token = getattr(event, "_goal_continuation_claim_token", None)
+        sid = getattr(event, "_goal_continuation_session_id", None)
+        if not intent_id or not token or not sid:
+            return False
+        try:
+            from hermes_cli.goals import GoalManager
+            acknowledged = bool(GoalManager(session_id=sid).acknowledge_continuation(intent_id, token))
+            if not acknowledged:
+                logger.error("goal continuation acknowledgement rejected for %s", intent_id)
+            return acknowledged
+        except Exception:
+            logger.warning("goal continuation acknowledgement failed", exc_info=True)
+            return False
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
@@ -1765,6 +1839,20 @@ class GatewayInboundMixin:
         # metadata, transcripts, and platform payloads.
         event._gateway_active_turn_session_key = session_key
         event._gateway_active_turn_token = token
+        # Continuation claims are made only after the native turn lease and durable marker exist.
+        # ACK is the handoff fence: once it succeeds, this turn owns the intent and crash recovery
+        # must not enqueue it a second time.
+        if (getattr(event, "metadata", None) or {}).get("goal_continuation_intent_id"):
+            claimed = self._claim_goal_continuation_before_model(event, session_key)
+            if claimed is None or not self._ack_goal_continuation_claim(event):
+                self._release_goal_continuation_claim(event)
+                await self._clear_durable_active_turn(event)
+                event._goal_continuation_claim_failed = True
+                return False
+        elif not getattr(event, "internal", False):
+            # A real user turn wins only after this turn has a durable marker. This prevents a
+            # pre-marker failure from discarding the pending synthetic work.
+            self._discard_goal_continuation_for_human(session_key)
         return True
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
