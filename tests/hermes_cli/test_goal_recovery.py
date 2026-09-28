@@ -133,6 +133,12 @@ def test_durable_intent_lifecycle_survives_reload_and_limits_failed_turns():
     goals.save_goal("invalid-deadline", bad)
     assert goals.GoalManager("invalid-deadline").claim_continuation("invalid-deadline") is None
     assert goals.load_goal("invalid-deadline").status == "paused"
+    not_finite = goals.GoalState(goal="nonfinite deadline", goal_id="g", pending_continuation={
+        "id": "nonfinite-deadline", "goal_id": "g", "prompt": "resume", "due_at": float("nan"),
+    })
+    goals.save_goal("nonfinite-deadline", not_finite)
+    assert goals.GoalManager("nonfinite-deadline").claim_continuation("nonfinite-deadline") is None
+    assert goals.load_goal("nonfinite-deadline").status == "paused"
     assert "valid-sibling" in goals.list_pending_goal_session_ids()
 
     good.wait_for_seconds(30, "pending work")

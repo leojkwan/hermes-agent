@@ -138,7 +138,14 @@ class GoalContinuationMixin:
         pending = self._state.pending_continuation
         if not pending or pending.get("id") != intent_id:
             return None
-        if float(pending.get("due_at") or 0) > (time.time() if now is None else now):
+        try:
+            due_at = float(pending.get("due_at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            due_at = float("nan")
+        if not math.isfinite(due_at):
+            self._pause_state("invalid continuation deadline")
+            return None
+        if due_at > (time.time() if now is None else now):
             return None
         if pending.get("claim_token"):
             if not recover or _claim_owner_alive(pending):
