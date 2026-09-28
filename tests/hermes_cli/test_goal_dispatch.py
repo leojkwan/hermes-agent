@@ -2,7 +2,9 @@
 import asyncio
 import os
 import queue
-from types import SimpleNamespace
+import socket
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -12,6 +14,14 @@ from hermes_cli import goals
 def _surface(surface, mgr, monkeypatch, prompts=None):
     prompts = prompts if prompts is not None else []
     if surface == "cli":
+        # This test exercises command state, not CLI dependency activation or
+        # terminal rendering. Importing cli.py from a checkout inside the real
+        # Hermes home trips the home-I/O guard while probing the source manifest.
+        console = ModuleType("cli")
+        setattr(console, "_cprint", lambda *args, **kwargs: None)
+        setattr(console, "_DIM", "")
+        setattr(console, "_RST", "")
+        monkeypatch.setitem(sys.modules, "cli", console)
         from hermes_cli.cli_commands_mixin import CLICommandsMixin
         cli = object.__new__(CLICommandsMixin)
         cli._get_goal_manager = lambda: mgr
@@ -45,6 +55,12 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
                 return asyncio.run(runner._busy_goal_command(event, mgr.session_id, None))
             return asyncio.run(runner._handle_goal_command(event))
         return execute
+    # The TUI imports process_bootstrap only for the socket racer, which no
+    # goal command calls. Avoid bootstrapping source dependencies under the
+    # home-I/O guard; the actual gateway command handler remains unmocked.
+    bootstrap = ModuleType("hermes_bootstrap")
+    setattr(bootstrap, "_happy_eyeballs_create_connection", socket.create_connection)
+    monkeypatch.setitem(sys.modules, "hermes_bootstrap", bootstrap)
     from tui_gateway import server
     server._sessions[mgr.session_id] = {'session_key': mgr.session_id}
     def execute(arg):
