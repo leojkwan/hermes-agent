@@ -15,6 +15,7 @@ from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
+from hermes_cli.goals_continuation import finite_continuation_deadline
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -366,7 +367,12 @@ class GatewayGoalsMixin:
             return False
         if not isinstance(intent, dict) or not intent.get("id"):
             return False
-        if due_at is not None and time.time() < float(due_at):
+        deadline = finite_continuation_deadline(intent.get("due_at") or 0)
+        if deadline is None:
+            await getattr(self, "_run_in_executor_with_context")(
+                mgr.pause_invalid_continuation, intent["id"])
+            return False
+        if time.time() < deadline:
             return True
         try:
             adapter = self._delivery_adapter_for(source)
@@ -537,11 +543,16 @@ class GatewayGoalsMixin:
         """Expose one due persisted goal intent to the normal adapter FIFO."""
         try:
             from hermes_cli.goals import GoalManager
-            pending = GoalManager(entry.session_id).get_pending_continuation()
+            manager = GoalManager(entry.session_id)
+            pending = manager.get_pending_continuation()
             if not isinstance(pending, dict) or not pending.get("id"):
                 return
-            due_at = pending.get("due_at")
-            if due_at is not None and time.time() < float(due_at):
+            deadline = finite_continuation_deadline(pending.get("due_at") or 0)
+            if deadline is None:
+                await getattr(self, "_run_in_executor_with_context")(
+                    manager.pause_invalid_continuation, pending["id"])
+                return
+            if time.time() < deadline:
                 return
             quick_key = self._session_key_for_source(source)
             adapter = self._delivery_adapter_for(source)

@@ -12,6 +12,15 @@ logger = logging.getLogger(__name__)
 RECOVERY_DELAY_SECONDS = 60
 
 
+def finite_continuation_deadline(value) -> float | None:
+    """Return a persisted deadline only when it can be compared safely."""
+    try:
+        deadline = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return deadline if math.isfinite(deadline) else None
+
+
 def _claim_owner_alive(pending: dict) -> bool:
     import psutil
 
@@ -98,6 +107,21 @@ class GoalContinuationMixin:
             return None
         return dict(pending)
 
+    def pause_invalid_continuation(self, intent_id: str) -> bool:
+        """Fail closed only for the same persisted intent; never pause a replaced goal."""
+        if not self._reload_goal_record():
+            return False
+        state = self._state
+        if state is None or state.status != "active":
+            return False
+        pending = state.pending_continuation
+        if not isinstance(pending, dict) or pending.get("id") != intent_id:
+            return False
+        if finite_continuation_deadline(pending.get("due_at") or 0) is not None:
+            return False
+        getattr(self, "_pause_state")("invalid continuation deadline")
+        return self._last_write_succeeded
+
     def prepare_continuation(
         self, prompt: str, *, kind="continue", reason="", due_at=None, max_attempts=3,
     ) -> dict | None:
@@ -138,11 +162,8 @@ class GoalContinuationMixin:
         pending = self._state.pending_continuation
         if not pending or pending.get("id") != intent_id:
             return None
-        try:
-            due_at = float(pending.get("due_at") or 0)
-        except (TypeError, ValueError, OverflowError):
-            due_at = float("nan")
-        if not math.isfinite(due_at):
+        due_at = finite_continuation_deadline(pending.get("due_at") or 0)
+        if due_at is None:
             self._pause_state("invalid continuation deadline")
             return None
         if due_at > (time.time() if now is None else now):

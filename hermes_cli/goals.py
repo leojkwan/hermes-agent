@@ -665,9 +665,10 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     return load_goal_record(session_id)[1]
 
 
-def list_pending_goal_session_ids() -> List[str]:
-    """Recovery candidates from this profile's existing records; active alone is insufficient."""
-    db = _get_session_db()
+def list_pending_goal_session_ids(db=None) -> List[str]:
+    """Recovery candidates from this profile's store; active alone is insufficient."""
+    if db is None:
+        db = _get_session_db()
     if db is None:
         return []
     candidates = []
