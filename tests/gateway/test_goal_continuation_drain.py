@@ -147,34 +147,47 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
 
 
 @pytest.mark.asyncio
-async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_home):
+async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_home, monkeypatch):
     """_post_turn_goal_continuation resolves the FIFO key via
     _session_key_for_source; the adapter drain uses build_session_key on the
     event source. These must agree or the continuation is orphaned under a
     key nobody drains (the silent-stall shape from #47699)."""
-    from unittest.mock import AsyncMock, patch
-    from types import SimpleNamespace
+    from datetime import datetime
+    from types import ModuleType
+    from unittest.mock import patch
+    import socket
+    import sys
     import uuid
 
-    from gateway.run_busy import GatewayBusySessionMixin
-    from gateway.run_goals import GatewayGoalsMixin
+    # Only bypass the CLI dependency bootstrap; the real runner and its key resolver stay in test.
+    bootstrap = ModuleType("hermes_bootstrap")
+    bootstrap._happy_eyeballs_create_connection = socket.create_connection
+    monkeypatch.setitem(sys.modules, "hermes_bootstrap", bootstrap)
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry, SessionStore
     from hermes_cli.goals import GoalManager
 
     src = _slack_thread_source()
     adapter_key = build_session_key(src)
 
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=adapter_key,
+        session_id=f"goal-sess-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner.session_store = SessionStore(sessions_dir=hermes_home / "sessions", config=runner.config)
+
     adapter = _DrainProbeAdapter()
-
-    class _GoalRunner(GatewayGoalsMixin, GatewayBusySessionMixin):
-        _goal_max_turns_from_config = staticmethod(lambda: 10)
-        _warm_goals_session_db = AsyncMock()
-        _run_in_executor_with_context = AsyncMock(side_effect=lambda fn, *args: fn(*args))
-        _defer_goal_status_notice_after_delivery = AsyncMock()
-        _session_key_for_source = staticmethod(lambda _source: adapter_key)
-        _delivery_adapter_for = staticmethod(lambda _source: adapter)
-
-    runner = _GoalRunner()
-    session_entry = SimpleNamespace(session_id=f"goal-sess-{uuid.uuid4().hex[:8]}")
+    runner.adapters = {Platform.SLACK: adapter}
 
     GoalManager(session_entry.session_id).set("ship it")
     with patch(
