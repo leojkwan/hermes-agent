@@ -13,6 +13,7 @@ matter and are pinned here:
 """
 
 import json
+import re
 import threading
 import types
 
@@ -106,6 +107,29 @@ class TestVoiceLiveTurnNote:
         note = server._hud_surface_note(busy_session)
         assert note.startswith(voice_live.VOICE_LIVE_TURN_NOTE)
         assert "User: what's the weather" in note
+
+    def test_spoken_context_is_background_for_the_request_that_follows(self, busy_session):
+        """A turn answers only the request it carries. The recent-speech block rides ahead of that request, so
+        the note must mark it as background: a held ask ("boiling point") answered the capital and spider
+        questions beside it, and a job the voice layer had already handed off would be started twice."""
+        context = "User: what's the capital of Australia\nHermes: On it.\nUser: run sleep 60 in the foreground"
+        server._methods["prompt.submit"](
+            "r1", {"session_id": "sid", "text": "boiling point of water", "queued": True, "surface": "voice-live",
+                   "voice_context": context})
+
+        note = server._hud_surface_note(busy_session)
+        framing = note[len(voice_live.VOICE_LIVE_TURN_NOTE):].replace(context, "")
+        model_input = server._prepend_note("boiling point of water", note)
+
+        assert "[Recent spoken conversation" in framing  # call_scorer finds voice sessions by this marker
+        assert re.search(r"background", framing, re.I)
+        assert re.search(r"other requests?", framing, re.I)
+        # it speaks of the conversation "above" and the request "below": block, then clause, then the request
+        assert model_input.index(context) < model_input.index("background") < model_input.rindex("boiling point of water")
+
+    def test_note_without_context_has_no_block_to_frame(self):
+        assert voice_live.voice_live_turn_note("") == voice_live.VOICE_LIVE_TURN_NOTE
+        assert voice_live.voice_live_turn_note("  \n") == voice_live.VOICE_LIVE_TURN_NOTE
 
     def test_voice_context_ignored_off_the_live_surface(self, busy_session):
         server._methods["prompt.submit"](

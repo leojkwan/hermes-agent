@@ -55,6 +55,10 @@ What you'll see:
 
 ## Commands
 
+A single `blocked` judgment gets a bounded recovery turn to verify the blocker and finish reachable independent work. Three consecutive usable blocked judgments pause the goal, even if the response or reason is reworded. A usable nonblocked judgment, a repaired quality gate, or explicit `/goal resume` starts a fresh audit; malformed or failed judge calls do not count as progress. The audit persists across session reloads.
+
+Recovery keeps the existing completion contract, tool permissions, explicit pause/clear controls, quality-gate retry limits, and turn budget. It never grants approval to cross a credential, spending, or publication gate.
+
 | Command | What it does |
 |---|---|
 | `/goal <text>` | Set (or replace) the standing goal. Kicks off the first turn immediately so you don't need to send a separate message. |

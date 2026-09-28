@@ -64,14 +64,78 @@ def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
 
 def _active_goal_manager(session: dict):
     """The session's GoalManager when a goal is active, else None."""
+    goal_mgr = _goal_manager(session)
+    return goal_mgr if goal_mgr.is_active() else None
+
+
+def _goal_manager(session: dict):
+    """Return the profile-scoped manager used by durable continuation hooks."""
     from hermes_cli.goals import GoalManager
     try:
         max_turns = int((_load_cfg().get("goals") or {}).get("max_turns", 20) or 20)
     except Exception:
         max_turns = 20
-    goal_mgr = GoalManager(
-        session_id=str(session.get("session_key") or ""), default_max_turns=max_turns)
-    return goal_mgr if goal_mgr.is_active() else None
+    return GoalManager(session_id=str(session.get("session_key") or ""), default_max_turns=max_turns)
+
+
+def _persist_goal_continuation(session: dict, prompt: str, *, kind: str = "continue",
+                               reason: str = "", due_at: float | None = None) -> str | None:
+    """Persist intent before returning it to the post-turn dispatcher.
+
+    The manager owns the SQLite row and its claim token.  The session copy is only a
+    handoff between the turn thread and the post-turn dispatcher in this process.
+    """
+    if not prompt or not str(session.get("session_key") or ""):
+        return None
+    with _session_profile_runtime_scope(session):
+        record = _goal_manager(session).prepare_continuation(
+            prompt, kind=kind, reason=reason, due_at=due_at)
+    if not record:
+        return None
+    session["_goal_followup_record"] = dict(record)
+    return str(record.get("prompt") or prompt)
+
+
+def _goal_claim_for_dispatch(session: dict, record: dict | None):
+    if not isinstance(record, dict) or not record.get("id"):
+        return None
+    with _session_profile_runtime_scope(session):
+        return _goal_manager(session).claim_continuation(str(record["id"]))
+
+
+def _goal_release_claim(session: dict, claim: dict | None) -> None:
+    if not isinstance(claim, dict) or not claim.get("id") or not claim.get("claim_token"):
+        return
+    with contextlib.suppress(Exception), _session_profile_runtime_scope(session):
+        _goal_manager(session).release_continuation(str(claim["id"]), str(claim["claim_token"]))
+
+
+def _goal_ack_claim(session: dict, metadata: dict | None) -> bool:
+    if not isinstance(metadata, dict) or not metadata.get("continuation_id"):
+        return True
+    with _session_profile_runtime_scope(session):
+        return bool(_goal_manager(session).acknowledge_continuation(
+            str(metadata["continuation_id"]), str(metadata.get("continuation_claim_token") or "")))
+
+
+def _goal_release_metadata(session: dict, metadata: dict | None) -> None:
+    if not isinstance(metadata, dict) or not metadata.get("continuation_id"):
+        return
+    _goal_release_claim(session, {
+        "id": metadata.get("continuation_id"),
+        "claim_token": metadata.get("continuation_claim_token"),
+    })
+
+
+def _claim_matching_user_kickoff(session: dict, text: Any, display_kind: str | None) -> dict | None:
+    """Adopt a persisted /goal kickoff only when the admitted user text matches it."""
+    if display_kind or not isinstance(text, str):
+        return None
+    with _session_profile_runtime_scope(session):
+        pending = _goal_manager(session).get_pending_continuation()
+        if not pending or pending.get("prompt") != text:
+            return None
+        return _goal_manager(session).claim_continuation(str(pending["id"]))
 
 
 def _plan_goal_compression_recovery(
@@ -103,7 +167,9 @@ def _plan_goal_compression_recovery(
         session[_GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = {
             "goal_created_at": goal_created_at, "goal": goal_text, "attempts": attempts + 1}
         return (
-            continuation_prompt,
+            _persist_goal_continuation(
+                session, continuation_prompt, kind="compression_failure",
+                reason="context compression exhausted"),
             "Context compression was exhausted. Retrying the active goal once.")
     goal_mgr.pause(reason="context compression exhausted twice consecutively")
     # A later explicit /goal resume gets a fresh bounded recovery cycle.
@@ -337,6 +403,11 @@ def _goal_followup_after_turn(
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
     goal_followup = None
+    with _session_profile_runtime_scope(session):
+        current_goal = _goal_manager(session).state
+    admitted_goal_id = session.get("_admitted_goal_id")
+    if "_admitted_goal_id" in session and getattr(current_goal, "goal_id", None) != admitted_goal_id:
+        return None
     compression_exhausted = bool(isinstance(result, dict) and result.get("compression_exhausted"))
     try:
         recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
@@ -350,6 +421,25 @@ def _goal_followup_after_turn(
     except Exception as _goal_recovery_exc:
         _hook_failure("goal compression recovery", _goal_recovery_exc)
     if compression_exhausted or not _is_successful_goal_turn(result, status, raw):
+        if isinstance(result, dict) and (compression_exhausted or result.get("failed")
+                                         or result.get("interrupted") or status == "error"
+                                         or result.get("failure_retryable") is True
+                                         or (isinstance(result.get("error_surface"), dict)
+                                             and result["error_surface"].get("retryable") is True)):
+            try:
+                failure = dict(result)
+                if failure.get("failure_retryable") is not True:
+                    failure["failure_retryable"] = bool((failure.get("error_surface") or {}).get("retryable"))
+                decision = _active_goal_manager(session)
+                if decision is not None:
+                    recovery = decision.record_turn_failure(failure)
+                    if recovery.get("message"):
+                        _emit("status.update", sid, {"kind": "goal", "text": recovery["message"]})
+                    pending = recovery.get("pending_continuation")
+                    if pending:
+                        session["_goal_followup_record"] = dict(pending)
+            except Exception as _failure_exc:
+                _hook_failure("goal failure recovery", _failure_exc)
         return goal_followup
     try:
         if session.get("session_key") and (goal_mgr := _active_goal_manager(session)) is not None:
@@ -366,9 +456,20 @@ def _goal_followup_after_turn(
                 raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
             if verdict_msg := decision.get("message") or "":
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
-            if decision.get("should_continue") and (
-                cont_prompt := decision.get("continuation_prompt") or ""):
-                goal_followup = cont_prompt
+            verdict = str(decision.get("verdict") or "continue")
+            cont_prompt = decision.get("continuation_prompt") or decision.get("prompt") or ""
+            if verdict == "wait" and not cont_prompt:
+                cont_prompt = goal_mgr.next_continuation_prompt() or ""
+            if cont_prompt and (decision.get("should_continue") or verdict == "wait"):
+                persisted = _persist_goal_continuation(
+                    session, cont_prompt, kind=verdict,
+                    reason=str(decision.get("reason") or ""),
+                    due_at=decision.get("due_at") or decision.get("waiting_until"))
+                # WAIT intent is durable but must remain parked for the idle poller.
+                if verdict == "wait":
+                    goal_followup = None
+                else:
+                    goal_followup = persisted
     except Exception as _goal_exc:
         _hook_failure("goal continuation hook", _goal_exc)
     return goal_followup
@@ -413,12 +514,16 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
 
 
 def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
-                            on_done=None, on_error=None) -> None:
+                            on_done=None, on_error=None, display_metadata: dict | None = None) -> None:
     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
     release ``running``."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        submit_kwargs = {"display_metadata": display_metadata} if display_metadata is not None else {}
+        started = _run_prompt_submit(rid, sid, session, prompt, **submit_kwargs)
+        if not started and on_error is not None:
+            on_error()
+            return
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -446,7 +551,20 @@ def _run_post_turn_followups(
             if not admitted or session.get("running"):
                 return  # user already sent something — their turn wins
             session["running"] = True
-        _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")
+        record = session.pop("_goal_followup_record", None)
+        claim = _goal_claim_for_dispatch(session, record)
+        if record is not None and claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            return
+        metadata = None
+        if claim:
+            metadata = {"continuation_id": claim.get("id"),
+                        "continuation_claim_token": claim.get("claim_token")}
+        _dispatch_followup_turn(
+            rid, sid, session, goal_followup, "goal continuation dispatch",
+            display_metadata=metadata,
+            on_error=lambda: _goal_release_metadata(session, metadata))
     # Safety net for completion events that arrived mid-turn.  Ownership is positive-proof
     # and compression-chain aware (same fail-closed gate as the poller): session B must
     # not consume session A's event.  Unclaimable events are requeued for the poller.
@@ -1000,6 +1118,9 @@ def _run_prompt_submit(
     if admitted is None:
         return False
     images, agent = admitted
+    with _session_profile_runtime_scope(session):
+        admitted_state = _goal_manager(session).state
+    session["_admitted_goal_id"] = getattr(admitted_state, "goal_id", None)
     from gateway.warning_notifications import diagnostic_turn_muted
     from agent.notification_presentation import notification_config_snapshot
     with _session_profile_runtime_scope(session):
@@ -1007,6 +1128,13 @@ def _run_prompt_submit(
         muted = diagnostic_turn_muted(display_metadata, "tui", notification_config)
     if muted:
         display_kind = "hidden"
+    user_kickoff_claim = _claim_matching_user_kickoff(session, text, display_kind)
+    if user_kickoff_claim:
+        display_metadata = {
+            **(display_metadata or {}),
+            "continuation_id": user_kickoff_claim["id"],
+            "continuation_claim_token": user_kickoff_claim["claim_token"],
+        }
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()
@@ -1032,10 +1160,36 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
-            notification_category=(display_metadata or {}).get("notification_category"))
+        continuation_claimed = bool((display_metadata or {}).get("continuation_id"))
+        continuation_acked = False
+        marker_durable = False
         goal_followup = None
         try:
+            st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
+                notification_category=(display_metadata or {}).get("notification_category"))
+            if continuation_claimed:
+                marker_durable = read_turn_marker(_session_home(session), st.marker_key) is not None
+                if not marker_durable:
+                    raise RuntimeError("goal continuation marker was not durable")
+                # ACK failure aborts before any model/tool call. The marker remains the
+                # owner of recovery; it is not released after this point.
+                continuation_acked = _goal_ack_claim(session, display_metadata)
+                if not continuation_acked:
+                    with _session_profile_runtime_scope(session):
+                        latest_goal = _goal_manager(session).state
+                    if (latest_goal is None or latest_goal.status != "active"
+                            or latest_goal.goal_id != session.get("_admitted_goal_id")):
+                        _retire_turn_marker(session, st.marker_key)
+                        st.result = {"failed": True, "interrupted": True, "completed": False,
+                                     "failure_retryable": False, "final_response": ""}
+                        return st.result, None
+                    st.receipt_committed = False
+                    raise RuntimeError("goal continuation acknowledgement failed")
+            elif not display_kind:
+                # A winning real-user turn retires the old intent only after its
+                # own marker is durable. A crash before this point preserves it.
+                with _session_profile_runtime_scope(session):
+                    _goal_manager(session).discard_continuation()
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
@@ -1061,6 +1215,8 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if continuation_claimed and not marker_durable and not continuation_acked:
+                _goal_release_metadata(session, display_metadata)
             _finish_turn(sid, session, st)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)

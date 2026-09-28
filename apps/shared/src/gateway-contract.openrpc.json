@@ -2780,12 +2780,12 @@
     },
     {
       "name": "prompt.background",
-      "summary": "Run a task on a fresh agent in the background; the answer arrives as background.complete.",
+      "summary": "Run a task on a background agent (a fresh session, or with continue_task_id the next turn of an earlier one); the answer arrives as background.complete.",
       "params": [
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/SideAgentParams"
+            "$ref": "#/components/schemas/BackgroundParams"
           }
         }
       ],
@@ -5089,6 +5089,50 @@
         ],
         "title": "AutoReloadCardKind",
         "type": "string"
+      },
+      "BackgroundParams": {
+        "additionalProperties": false,
+        "description": "``continue_task_id``: a ``task_id`` an earlier ``prompt.background`` on THIS session returned.\nThe ask runs as that background session's next turn (same row, its transcript replayed), queued\nbehind a turn still running; the result echoes the same ``task_id``. Malformed \u2192 ``4004``,\nunknown or another session's \u2192 ``4040``.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "continue_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Continue Task Id"
+          }
+        },
+        "required": [
+          "session_id",
+          "text"
+        ],
+        "title": "BackgroundParams",
+        "type": "object"
       },
       "BatteryCategory": {
         "description": "``agent/battery.py::battery_category`` colour bucket.",

@@ -2063,6 +2063,7 @@ tool_loop_guardrails:
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
+    max_tool_calls: null       # max tool calls of any kind per turn (null = 60 unattended, unlimited attended; 0 = unlimited)
 ```
 
 `hard_stop_enabled` explicitly enables hard stops on every platform. When it remains `false`, `non_interactive_hard_stop_enabled` still enables them for unattended gateway/cron-style platforms while preserving warning-only behavior for CLI, TUI, Desktop, ACP, subagents, and `api_server` runs (supervised task loops with a live parent or client). Set `non_interactive_hard_stop_enabled: false` to opt an unattended deployment out. See also [Docker / unattended deployments](docker.md).
@@ -2080,6 +2081,8 @@ Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings
 A single `delegate_task` batch counts each task toward `max_subagents` (a batch of 3 spends 3), so the cap tracks real subagents spawned rather than `delegate_task` invocations.
 
 This mirrors Claude Code's per-session WebSearch and subagent caps (v2.1.212), which also default to 200 and reset on `/clear`.
+
+`max_tool_calls` bounds every tool call in one turn. It catches the runaway the failure-based thresholds cannot see: a model that keeps trying something *new* (a different script, screenshot, or command each time) whose calls mostly succeed, so nothing repeats and nothing counts as a failure. Left at `null`, it is 60 on unattended platforms — voice sessions, chat gateways, and cron, where nobody can `/stop` the loop — and unlimited on CLI, TUI, Desktop, ACP, subagents, and `api_server`, which show every call as it happens and routinely run long coding turns. `non_interactive_hard_stop_enabled: false` also removes the unattended default. A number applies on every platform. When the cap is reached the turn ends with a reply meant to be read or spoken: how many steps it took, the last error it hit (or that nothing reported one), and whether to keep going or try another way. Replying "keep going" starts a fresh turn with fresh counters.
 
 ### Runtime anti-stall guards
 

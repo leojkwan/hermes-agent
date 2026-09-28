@@ -1891,6 +1891,36 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
+def _kanban_worker_toolless_candidate(agent, fb_provider: str, fb_model: str) -> bool:
+    """True when this fallback candidate cannot carry tool calls and the session is a
+    dispatcher-owned kanban worker.
+
+    A kanban worker MUST be able to emit a terminal board tool call
+    (``kanban_complete``/``kanban_block``): falling back onto a tool-less model
+    guarantees a clean exit with no terminal call — a protocol violation — even
+    though the work itself succeeded. Skipping the candidate keeps the turn's ORIGINAL failure
+    (usually a rate limit), so the dispatcher books a transient ``rate_limited``
+    requeue instead of a guaranteed violation. Honors the declared capability
+    chain (``model_overrides.supports_tools`` → models.dev catalog); unknown
+    capability fails OPEN — only a positively-declared tool-less model is skipped.
+    """
+    from agent.delegation_context import owned_kanban_task
+    if not owned_kanban_task():
+        return False
+    try:
+        from agent.models_dev import get_model_capabilities
+        caps = get_model_capabilities(fb_provider, fb_model, allow_network=False)
+    except Exception:
+        logger.debug("capability lookup failed for %s/%s", fb_provider, fb_model, exc_info=True)
+        return False
+    if caps is None or caps.supports_tools:
+        return False
+    logger.warning(
+        "Fallback skip: %s/%s cannot carry tool calls — a kanban worker must keep tool "
+        "capability or it cannot file its terminal board call", fb_provider, fb_model)
+    return True
+
+
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
@@ -1902,6 +1932,8 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
+        return True
+    if _kanban_worker_toolless_candidate(agent, fb_provider, fb_model):
         return True
     if _candidate_pool_exhausted(agent, fb_provider, fb_model):
         logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)

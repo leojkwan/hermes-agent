@@ -547,6 +547,9 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # web_search calls per turn
             "max_subagents": 50,      # subagents spawned per turn
+            # All tool calls per turn. null = 60 on unattended platforms (voice, chat gateways,
+            # cron) and unlimited on attended cli/tui/desktop/acp; a number applies everywhere.
+            "max_tool_calls": None,
         },
     },
 

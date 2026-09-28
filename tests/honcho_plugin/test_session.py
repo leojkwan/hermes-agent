@@ -1393,3 +1393,26 @@ class TestObservationPerSessionScoping:
 
         assert mgr._ai_observes_others(session_c) is True
 
+
+
+# ---------------------------------------------------------------------------
+# prefetch recall must fit the 10K spill cap
+# ---------------------------------------------------------------------------
+
+
+class TestPeerContextConclusionCap:
+    """Uncapped peer.context() returned ~20K of conclusions; the ~30K prefetch spilled to a 500-char
+    head and tail, so a mid-list fact ("who is Morgan Example?") never reached the model."""
+
+    def _manager(self):
+        mgr = HonchoSessionManager()
+        peer = MagicMock()
+        peer.context.return_value = SimpleNamespace(representation="rep", peer_card=["fact"])
+        mgr._get_or_create_peer = MagicMock(return_value=peer)
+        return mgr, peer
+
+    def test_fetch_peer_context_caps_conclusions(self):
+        mgr, peer = self._manager()
+        mgr._fetch_peer_context("casey-example", "who is Morgan Example?")
+        assert peer.context.call_args.kwargs["max_conclusions"] == 15
+        assert peer.context.call_args.kwargs["search_query"] == "who is Morgan Example?"

@@ -80,7 +80,8 @@ _PROMPT_HEADERS = {
     ),
     "hybrid": (
         "# Honcho Memory\nActive (hybrid mode). Relevant context is auto-injected AND memory tools "
-        f"are available. {_TOOL_GUIDE}"
+        "are available. Answer from the injected memory context first; call a memory tool only when "
+        f"it lacks what the question needs. {_TOOL_GUIDE}"
     ),
 }
 
@@ -107,6 +108,11 @@ _CONTEXT_SECTIONS = (
 )
 
 _PREWARM_QUERY = "Summarize what you know about this user. Focus on preferences, current projects, and working style."
+
+# Session platforms that carry live speech (the voice page opens its session with source "voice-safari").
+# A spoken reply is due in seconds, so the dialectic layer's background LLM query only adds Honcho load
+# and turn latency there; base recall (representation + card) still injects every turn.
+_VOICE_PLATFORMS = frozenset({"voice-safari"})
 
 
 class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
@@ -179,6 +185,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._init_peer_platform: str = "cli"
         self._init_peer_notice_emitted = False
         self._cron_skipped = False  # cron and flush contexts disable the plugin entirely
+        self._dialectic_off = False  # voice sessions: no prewarm, turn-1 wait or cadence dialectic
 
     @property
     def name(self) -> str:
@@ -222,6 +229,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._recall_generation = object()
         try:
             agent_context, platform = kwargs.get("agent_context", ""), kwargs.get("platform", "cli")
+            self._dialectic_off = platform in _VOICE_PLATFORMS
             if agent_context in {"cron", "flush"} or platform == "cron":
                 logger.debug("Honcho skipped: cron/flush context (agent_context=%s, platform=%s)",
                              agent_context, platform)
@@ -382,7 +390,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
         # Generic dialectic prewarm is incompatible with latest-message query rewriting,
         # which needs the first substantive user message.
-        if self._recall_mode in {"context", "hybrid"} and not self._recall_sync:
+        if self._recall_mode in {"context", "hybrid"} and not self._recall_sync and not self._dialectic_off:
             if self._query_rewriter is None or not self._query_rewrite_enabled:
                 self._spawn_dialectic(_PREWARM_QUERY, thread_name="honcho-prewarm-dialectic", fired_at=0,
                                       log_label="dialectic prewarm", use_query_rewrite=False)
@@ -591,7 +599,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         # First-turn mode suppresses only the base layer; dialectic is independent.
         if not (self._injection_frequency == "first-turn" and self._turn_count > 1):
             parts.append(self._fetch_base_context_layer(query, first_turn_base_deadline))
-        self._first_turn_dialectic_wait(query)
+        if not self._dialectic_off:
+            self._first_turn_dialectic_wait(query)
         # Consume only results that are already ready; later turns never wait.
         parts.append(self._consume_pending_dialectic())
         parts = [p for p in parts if p and p.strip()]
@@ -667,6 +676,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             except Exception as e:
                 logger.debug("Honcho context prefetch failed: %s", e)
 
+        if self._dialectic_off:
+            return
         # Dialectic layer: a hung call older than timeout × multiplier counts as dead.
         if self._thread_is_live():
             logger.debug("Honcho dialectic prefetch skipped: prior thread still running")

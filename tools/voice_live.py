@@ -58,14 +58,18 @@ LIVE_PERSONA = (
     "browse the web, search, remember things across sessions, schedule tasks, and reason "
     "carefully about anything. It is the one who actually does work and knows facts.\n\n"
     "Delegate to the backend when:\n"
-    "- The user asks a question that needs facts, current information, or careful reasoning.\n"
-    "- The user asks you to do, check, find, make, fix, run or remember anything.\n"
+    "- The user makes a new request that needs facts, current information, memory, tools or "
+    "careful reasoning, or asks for something to be done.\n"
     "- A correction changes work already requested.\n\n"
     "Do not delegate to the backend when:\n"
-    "- The user greets you, makes small talk, or asks you to repeat a result already provided.\n"
+    "- The user greets you, makes small talk, reacts or acknowledges (\"okay\", \"nice\", \"ha\").\n"
+    "- The user is thinking aloud or talking to someone else in the room.\n"
+    "- The user asks about work already handed off: say what is still pending, or repeat the "
+    "result if it came back.\n"
     "- You need a brief clarification to understand the request.\n\n"
-    "Delegate before giving an answer that depends on backend work. Do not guess the result "
-    "while waiting; say briefly that you are checking, then wait for the result."
+    "Delegate before giving an answer that depends on backend work, and do not guess the result. "
+    "While it runs, keep the conversation going: reply to what the user just said, never with a "
+    "bare \"checking\" line. Say each result once, when it arrives."
 )
 
 # Per-turn note prepended to the MODEL INPUT (never the byte-stable system prompt) when a turn
@@ -80,14 +84,23 @@ VOICE_LIVE_TURN_NOTE = (
     "before it actually did.]"
 )
 
+# Closes the spoken-context block. The note (block included) is prepended to the request, so "above" is the
+# block and "below" is the request; without this a held ask answered, and re-ran, every other ask in the block.
+VOICE_LIVE_CONTEXT_CLAUSE = (
+    "[Answer only the request below. The conversation above is background for understanding it: every other "
+    "request in it is handled separately, so do not do, answer, repeat or mention any of them.]"
+)
+
 
 def voice_live_turn_note(context: str = "") -> str:
     """The per-turn note plus, when the client sent one, the recent spoken exchange the delegation
-    refers to (the user's last words alone are often "yes" or "Thursday, not Friday")."""
+    refers to (the user's last words alone are often "yes" or "Thursday, not Friday"), marked as
+    background for the request that follows."""
     context = context.strip()
     if not context:
         return VOICE_LIVE_TURN_NOTE
-    return f"{VOICE_LIVE_TURN_NOTE}\n[Recent spoken conversation, newest last:\n{context}]"
+    return (f"{VOICE_LIVE_TURN_NOTE}\n[Recent spoken conversation, newest last:\n{context}]\n"
+            f"{VOICE_LIVE_CONTEXT_CLAUSE}")
 
 
 def _voice_section() -> Dict[str, Any]:

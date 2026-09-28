@@ -965,8 +965,8 @@ _PROTOCOL_VIOLATION_ERROR = (
     # Keep this short: ``_record_task_failure`` caps the stored error at 500 chars and the worker's own
     # last output (``_worker_final_output``, up to 400 chars) is appended after it — a longer preamble
     # truncates away the worker's explanation, which is the part the board and the retry worker need.
-    "worker exited cleanly (rc=0) without kanban_complete, kanban_block "
-    "or kanban_request_review — protocol violation. "
+    "worker exited cleanly (rc=0) without kanban_complete, kanban_block, "
+    "kanban_request_review or kanban_request_changes — protocol violation. "
     "If the prior run already did the work, verify it and "
     "report it via kanban_complete (or kanban_request_review); "
     "a run without a terminal kanban call counts as failed no "
@@ -1013,6 +1013,34 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
+def _last_run_progress(conn: sqlite3.Connection, task_id: str, *, min_run_seconds: int = 300) -> str:
+    """One-line progress note from the dead run's last heartbeat, for rate_limited requeues.
+
+    Rate-limited requeues skip ``_worker_final_output`` by design (a quota wall's log
+    tail is provider noise), which can erase progress between attempts and
+    leave the next worker without a resume point. The last heartbeat NOTE is the worker's own signpost —
+    fold it into the requeue record for runs that lived long enough to have one.
+    """
+    try:
+        run = conn.execute(
+            "SELECT id, started_at FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if run is None or run["started_at"] is None:
+            return ""
+        if time.time() - float(run["started_at"]) < min_run_seconds:
+            return ""
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'heartbeat' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, run["id"]),
+        ).fetchone()
+        note = (_kb._json_dict(ev["payload"]).get("note") if ev is not None else "") or ""
+        return " ".join(str(note).split())[:200]
+    except Exception:
+        return ""
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1027,11 +1055,18 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    marker: Optional[dict] = None
+    """Validated workspace terminal marker (tool-less-lane clean exit): replayed as a
+    real ``complete``/``block`` after the reclaim txn commits."""
+    outcome_override: Optional[str] = None
+    """Explicit run outcome for marker replays (``completed`` / ``blocked``)."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
+        if self.outcome_override:
+            return self.outcome_override
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1126,6 +1161,10 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # ``(task_id, workspace_path, marker)``: tool-less-lane terminal markers to
+    # replay as real complete/block transitions AFTER the reclaim txn commits
+    # (``complete_task``/``block_task`` must never run under an open txn).
+    marker_replays: list[tuple[str, str, dict]] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1139,7 +1178,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, workspace_path "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1158,6 +1197,29 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            if dead.rate_limited:
+                # D2: the worker-log tail is skipped for quota walls by design, so
+                # fold the dead run's own last heartbeat note into the requeue
+                # record — otherwise a long run requeues with zero trace and the
+                # respawn restarts cold.
+                progress = _last_run_progress(conn, row["id"])
+                if progress:
+                    dead.error_text += f" Last progress: {progress!r}"
+                    dead.event_payload["last_progress"] = progress
+            if dead.kind == "clean_exit" and row["workspace_path"]:
+                # Tool-less-lane clean exit: a fresh marker addressed to this run
+                # is the worker's terminal handoff. Collect it for replay AFTER
+                # this txn commits — ``complete_task``/``block_task`` must never
+                # run under an open txn — leaving the task running until then.
+                from agent import kanban_stop as _kstop
+                marker = _kstop.read_fresh_terminal_marker(
+                    row["id"], workspace=row["workspace_path"],
+                    expected_run_token=row["claim_lock"] or "",
+                )
+                if marker is not None:
+                    dead.marker = marker
+                    sweep.marker_replays.append((row["id"], row["workspace_path"], marker))
+                    continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1201,6 +1263,32 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+    for task_id, workspace, marker in sweep.marker_replays:
+        # Post-commit: land each collected marker as the real transition the
+        # tool-less worker could not file itself. Always consumed (replayed or
+        # cleared): a marker that cannot land must not wedge the sweep, and the
+        # next tick reclaims the still-running task through the normal path.
+        try:
+            run_id = _kb._current_run_id(conn, task_id)
+            if marker.get("action") == "complete":
+                meta: dict = {"terminal_marker": True}
+                if marker.get("artifacts"):
+                    meta["artifacts"] = list(marker["artifacts"])
+                _kb.complete_task(
+                    conn, task_id, summary=marker.get("summary"),
+                    metadata=meta, expected_run_id=run_id,
+                )
+            else:
+                _kb.block_task(
+                    conn, task_id,
+                    reason=marker.get("reason") or "worker reported blocked via terminal marker",
+                    expected_run_id=run_id,
+                )
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            from agent import kanban_stop as _kstop
+            _kstop.clear_kanban_terminal_marker(workspace=workspace)
     return sweep
 
 

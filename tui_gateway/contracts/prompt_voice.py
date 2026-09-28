@@ -222,6 +222,15 @@ class SideAgentParams(SessionParams):
     text: str
 
 
+class BackgroundParams(SideAgentParams):
+    """``continue_task_id``: a ``task_id`` an earlier ``prompt.background`` on THIS session returned.
+    The ask runs as that background session's next turn (same row, its transcript replayed), queued
+    behind a turn still running; the result echoes the same ``task_id``. Malformed → ``4004``,
+    unknown or another session's → ``4040``."""
+
+    continue_task_id: str | None = None
+
+
 class TaskIdResult(Result):
     """The side agent runs detached; its answer lands on the parent session as an event carrying
     this ``task_id``."""
@@ -229,8 +238,9 @@ class TaskIdResult(Result):
     task_id: str
 
 
-method("prompt.background", params=SideAgentParams, result=TaskIdResult,
-       doc="Run a task on a fresh agent in the background; the answer arrives as background.complete.")
+method("prompt.background", params=BackgroundParams, result=TaskIdResult,
+       doc="Run a task on a background agent (a fresh session, or with continue_task_id the next turn of "
+           "an earlier one); the answer arrives as background.complete.")
 method("prompt.btw", params=SideAgentParams, result=TaskIdResult,
        doc="Side question over a snapshot of the live conversation; the answer arrives as btw.complete.")
 

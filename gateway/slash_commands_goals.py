@@ -62,7 +62,15 @@ class GatewayGoalCommandsMixin:
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
+            pending = None
+            try:
+                pending = mgr.get_pending_continuation()
+            except Exception:
+                pending = None
+            self._enqueue_goal_turn(
+                event, result.prompt, label="command enqueue", kickoff=result.kickoff,
+                intent=pending,
+            )
         return result.output
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
@@ -74,7 +82,7 @@ class GatewayGoalCommandsMixin:
             logger.debug("goal %s: pending continuation cleanup failed: %s", verb, exc)
 
     def _enqueue_goal_turn(
-        self, event: MessageEvent, text: str, *, label: str, kickoff: bool
+        self, event: MessageEvent, text: str, *, label: str, kickoff: bool, intent=None
     ) -> None:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
@@ -91,6 +99,13 @@ class GatewayGoalCommandsMixin:
                     message_id=event.message_id if kickoff else None,
                     channel_prompt=event.channel_prompt if kickoff else None,
                 )
+                if isinstance(intent, dict) and intent.get("id"):
+                    turn._goal_continuation_generated = True
+                    turn.metadata["goal_continuation_intent_id"] = str(intent["id"])
+                    turn.metadata["goal_continuation_session_id"] = str(
+                        getattr(getattr(event, "source", None), "session_id", "") or ""
+                    )
+                    turn.metadata["goal_continuation_prompt"] = str(intent.get("prompt") or text)
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)

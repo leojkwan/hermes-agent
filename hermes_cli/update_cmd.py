@@ -774,8 +774,9 @@ def _repair_current_checkout(
 
 
 def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
-    """Fast-forward failed: merge on a custom branch (local commits survive) or reset --hard on the
-    same branch (rescue ref first when histories share no ancestor). ``sys.exit(1)`` on failure."""
+    """Fast-forward failed: merge on a custom branch (local commits survive) or, on the same
+    branch, rebase unique local commits onto ``origin/<branch>`` (plain reset only when local
+    has nothing origin lacks; rebase conflict -> rescue ref + refuse). ``sys.exit(1)`` on failure."""
     # A custom branch (local commits atop origin/<branch>) also can't ff, and reset --hard
     # would discard that work: merge instead, stop on conflict.
     _cur_branch = (_git_run(git_cmd, ["branch", "--show-current"]).stdout or "").strip()
@@ -792,7 +793,24 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
             print("  Then re-run the update. Local work is untouched.")
             sys.exit(1)
         return
-    # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
+    # Same branch: a true upstream force-push/rebase. Local changes are stashed, but commits
+    # made locally on top of origin/<branch> are history, not dirt, and ``git reset --hard``
+    # used to silently discard every one of them (two landed fixes were wiped off main this
+    # way). Nothing unique -> the plain reset loses nothing. Anything unique -> rebase:
+    # rebase drops patch-equivalent commits, so even a rewritten upstream lands clean, and
+    # a real conflict parks pre_pull_sha behind a rescue ref and refuses rather than
+    # destroying work.
+    unique_result = _git_run(git_cmd, ["rev-list", "--count", f"origin/{branch}..HEAD"])
+    if unique_result.returncode == 0 and unique_result.stdout.strip() == "0":
+        print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
+        reset_result = _git_run(git_cmd, ["reset", "--hard", f"origin/{branch}"])
+        if reset_result.returncode != 0:
+            print(f"✗ Failed to reset to origin/{branch}.")
+            if reset_result.stderr.strip():
+                print(f"  {reset_result.stderr.strip()}")
+            print(f"  Try manually: git fetch origin && git reset --hard origin/{branch}")
+            sys.exit(1)
+        return
     # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
     # local graph, so park pre_pull_sha behind a rescue ref first.
     merge_base_result = _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"])
@@ -814,14 +832,38 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
                 f"{head}attempted to back up current HEAD to {rescue_ref} before resetting, "
                 f"but the backup write failed (pre-reset SHA was {pre_pull_sha}).")
         _prune_orphan_rescue_refs(git_cmd, _m().PROJECT_ROOT, branch)
-    print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
-    reset_result = _git_run(git_cmd, ["reset", "--hard", f"origin/{branch}"])
-    if reset_result.returncode != 0:
-        print(f"✗ Failed to reset to origin/{branch}.")
-        if reset_result.stderr.strip():
-            print(f"  {reset_result.stderr.strip()}")
-        print(f"  Try manually: git fetch origin && git reset --hard origin/{branch}")
-        sys.exit(1)
+    if not has_common_ancestor:
+        # Rebase is impossible across unrelated histories; the rescue ref parked above is
+        # the recovery anchor, so the plain reset loses nothing recoverable.
+        print("  ⚠ Fast-forward not possible (unrelated histories), resetting to match remote...")
+        reset_result = _git_run(git_cmd, ["reset", "--hard", f"origin/{branch}"])
+        if reset_result.returncode != 0:
+            print(f"✗ Failed to reset to origin/{branch}.")
+            if reset_result.stderr.strip():
+                print(f"  {reset_result.stderr.strip()}")
+            print(f"  Try manually: git fetch origin && git reset --hard origin/{branch}")
+            sys.exit(1)
+        return
+    print(
+        f"  ⚠ Fast-forward not possible (history diverged) — rebasing local commits onto "
+        f"origin/{branch} so local work survives the update...")
+    rebase_result = _git_run(git_cmd, ["rebase", f"origin/{branch}"])
+    if rebase_result.returncode == 0:
+        return
+    _git_run(git_cmd, ["rebase", "--abort"])
+    # Park the pre-update HEAD behind a rescue ref so the refused rebase stays recoverable,
+    # then refuse: a conflict must stop the update, never destroy work.
+    if pre_pull_sha:
+        from datetime import datetime as _dt, timezone
+        rescue_ref = (
+            f"refs/hermes-update-backups/diverged-{branch}-"
+            f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{pre_pull_sha[:12]}")
+        if _git_run(git_cmd, ["update-ref", rescue_ref, pre_pull_sha]).returncode == 0:
+            print(f"  Pre-update HEAD backed up to {rescue_ref}.")
+    print(f"✗ Rebase conflict between local commits and origin/{branch} — update stopped, nothing was changed.")
+    print(f"  Resolve manually: cd {_m().PROJECT_ROOT} && git rebase origin/{branch}")
+    print("  Then re-run the update. Local work is preserved (rescue ref above).")
+    sys.exit(1)
 
 
 def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
@@ -858,7 +900,8 @@ def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
     keep_stash):
     """Fast-forward onto ``origin/<branch>`` and settle the autostash. Divergence by shape:
-    custom branch -> merge, same branch -> reset, orphan history -> rescue ref first; a
+    custom branch -> merge, same branch -> rebase unique local commits (conflict -> rescue
+    ref + refuse; nothing unique -> plain reset), orphan history -> rescue ref first; a
     post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA."""
     update_succeeded = False
     # Pre-pull SHA for auto-rollback (stray conflict markers once bricked every updater).

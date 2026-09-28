@@ -128,6 +128,7 @@ def _make_update_side_effect(
     update_ref_fails=False,
     pre_pull_sha_unavailable=False,
     existing_rescue_refs=None,
+    unique_commits="0",
 ):
     """Build a subprocess.run side_effect for cmd_update tests.
 
@@ -180,6 +181,11 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
+            if "..HEAD" in joined:
+                # Direction-split: "origin/<branch>..HEAD" counts local-only commits
+                # (the divergence reconcile's rebase gate); default 0 keeps these
+                # staged scenarios on the plain-reset path.
+                return SimpleNamespace(stdout=f"{unique_commits}\n", stderr="", returncode=0)
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "merge-base" in joined:
             if merge_base_exists:
@@ -267,7 +273,7 @@ def test_cmd_update_orphan_history_backs_up_before_reset(monkeypatch, tmp_path, 
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3",
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -297,7 +303,7 @@ def test_cmd_update_orphan_rescue_ref_write_failure_message_is_honest(monkeypatc
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False, update_ref_fails=True,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3", update_ref_fails=True,
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -326,7 +332,7 @@ def test_cmd_update_orphan_rescue_refs_pruned_beyond_keep_limit(monkeypatch, tmp
         for i in range(total)
     ]
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False, existing_rescue_refs=stale_refs,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3", existing_rescue_refs=stale_refs,
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -362,7 +368,7 @@ def test_cmd_update_orphan_rescue_refs_expired_by_age(monkeypatch, tmp_path, cap
         f"{fresh.strftime('%Y%m%d-%H%M%S')}-new1"
     )
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3",
         existing_rescue_refs=[expired_ref, fresh_ref],
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
@@ -426,7 +432,7 @@ def test_cmd_update_orphan_rescue_ref_write_failure_is_non_fatal(monkeypatch, tm
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False, update_ref_fails=True,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3", update_ref_fails=True,
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -455,7 +461,7 @@ def test_cmd_update_orphan_guard_skips_rescue_ref_when_pre_pull_sha_missing(
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False, pre_pull_sha_unavailable=True,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3", pre_pull_sha_unavailable=True,
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -475,7 +481,7 @@ def test_cmd_update_orphan_rescue_ref_persists_when_reset_fails(monkeypatch, tmp
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=False, reset_fails=True,
+        ff_only_fails=True, merge_base_exists=False, unique_commits="3", reset_fails=True,
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
