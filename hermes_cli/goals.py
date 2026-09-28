@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -433,6 +434,8 @@ class GoalState:
     consecutive_blocked_verdicts: int = field(default=0, kw_only=True)
     pending_continuation: Optional[Dict[str, Any]] = field(default=None, kw_only=True)
     recovery_attempts: int = field(default=0, kw_only=True)
+    # Retain only a digest so a repeated reply during a judge outage can be paused across restarts.
+    last_transport_response_sha256: str = ""
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -471,6 +474,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            last_transport_response_sha256=str(data.get("last_transport_response_sha256") or ""),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -1235,6 +1239,7 @@ class GoalManager(GoalContinuationMixin):
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        self._state.last_transport_response_sha256 = ""
         self._state.clear_wait()   # resuming starts fresh
         self._state.consecutive_blocked_verdicts = 0
         self._state.recovery_attempts = 0
@@ -1563,6 +1568,18 @@ class GoalManager(GoalContinuationMixin):
         # separately because persistent API errors (401, DNS) mean a broken config.
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
+        if transport_failed and not (active_delegations or background_processes):
+            response_digest = hashlib.sha256(last_response.strip().encode("utf-8")).hexdigest()
+            if response_digest == state.last_transport_response_sha256:
+                return self._pause_decision(
+                    "judge API failed while the assistant repeated the same reply; retry the judge or resume after checking progress",
+                    "continue", reason,
+                    "⏸ Goal paused — the judge failed and the assistant repeated its last reply. "
+                    "Check the goal_judge route and /goal resume when ready.",
+                )
+            state.last_transport_response_sha256 = response_digest
+        else:
+            state.last_transport_response_sha256 = ""
 
         # Wording changes are not progress. Failed judge calls also provide no
         # evidence that a previous blocker was resolved.
