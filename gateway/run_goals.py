@@ -565,13 +565,14 @@ class GatewayGoalsMixin:
             event.metadata["goal_continuation_intent_id"] = str(pending["id"])
             event.metadata["goal_continuation_session_id"] = str(entry.session_id)
             event.metadata["goal_continuation_prompt"] = str(pending.get("prompt") or "")
+            event.metadata["gateway_session_key"] = quick_key
             # A prior process may have died after claiming but before its durable turn marker. The
             # watcher only marks this recoverable when the persisted session has no marker and the
             # native runner has no live lease.
             event.metadata["goal_continuation_recover"] = bool(
                 pending.get("claim_token") and not getattr(entry, "active_turn_token", None)
             )
-            self._enqueue_fifo(quick_key, event, adapter)
+            await adapter.handle_message(event)
         except Exception:
             logger.debug("goal wakeup failed for %s", getattr(entry, "session_id", "?"), exc_info=True)
 

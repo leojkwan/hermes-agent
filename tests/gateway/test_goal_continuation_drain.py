@@ -152,38 +152,29 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     _session_key_for_source; the adapter drain uses build_session_key on the
     event source. These must agree or the continuation is orphaned under a
     key nobody drains (the silent-stall shape from #47699)."""
-    from unittest.mock import MagicMock, patch
-    from datetime import datetime
+    from unittest.mock import AsyncMock, patch
+    from types import SimpleNamespace
     import uuid
 
-    from gateway.run import GatewayRunner
-    from gateway.session import SessionEntry
+    from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.run_goals import GatewayGoalsMixin
     from hermes_cli.goals import GoalManager
 
     src = _slack_thread_source()
     adapter_key = build_session_key(src)
 
-    runner = object.__new__(GatewayRunner)
-    from gateway.config import GatewayConfig
-
-    runner.config = GatewayConfig(
-        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
-    )
-    runner._queued_events = {}
-    session_entry = SessionEntry(
-        session_key=adapter_key,
-        session_id=f"goal-sess-{uuid.uuid4().hex[:8]}",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.SLACK,
-        chat_type="channel",
-    )
-    runner.session_store = MagicMock()
-    runner.session_store.get_or_create_session.return_value = session_entry
-    runner.session_store._generate_session_key.return_value = adapter_key
-
     adapter = _DrainProbeAdapter()
-    runner.adapters = {Platform.SLACK: adapter}
+
+    class _GoalRunner(GatewayGoalsMixin, GatewayBusySessionMixin):
+        _goal_max_turns_from_config = staticmethod(lambda: 10)
+        _warm_goals_session_db = AsyncMock()
+        _run_in_executor_with_context = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        _defer_goal_status_notice_after_delivery = AsyncMock()
+        _session_key_for_source = staticmethod(lambda _source: adapter_key)
+        _delivery_adapter_for = staticmethod(lambda _source: adapter)
+
+    runner = _GoalRunner()
+    session_entry = SimpleNamespace(session_id=f"goal-sess-{uuid.uuid4().hex[:8]}")
 
     GoalManager(session_entry.session_id).set("ship it")
     with patch(
@@ -202,3 +193,67 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_due_goal_wakeup_starts_an_idle_adapter_turn(hermes_home):
+    """A saved due goal must enter the real adapter while its session is idle."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.run_goals import GatewayGoalsMixin
+    from gateway.run_inbound import GatewayInboundMixin
+    from hermes_cli.goals import GoalManager
+
+    source = _slack_thread_source()
+    key = build_session_key(source)
+    goal = GoalManager("idle-goal-wakeup")
+    goal.set("ship it")
+    pending = goal.get_pending_continuation()
+    assert pending is not None
+
+    adapter = _DrainProbeAdapter()
+    handled: list[str] = []
+
+    async def handler(event):
+        event._gateway_resolved_session_id = "idle-goal-wakeup"
+        assert await runner._mark_durable_active_turn(event, key)
+        handled.append(event.text)
+        assert await runner._clear_durable_active_turn(event)
+        return "continued"
+
+    adapter.set_message_handler(handler)
+
+    class _WakeRunner(GatewayGoalsMixin, GatewayBusySessionMixin, GatewayInboundMixin):
+        _session_key_for_source = staticmethod(lambda _source: key)
+        _delivery_adapter_for = staticmethod(lambda _source: adapter)
+        _is_session_running = staticmethod(lambda _key: False)
+        _peek_session_state = staticmethod(lambda _key: None)
+
+    runner = _WakeRunner()
+    runner.async_session_store = SimpleNamespace(
+        mark_turn_active=AsyncMock(return_value="turn-token"),
+        clear_turn_active=AsyncMock(return_value=True),
+    )
+
+    await runner._goal_wakeup_fire_one(
+        SimpleNamespace(session_id="idle-goal-wakeup", active_turn_token=None), source,
+    )
+    for _ in range(40):
+        if adapter.sent:
+            break
+        await asyncio.sleep(0.05)
+
+    assert handled == [pending["prompt"]]
+    assert adapter.sent == ["continued"]
+    assert key not in adapter._pending_messages
+    assert goal.get_pending_continuation() is None
+    for _ in range(40):
+        if key not in adapter._active_sessions:
+            break
+        await asyncio.sleep(0.05)
+    await runner._goal_wakeup_fire_one(
+        SimpleNamespace(session_id="idle-goal-wakeup", active_turn_token=None), source,
+    )
+    assert handled == [pending["prompt"]]

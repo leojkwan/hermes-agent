@@ -2104,7 +2104,8 @@ class GatewayTurnMixin:
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
-        if not await self._mark_durable_active_turn(event, session_entry.session_key):
+        marked = await self._mark_durable_active_turn(event, session_entry.session_key)
+        if not marked and (getattr(event, "metadata", None) or {}).get("goal_continuation_intent_id"):
             self._clear_session_env(_session_env_tokens)
             return {
                 "success": False,

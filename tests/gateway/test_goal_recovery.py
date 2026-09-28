@@ -141,6 +141,68 @@ def test_corrupt_deadline_cannot_pause_a_replaced_goal(isolated_goal_home):
 
 
 @pytest.mark.asyncio
+async def test_plain_turn_survives_marker_failure_but_goal_continuation_does_not(
+    isolated_goal_home, monkeypatch,
+):
+    from datetime import datetime
+    from unittest.mock import MagicMock
+    import sys
+
+    from gateway.config import GatewayConfig, Platform
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run_inbound import GatewayInboundMixin
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session import SessionEntry, SessionSource
+
+    source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1", chat_type="channel")
+    entry = SessionEntry(
+        session_key="plain-key", session_id="plain-session",
+        created_at=datetime.now(), updated_at=datetime.now(),
+        platform=Platform.SLACK, chat_type="channel",
+    )
+
+    class _TurnRunner(GatewayTurnMixin, GatewayInboundMixin):
+        pass
+
+    runner = _TurnRunner()
+    runner.config = GatewayConfig()
+    runner.session_store = MagicMock()
+    store = SimpleNamespace(
+        _store=runner.session_store,
+        mark_turn_active=AsyncMock(return_value=False),
+        load_transcript=AsyncMock(return_value=[]),
+    )
+    runner.async_session_store = store
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_load_gateway_config=lambda: {}))
+    monkeypatch.setattr("gateway.run_turn.build_session_context", lambda *_: SimpleNamespace())
+    runner._hmwa_open_session = AsyncMock(return_value=(False, False))
+    runner._set_session_env = lambda _context: "env-token"
+    runner._clear_session_env = lambda _token: None
+    runner._pinned_session_context_prompt = lambda *_args, **_kwargs: "context"
+    runner._hmwa_acquire_turn_lease = AsyncMock()
+    runner._hmwa_run_session_hygiene = AsyncMock(return_value=[])
+    runner._hmwa_first_contact_notes = AsyncMock()
+    runner._voice_channel_sidecar_note = lambda *_args: None
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="hello")
+    runner._hmwa_apply_message_timestamp = lambda _event, text: (text, text, None)
+    runner._bind_adapter_run_generation = lambda *_args: None
+    runner._delivery_adapter_for = lambda _source: None
+
+    plain = MessageEvent(text="hello", message_type=MessageType.TEXT, source=source)
+    prepared, _ = await runner._hmwa_prepare_turn(plain, source, entry, "plain-key", "plain-key", 1)
+    assert isinstance(prepared, runner._PreparedTurn)
+    store.load_transcript.assert_awaited_once_with("plain-session")
+
+    continuation = MessageEvent(text="continue", message_type=MessageType.TEXT, source=source)
+    continuation.metadata["goal_continuation_intent_id"] = "intent-1"
+    blocked, _ = await runner._hmwa_prepare_turn(
+        continuation, source, entry, "plain-key", "plain-key", 2,
+    )
+    assert isinstance(blocked, dict) and blocked["success"] is False
+    assert store.load_transcript.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_goal_decision_is_persisted_before_fifo_enqueue(monkeypatch):
     manager = _Manager("sid")
     runner = _Runner(manager)
