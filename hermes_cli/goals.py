@@ -61,12 +61,25 @@ _MAX_BARRIER_WAIT_S = 30 * 60
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
+_REAL_USER_GATE_TAXONOMY = (
+    "(a) credentials or account access; (b) spending money; (c) sending or "
+    "publishing anything outside this machine; (d) a destructive or "
+    "irreversible action; or (e) a product decision that cannot be undone"
+)
+_REAL_USER_GATE_CONTINUATION = (
+    "Ask the user and stop only when every remaining step requires one of "
+    f"these five user-gate classes and no recorded grant covers it: "
+    f"{_REAL_USER_GATE_TAXONOMY}. Otherwise, choose the reasonable reversible "
+    "default, or note what is waiting on the user and continue with the rest."
+)
+
+
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
     "Continue working toward this goal. Take the next concrete step. "
     "If you believe the goal is complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly and stop."
+    f"{_REAL_USER_GATE_CONTINUATION}"
 )
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
@@ -80,8 +93,8 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Stay within the stated boundaries and do not violate the constraints. "
     "Before claiming the goal is done, satisfy the Verification criterion and "
     "show the concrete evidence (command output, file contents, test result). "
-    "If you hit the stated stop condition or are otherwise blocked and need "
-    "user input, say so clearly and stop."
+    "If you hit the stated stop condition, say so clearly and stop. "
+    f"{_REAL_USER_GATE_CONTINUATION}"
 )
 
 # With /subgoal criteria: surfaced verbatim to the agent and to the judge.
@@ -93,8 +106,7 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Continue working toward the goal AND all additional criteria. Take "
     "the next concrete step. If you believe the goal and every "
     "additional criterion are complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly "
-    "and stop."
+    f"{_REAL_USER_GATE_CONTINUATION}"
 )
 
 # Fed back when a quality gate fails: bounded output is the evidence to repair against (no judge).
@@ -124,16 +136,19 @@ JUDGE_SYSTEM_PROMPT = (
     "- The response clearly shows the final deliverable was produced.\n"
     "DONE requires the deliverable to actually exist. If the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not "
-    "DONE.\n\n"
+    "DONE. DONE is allowed when the deliverable exists and any gated "
+    "remainder is recorded as waiting on the user.\n\n"
     "BLOCKED — the goal cannot be satisfied as stated:\n"
     "- The response explains the goal is genuinely unachievable (impossible, "
     "out of scope, no valid path to the deliverable), or refuses to "
     "fabricate a deliverable that cannot exist, OR\n"
-    "- The response explains progress is blocked and the next step needs "
-    "user input to proceed.\n"
+    "- Every remaining step is behind one of the five user-gate classes with "
+    f"no recorded grant: {_REAL_USER_GATE_TAXONOMY}.\n"
     "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
     "a refusal, not a completion — never return BLOCKED for a goal that "
-    "was achieved.\n"
+    "was achieved. A question about a reversible choice, a local merge, a "
+    "deploy with a rollback, or a test that needs the user's hands is NOT "
+    "BLOCKED; return CONTINUE and take the next concrete step.\n"
     "When the block is an error the agent hit (an HTTP status, an API, "
     "sign-in or token failure), quote the error text verbatim in the reason "
     "and attribute it only to a provider, service or credential the response "
@@ -233,8 +248,9 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
     "- If the response explains the work is genuinely unachievable or hits "
-    "the stated Stop condition and needs user input, the goal is NOT done — "
-    "return BLOCKED with the reason describing the block.\n"
+    "the stated Stop condition and every remaining step is behind one of the "
+    "five user-gate classes listed above with no recorded grant, the goal is "
+    "NOT done — return BLOCKED with the reason describing the block.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
