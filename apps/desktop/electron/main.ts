@@ -116,6 +116,7 @@ import {
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap, readBundleSwapStamp } from './bundle-swap'
+import { createCallAuditBridge, exitAfterShutdown } from './call-audit'
 import { registerChatOnboardingWindow } from './chat-onboarding-window'
 import { provisionCliLinks } from './cli-provision'
 import { closeStopFailureMessage, finishWindowsCloseStop, type RuntimeLock } from './close-stop-kill'
@@ -12550,14 +12551,13 @@ async function teardownSshForQuit(): Promise<void> {
   )
 }
 
-async function exitAfterBackendShutdown(code) {
-  try {
-    await backendShutdown.run()
-  } catch {
-    // Already logged by backendShutdown; the exit must still happen.
-  }
+// GPT-Live call recording (~va01, ~da02). The relay admits main with the key
+// it publishes, so the bridge depends on no backend and can outlive them all.
+const callAudit = createCallAuditBridge()
 
-  app.exit(code)
+async function exitAfterBackendShutdown(code) {
+  // app.exit skips before-quit, so open recordings are ended incomplete here.
+  await exitAfterShutdown({ backendShutdown, callAudit, exit: exitCode => app.exit(exitCode) }, code)
 }
 
 // Returns the profile name whose backend was torn down, or null when the
@@ -17330,6 +17330,23 @@ function formatApiRequestFailure(
   return `[hermes:api ${method} ${path}] ${detail}`.slice(0, 6000)
 }
 
+ipcMain.handle('hermes:call-audit', (event, request) => callAudit(request, event.sender.id))
+
+// A renderer that reloads, crashes or closes cannot finish its call recording;
+// the bridge ends that renderer's calls incomplete, including a start in flight.
+app.on('web-contents-created', (_event, contents) => {
+  const sender = contents.id
+  const release = () => void callAudit.releaseSender(sender)
+
+  contents.once('destroyed', release)
+  contents.on('render-process-gone', release)
+  contents.on('did-start-navigation', details => {
+    if (details.isMainFrame && !details.isSameDocument) {
+      release()
+    }
+  })
+})
+
 ipcMain.handle('hermes:api', async (_event, request) => {
   // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
   // renderer reconnect entering ensureBackend() mid-mutation would otherwise
@@ -19110,6 +19127,14 @@ app.on('before-quit', event => {
   const teardownTasks: QuitTeardownTask[] = [
     { run: (): Promise<void> => backendShutdown.run(), waitForCompletion: backendNeedsWait }
   ]
+
+  // No renderer stop receipt exists on quit: end open recordings incomplete.
+  // It always runs, so a start during teardown is refused; the quit waits only
+  // for open calls. The relay key needs no backend, so this runs beside it.
+  teardownTasks.push({
+    run: (): Promise<void> => callAudit.abortOpenCalls(),
+    waitForCompletion: callAudit.hasOpenCalls()
+  })
 
   if (sshNeedsWait) {
     teardownTasks.push({ run: teardownSshForQuit, waitForCompletion: true })

@@ -16,24 +16,34 @@ const handlers: VoiceLiveHandlers = {
   onError: () => undefined
 }
 
-function installApi() {
-  const api = vi.fn(async (_request: unknown) => ({
-    ok: true,
-    session: { id: 's1' },
-    transport: { sdp: 'answer', type: 'answer' }
-  }))
+type CallAuditFake = (request: { action: string }) => Promise<unknown>
 
-  Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+const acceptingCallAudit: CallAuditFake = async request =>
+  request.action === 'start'
+    ? { callId: 'c'.repeat(32), ok: true, state: 'open', status: 201 }
+    : { ok: true, status: 201 }
 
-  return api
+const sessionAnswer = { ok: true, session: { id: 's1' }, transport: { sdp: 'answer', type: 'answer' } }
+
+function installApi(callAudit: CallAuditFake = acceptingCallAudit) {
+  const api = vi.fn(async (_request: unknown) => sessionAnswer)
+
+  const audit = vi.fn(callAudit)
+
+  Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api, callAudit: audit } })
+
+  return { api, audit }
 }
 
-/** Enough of RTCPeerConnection/getUserMedia for `start()` to reach the POST. */
-function installWebRTC() {
+let recorders: Array<{ state: string; stream: unknown; timeslice?: number }> = []
+
+/** Enough of RTCPeerConnection/getUserMedia/MediaRecorder for `start()` to reach the POST. */
+function installWebRTC(microphone: unknown = { getAudioTracks: () => [] }) {
   const channel = { addEventListener: () => undefined, readyState: 'open' as const, send: () => undefined }
 
   const PeerConnection = class {
     addEventListener = () => undefined
+    addTrack = () => undefined
     connectionState = 'new'
     createDataChannel = () => channel
     createOffer = async () => ({})
@@ -43,10 +53,28 @@ function installWebRTC() {
     setRemoteDescription = async () => undefined
   }
 
+  const Recorder = class extends EventTarget {
+    static isTypeSupported = (mime: string) => mime === 'audio/webm;codecs=opus'
+    mimeType = 'audio/webm;codecs=opus'
+    state = 'inactive'
+    timeslice: number | undefined
+    constructor(readonly stream: unknown) {
+      super()
+      recorders.push(this)
+    }
+    start = (timeslice?: number) => {
+      this.state = 'recording'
+      this.timeslice = timeslice
+    }
+  }
+
+  recorders = []
+
   Object.defineProperty(globalThis, 'RTCPeerConnection', { configurable: true, value: PeerConnection })
+  Object.defineProperty(globalThis, 'MediaRecorder', { configurable: true, value: Recorder })
   Object.defineProperty(window.navigator, 'mediaDevices', {
     configurable: true,
-    value: { getUserMedia: async () => ({ getAudioTracks: () => [] }) }
+    value: { getUserMedia: async () => microphone }
   })
 }
 
@@ -55,13 +83,14 @@ afterEach(() => {
   setApiRequestProfile(null)
   Reflect.deleteProperty(window, 'hermesDesktop')
   Reflect.deleteProperty(globalThis, 'RTCPeerConnection')
+  Reflect.deleteProperty(globalThis, 'MediaRecorder')
   Reflect.deleteProperty(window.navigator, 'mediaDevices')
 })
 
 describe('GPT-Live owner routing', () => {
   it('creates the session on the chat owner (connection, profile) ahead of the active scope', async () => {
     installWebRTC()
-    const api = installApi()
+    const { api, audit } = installApi()
     setApiRequestConnection('gw-active')
     setApiRequestProfile('research')
 
@@ -75,6 +104,8 @@ describe('GPT-Live owner routing', () => {
     expect(request.profile).toBe('bot-adam')
     expect(request.connectionId).toBe('gw-bots')
     expect(request.priority).toBe('foreground')
+    // Recording authenticates with the relay's own key in main, so no backend scope goes with it.
+    expect(audit.mock.calls[0][0]).toEqual({ action: 'start' })
 
     // Ownerless chats keep the active scope verbatim (the old bare profileScoped()).
     const ownerless = new VoiceLiveSession(handlers, null)
@@ -84,5 +115,32 @@ describe('GPT-Live owner routing', () => {
     expect(plain.profile).toBe('research')
     expect(plain.connectionId).toBe('gw-active')
     expect(plain.priority).toBeUndefined()
+  })
+})
+
+describe('GPT-Live call recording gate', () => {
+  it('a refused recording start never creates the voice session', async () => {
+    installWebRTC()
+    const { api } = installApi(async () => ({ error: 'sign in to Hermes', ok: false, status: 401 }))
+
+    await expect(new VoiceLiveSession(handlers, null).start([])).rejects.toThrow(/401/)
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('is already recording the microphone stream when the voice session is created', async () => {
+    const microphone = { getAudioTracks: () => [] }
+    installWebRTC(microphone)
+    const { api } = installApi()
+    let armed: unknown[] = []
+
+    api.mockImplementationOnce(async () => {
+      armed = recorders.map(recorder => [recorder.stream, recorder.state, recorder.timeslice])
+
+      return sessionAnswer
+    })
+
+    await new VoiceLiveSession(handlers, null).start([])
+
+    expect(armed).toEqual([[microphone, 'recording', 1000]])
   })
 })

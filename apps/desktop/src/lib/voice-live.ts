@@ -1,6 +1,8 @@
 import { type OwnerScope, ownerScoped, profileScoped } from '@/api/client'
 import { hermesApi } from '@/hermes'
 
+import { CallAudit } from './call-audit'
+
 /**
  * GPT-Live voice chat: the full-duplex voice frontend that DELEGATES to Hermes.
  *
@@ -15,7 +17,8 @@ import { hermesApi } from '@/hermes'
  * This module owns the transport only: session creation via the gateway
  * (the OpenAI key never reaches the renderer), the RTCPeerConnection, the
  * `oai-events` data channel, transcript accumulation and the command
- * surface the conversation hook drives. Vendor contract:
+ * surface the conversation hook drives. Every call is privately recorded
+ * (`./call-audit`); a call that cannot be recorded does not start. Vendor contract:
  * https://developers.openai.com/api/docs/guides/live-delegation
  */
 
@@ -221,6 +224,8 @@ export class VoiceLiveSession {
   private peer: null | RTCPeerConnection = null
   private events: null | RTCDataChannel = null
   private microphone: null | MediaStream = null
+  private audit: null | CallAudit = null
+  private auditFailed = false
   private closeTimer: null | number = null
   private finalized = false
   private started = false
@@ -276,15 +281,31 @@ export class VoiceLiveSession {
   }
 
   async start(history: LiveHistoryMessage[]): Promise<void> {
-    if (this.peer) {
+    if (this.peer || this.audit) {
       throw new Error('GPT-Live session already started')
     }
 
+    const audit = new CallAudit(reason => {
+      this.auditFailed = true
+      this.finish(`Call recording failed: ${reason}`, null)
+    })
+
+    this.audit = audit
     const connection = new RTCPeerConnection()
     this.peer = connection
 
     connection.addEventListener('track', event => {
       const stream = new MediaStream([event.track])
+
+      try {
+        audit.record('assistant', stream)
+      } catch (error) {
+        this.auditFailed = true
+        this.finish(`Call recording failed: assistant recorder could not start (${String(error)})`, null)
+
+        return
+      }
+
       this.audio.srcObject = stream
       void this.audio.play().catch(() => undefined)
       this.armSpeakingProbe(stream)
@@ -298,6 +319,11 @@ export class VoiceLiveSession {
     this.microphone = await navigator.mediaDevices.getUserMedia({
       audio: { autoGainControl: true, echoCancellation: true, noiseSuppression: true }
     })
+    // The relay call opens once the mic is granted and its recorder starts at
+    // once: the relay checks each side's audio against the call's wall time.
+    // A refusal here ends setup before the voice session exists.
+    await audit.start()
+    audit.record('mic', this.microphone)
 
     for (const track of this.microphone.getAudioTracks()) {
       connection.addTrack(track, this.microphone)
@@ -321,6 +347,11 @@ export class VoiceLiveSession {
 
     if (!sdp) {
       throw new Error('Missing local SDP offer')
+    }
+
+    // A call whose recording already broke must not become a billed session.
+    if (this.finalized) {
+      throw new Error('GPT-Live session ended before it started')
     }
 
     const response = await hermesApi<{
@@ -519,6 +550,8 @@ export class VoiceLiveSession {
     }
 
     this.finalized = true
+    // Before the tracks end, so both recorders flush their last slice.
+    const recorded = this.audit?.finish()
 
     if (this.closeTimer) {
       window.clearTimeout(this.closeTimer)
@@ -538,5 +571,10 @@ export class VoiceLiveSession {
     this.audio.srcObject = null
     this.audio.pause()
     this.handlers.onClosed(reason, usageSeconds)
+    void recorded?.then(outcome => {
+      if (outcome.callId && !outcome.complete && !this.auditFailed && this.sessionId) {
+        this.handlers.onError(`Call audio was not fully saved: ${outcome.reason}`, false)
+      }
+    })
   }
 }
