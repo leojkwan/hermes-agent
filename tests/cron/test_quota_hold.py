@@ -177,6 +177,8 @@ def test_classified_rate_limit_result_parks_real_scheduled_fire_once(tmp_cron_ho
         failed(failure_resets_at=str(reset.timestamp())),
         failed(failure_resets_at=(fire - timedelta(seconds=5)).timestamp()),
         failed(failure_resets_at=None),
+        failed(failure_resets_at=datetime(2400, 1, 1, tzinfo=timezone.utc).timestamp()),
+        failed(failure_resets_at=1e12),
         {"failed": True, "completed": False, "failure_reason": "unknown",
          "error": "tool said: HTTP 429, retry after 60s",
          "final_response": "retry after 60s; resets_at 9999999999"},
@@ -258,3 +260,13 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = update_job(job_id, {"schedule": "every 15m"})
     assert qh.STATE_KEY not in j
     assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
+
+
+@pytest.mark.parametrize("retry_after", [7 * 86400 + 1, 1e12, float("inf")])
+def test_implausible_provider_wait_never_parks(retry_after):
+    """A wait beyond any real provider window (weekly limits reset within 7 days) is corrupt data:
+    parking on it would silence a job for years or overflow the hold notice."""
+    err = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
+                    retry_after=retry_after)
+    assert qh.hold_seconds_from_failure(err) is None
+

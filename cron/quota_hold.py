@@ -33,6 +33,16 @@ SCHEDULE_EXPR_KEY = "quota_hold_cron_expr"
 # recorded a little wall clock has passed, so land clearly past the boundary.
 HOLD_SLACK_SECONDS = 60
 
+# Real provider windows reset within a week (weekly subscription limits are the longest). A wait
+# past that is corrupt data: parking on it silences a job for years or overflows the hold notice.
+MAX_HOLD_SECONDS = 7 * 86400
+
+
+def _plausible_wait(seconds: Optional[float]) -> Optional[float]:
+    if seconds is None or not math.isfinite(seconds) or not 0 < seconds <= MAX_HOLD_SECONDS:
+        return None
+    return seconds
+
 _RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
 
 
@@ -52,7 +62,7 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
             if hint is None:
                 m = _RETRY_AFTER_RE.search(str(cur))
                 hint = float(m.group(1)) if m else None
-            return float(hint) if hint is not None and float(hint) > 0 else None
+            return _plausible_wait(float(hint)) if hint is not None else None
         cur = cur.__cause__ or cur.__context__
     return None
 
@@ -73,8 +83,7 @@ def hold_seconds_from_result(result: Any) -> Optional[float]:
         return None
     if not math.isfinite(resets_at):
         return None
-    remaining = float(resets_at) - _hermes_now().timestamp()
-    return remaining if remaining > 0 else None
+    return _plausible_wait(float(resets_at) - _hermes_now().timestamp())
 
 
 def hold_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:
