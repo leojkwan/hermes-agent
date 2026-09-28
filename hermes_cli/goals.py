@@ -166,8 +166,10 @@ JUDGE_SYSTEM_PROMPT = (
     "watch_patterns trigger fires (use this for a long-lived watcher that "
     "signals mid-run and may never exit). Otherwise return its pid in "
     "``wait_on_pid`` (releases on exit only).\n"
-    "- The agent says it is rate-limited / backing off / must wait a fixed "
-    "period — return seconds in ``wait_for_seconds``.\n"
+    "- A narrated rate limit, backoff, or fixed delay alone is not a WAIT "
+    "target on a successful turn. Provider retry deadlines are handled by "
+    "turn-failure recovery; without a listed running process or active "
+    "delegation, return CONTINUE.\n"
     "- The agent has delegated subagents still running (stated below as "
     "active delegations) and the response says it is waiting on them with "
     "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
@@ -1514,8 +1516,13 @@ class GoalManager(GoalContinuationMixin):
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
-            tgt = f"{wait_directive['seconds']}s"
+            seconds = int(wait_directive["seconds"])
+            if active_delegations <= 0:
+                logger.info("goal judge: refused wait_for_seconds=%s without active delegations; continuing", seconds)
+                return None
+            seconds = max(600, min(1800, seconds))
+            self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+            tgt = f"{seconds}s"
         return self._decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:

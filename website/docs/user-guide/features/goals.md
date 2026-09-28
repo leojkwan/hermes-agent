@@ -158,17 +158,17 @@ Gates and contracts compose: use a contract to shape *what the agent aims for*, 
 
 ## Parking on a background process: automatic, with a manual override
 
-Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, a deploy, a rate-limit cooldown. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
+Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, or a deploy. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
 
-**This is handled automatically.** Every turn, the judge is shown the agent's own live background processes (the `terminal(background=true)` registry entries this session spawned — pid, session id, command, uptime, recent output, and any `watch_patterns` / `notify_on_complete` trigger; processes started by delegated subagents are not shown, so a fan-out parent is never parked on a worker's poller) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the wait is satisfied — then it resumes normally with the result in hand. A pid/session wait is capped at 30 minutes; a process that never exits (a watcher, a forgotten poller) cannot park the goal indefinitely. The judge can also park on a **time** basis (`wait_for_seconds`) for backoff/cooldown waits. `/goal status` shows `⏳ Goal (parked …)` while parked.
+**This is handled automatically.** Every turn, the judge is shown the agent's own live background processes (the `terminal(background=true)` registry entries this session spawned — pid, session id, command, uptime, recent output, and any `watch_patterns` / `notify_on_complete` trigger; processes started by delegated subagents are not shown, so a fan-out parent is never parked on a worker's poller) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the wait is satisfied — then it resumes normally with the result in hand. A pid/session wait is capped at 30 minutes; a process that never exits (a watcher, a forgotten poller) cannot park the goal indefinitely. A timed judge wait is reserved for active delegated subagents: it lasts 10–30 minutes and lifts early when a result arrives. A successful response that merely says to wait a fixed period does not park the goal. Typed provider retry deadlines use the separate failed-turn recovery path. `/goal status` shows `⏳ Goal (parked …)` while parked.
 
 The judge picks the right kind of wait from the process's own signal:
 
 - **`wait_on_session <id>`** — releases when the process's *own trigger* fires: it exits, **or** (if it was started with `watch_patterns`) its pattern matches. This is the one for a long-lived watcher / server / poller that signals **mid-run** (e.g. a build process that prints `BUILD SUCCESSFUL` and keeps running, or a `notify_on_complete` watcher) and may never exit on its own.
 - **`wait_on_pid <pid>`** — releases on process exit only.
-- **`wait_for_seconds <n>`** — releases after a fixed delay.
+- **`wait_for_seconds <n>`** — for active delegated subagents, releases after a bounded delay or as soon as a delegation result arrives.
 
-You don't type anything for this — it's the judge's decision, made from the process context the loop hands it. The manual commands exist as an override:
+You don't type anything for this — it's the judge's decision, made from the process and delegation context the loop hands it. The manual commands exist as an override:
 
 | Command | What it does |
 |---|---|

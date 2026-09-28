@@ -513,6 +513,45 @@ class TestJudgeDrivenWait:
         import subprocess, sys
         return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 
+    def test_judge_seconds_without_live_delegations_continues(self, hermes_home):
+        """A model-proposed timer alone cannot park a successful goal turn."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-unsupported-seconds", default_max_turns=10)
+        mgr.set("land the tested local branch")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("wait", "waiting for a local merge", False, {"seconds": 900}, False),
+        ):
+            decision = mgr.evaluate_after_turn("The branch is ready to merge.", active_delegations=0)
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.last_verdict == "wait"  # raw judge proposal remains inspectable
+        reloaded = GoalManager("jw-unsupported-seconds")
+        assert reloaded.state.last_verdict == "wait"
+        assert reloaded.state.waiting_until == 0.0
+        assert reloaded.state.turns_used == 1
+
+    def test_typed_retry_deadline_stays_on_failure_recovery_path(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-provider-reset")
+        mgr.set("finish after provider recovery")
+        reset_at = time.time() + 120
+        with patch.object(goals, "judge_goal", side_effect=AssertionError("failed turns do not judge")):
+            recovery = mgr.record_turn_failure({
+                "failed": True, "failure_retryable": True, "failure_resets_at": reset_at,
+            })
+
+        pending = GoalManager("jw-provider-reset").get_pending_continuation()
+        assert recovery["pending_continuation"] is not None
+        assert pending["kind"] == "retryable_failure"
+        assert reset_at <= pending["due_at"] <= reset_at + 1
+        assert mgr.state.waiting_until == 0.0
+
     def test_judge_wait_on_dead_pid_continues_instead_of_parking(self, hermes_home):
         """#110826: a judge ``wait_on_pid`` naming a pid this host cannot observe (remote, or
         already exited) must not park — the barrier would lift and re-park every turn."""
@@ -954,9 +993,9 @@ class TestBlockedVerdict:
             mgr.evaluate_after_turn("source missing")
             mgr.evaluate_after_turn("still missing")
         with patch("hermes_cli.goals.judge_goal", return_value=(
-            "wait", "a source fetch is running", False, {"seconds": 30}, False
+            "wait", "delegated worker still running", False, {"seconds": 600}, False
         )):
-            assert not mgr.evaluate_after_turn("fetch launched")["should_continue"]
+            assert not mgr.evaluate_after_turn("worker dispatched", active_delegations=1)["should_continue"]
             assert mgr.state.consecutive_blocked_verdicts == 0
         mgr.stop_waiting()
         with patch("hermes_cli.goals.judge_goal", return_value=blocked):
