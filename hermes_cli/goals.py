@@ -1509,7 +1509,11 @@ class GoalManager(GoalContinuationMixin):
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
         unobservable here, so the caller continues instead."""
         if wait_directive.get("session_id"):
-            tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
+            session_id = str(wait_directive["session_id"])
+            if not _session_waiting(session_id):
+                logger.info("goal judge: wait_on_session %s is not waiting in the process registry; continuing", session_id)
+                return None
+            tgt = f"session {self.wait_on_session(session_id, reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):
             pid = int(wait_directive["pid"])
             try:

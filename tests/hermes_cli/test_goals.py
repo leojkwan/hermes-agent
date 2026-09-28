@@ -696,6 +696,47 @@ class TestSessionTriggerBarrier:
         assert s.exited is False
         assert reg.is_session_waiting("proc_t2") is False
 
+    def test_judge_session_wait_requires_a_live_registry_target(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+        from tools.process_registry import process_registry
+
+        missing = "proc_hg07_not_registered"
+        assert process_registry.is_session_waiting(missing) is False
+        manager = GoalManager("judge-session-missing", default_max_turns=10)
+        manager.set("finish the local task")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("wait", "claimed watcher", False, {"session_id": missing}, False),
+        ):
+            decision = manager.evaluate_after_turn("No registered watcher is active.")
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert GoalManager(manager.session_id).state.last_verdict == "wait"
+        assert GoalManager(manager.session_id).state.waiting_on_session is None
+
+        live_id = "proc_hg07_live_watcher"
+        session, registry = self._inject(live_id, watch_patterns=["READY"])
+        try:
+            assert registry.is_session_waiting(live_id) is True
+            manager = GoalManager("judge-session-live", default_max_turns=10)
+            manager.set("finish after the watcher signal")
+            with patch.object(
+                goals, "judge_goal",
+                return_value=("wait", "watcher running", False, {"session_id": live_id}, False),
+            ):
+                decision = manager.evaluate_after_turn(
+                    "Watching the registered build.",
+                    background_processes=[{"session_id": live_id, "pid": 4242, "status": "running"}],
+                )
+            assert decision["verdict"] == "wait"
+            assert GoalManager(manager.session_id).state.waiting_on_session == live_id
+            session._watch_hits = 1
+            assert manager.is_waiting() is False
+            assert manager.state.waiting_on_session is None
+        finally:
+            registry._running.pop(live_id, None)
+
 
     def test_wait_on_session_validation(self, hermes_home):
         from hermes_cli.goals import GoalManager
