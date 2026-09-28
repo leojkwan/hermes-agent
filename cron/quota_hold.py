@@ -16,6 +16,7 @@ closed provider window. Any run that reaches the model clears the marker.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -54,6 +55,26 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
             return float(hint) if hint is not None and float(hint) > 0 else None
         cur = cur.__cause__ or cur.__context__
     return None
+
+
+def hold_seconds_from_result(result: Any) -> Optional[float]:
+    """Seconds until the provider's reported reset for a turn-time rate limit, else None.
+
+    A limit hit mid-turn never reaches cron as an exception: the agent returns a result the error
+    classifier already labelled (``failed``, ``failure_reason``, ``failure_resets_at`` epoch).
+    Anchored on that verdict plus the provider's numeric reset — never on response/error text —
+    so billing, auth, unknown, or a bool/non-finite/past/non-numeric reset cannot park a job."""
+    if not isinstance(result, dict) or result.get("failed") is not True:
+        return None
+    if result.get("failure_reason") != "rate_limit":
+        return None
+    resets_at = result.get("failure_resets_at")
+    if isinstance(resets_at, bool) or not isinstance(resets_at, (int, float)):
+        return None
+    if not math.isfinite(resets_at):
+        return None
+    remaining = float(resets_at) - _hermes_now().timestamp()
+    return remaining if remaining > 0 else None
 
 
 def hold_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:
