@@ -222,6 +222,16 @@ class SideAgentParams(SessionParams):
     text: str
 
 
+class BackgroundParams(SideAgentParams):
+    """Optionally continue a task started by this live parent session.
+
+    The task id and stored conversation remain the same while the parent is
+    live. A malformed, foreign, or post-restart id is refused before work starts.
+    """
+
+    continue_task_id: str | None = None
+
+
 class TaskIdResult(Result):
     """The side agent runs detached; its answer lands on the parent session as an event carrying
     this ``task_id``."""
@@ -229,8 +239,9 @@ class TaskIdResult(Result):
     task_id: str
 
 
-method("prompt.background", params=SideAgentParams, result=TaskIdResult,
-       doc="Run a task on a fresh agent in the background; the answer arrives as background.complete.")
+method("prompt.background", params=BackgroundParams, result=TaskIdResult,
+       doc="Run a background task, optionally continuing this live parent's task after its prior turn; "
+           "the answer arrives as background.complete.")
 method("prompt.btw", params=SideAgentParams, result=TaskIdResult,
        doc="Side question over a snapshot of the live conversation; the answer arrives as btw.complete.")
 

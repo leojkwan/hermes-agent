@@ -2610,14 +2610,21 @@ export interface InputDetectDropResult {
   count?: number | null
   text?: string | null
 }
-export interface SideAgentParams {
+/** Optionally continue a task started by this live parent session. The task id and stored conversation remain the same while the parent is live. A malformed, foreign, or post-restart id is refused before work starts. */
+export interface BackgroundParams {
   session_id: string
   profile?: string | null
   text: string
+  continue_task_id?: string | null
 }
 /** The side agent runs detached; its answer lands on the parent session as an event carrying this ``task_id``. */
 export interface TaskIdResult {
   task_id: string
+}
+export interface SideAgentParams {
+  session_id: string
+  profile?: string | null
+  text: string
 }
 export interface PreviewRestartParams {
   session_id: string
@@ -5047,8 +5054,8 @@ export interface RpcMethods {
   'projects.tree': { params: ProjectsTreeParams; result: ProjectsTreeResult }
   /** Patch a project's display fields; answers the refreshed project. */
   'projects.update': { params: ProjectsUpdateParams; result: ProjectResult }
-  /** Run a task on a fresh agent in the background; the answer arrives as background.complete. */
-  'prompt.background': { params: SideAgentParams; result: TaskIdResult }
+  /** Run a background task, optionally continuing this live parent's task after its prior turn; the answer arrives as background.complete. */
+  'prompt.background': { params: BackgroundParams; result: TaskIdResult }
   /** Side question over a snapshot of the live conversation; the answer arrives as btw.complete. */
   'prompt.btw': { params: SideAgentParams; result: TaskIdResult }
   /** Send a user turn to a live session; busy sessions queue / steer / redirect instead of refusing. */

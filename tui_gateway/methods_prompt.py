@@ -5,6 +5,8 @@ method_ctx.bind_module), so they reference server.py globals bare.
 """
 
 import contextlib
+import re
+import threading
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -907,28 +909,57 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, str(e))
 
 
+_BACKGROUND_TASK_ID = re.compile(r"bg_[0-9a-f]{6}")
+
+
 @method("prompt.background")
 def _(rid, params: dict) -> dict:
+    cont = params.get("continue_task_id")
+    if cont is not None and not (isinstance(cont, str) and _BACKGROUND_TASK_ID.fullmatch(cont)):
+        return _err(rid, 4004, "continue_task_id must be a task_id returned by prompt.background")
     session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
     if err:
         return err
 
-    def body():
-        from run_agent import AIAgent
-        kwargs = _background_agent_kwargs(session["agent"], task_id)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
-            agent = AIAgent(**{**kwargs, "session_db": session_db})
-            try:
-                result = agent.run_conversation(user_message=text, task_id=task_id)
-            finally:
-                # AIAgent.close() is the owner boundary (memory shutdown, tool
-                # subprocesses, httpx clients); an unclosed side agent leaks
-                # all of them for the gateway's life (#50197).
-                with contextlib.suppress(Exception):
-                    agent.close()
-        return _final_response_text(result)
+    # The parent's history lock already serializes its other admissions. Register
+    # the new tail while held so every follow-up waits for the preceding turn.
+    with session["history_lock"]:
+        tasks = session.get("background_tasks", {})
+        if cont is not None and cont not in tasks:
+            return _err(rid, 4040, "background task not found in this session")
+        task_id, previous = (cont or task_id), tasks.get(cont)
+        done = threading.Event()
 
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
+        def body():
+            if previous is not None:
+                previous.wait()
+            from run_agent import AIAgent
+            kwargs = _background_agent_kwargs(session["agent"], task_id)
+            with _side_agent_session_db(kwargs.get("session_db")) as session_db:
+                history = None
+                if previous is not None:
+                    if session_db is None:
+                        raise RuntimeError("background history is unavailable")
+                    kwargs["session_id"] = session_db.resolve_resume_session_id(task_id)
+                    history = canonicalize_replay_history(
+                        session_db.get_messages_as_conversation(kwargs["session_id"], repair_alternation=True))
+                    if not history:
+                        raise RuntimeError("background history is empty")
+                agent = AIAgent(**{**kwargs, "session_db": session_db})
+                try:
+                    result = agent.run_conversation(
+                        user_message=text, task_id=task_id, conversation_history=history)
+                finally:
+                    # Close per-turn side resources even when the provider fails.
+                    with contextlib.suppress(Exception):
+                        agent.close()
+            return _final_response_text(result)
+
+        response = _spawn_side_agent(
+            rid, session, task_id, parent, "background.complete", body, cleanup=done.set)
+        if "error" not in response:
+            session.setdefault("background_tasks", {})[task_id] = done
+        return response
 
 
 @method("prompt.btw")

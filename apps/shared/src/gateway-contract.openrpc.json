@@ -2798,12 +2798,12 @@
     },
     {
       "name": "prompt.background",
-      "summary": "Run a task on a fresh agent in the background; the answer arrives as background.complete.",
+      "summary": "Run a background task, optionally continuing this live parent's task after its prior turn; the answer arrives as background.complete.",
       "params": [
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/SideAgentParams"
+            "$ref": "#/components/schemas/BackgroundParams"
           }
         }
       ],
@@ -5161,6 +5161,50 @@
         ],
         "title": "AutoReloadCardKind",
         "type": "string"
+      },
+      "BackgroundParams": {
+        "additionalProperties": false,
+        "description": "Optionally continue a task started by this live parent session.\n\nThe task id and stored conversation remain the same while the parent is\nlive. A malformed, foreign, or post-restart id is refused before work starts.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "continue_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Continue Task Id"
+          }
+        },
+        "required": [
+          "session_id",
+          "text"
+        ],
+        "title": "BackgroundParams",
+        "type": "object"
       },
       "BatteryCategory": {
         "description": "``agent/battery.py::battery_category`` colour bucket.",
