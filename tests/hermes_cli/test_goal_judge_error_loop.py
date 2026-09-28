@@ -35,6 +35,8 @@ def test_repeated_transport_error_pauses_across_reload_and_resume_rearms(goal_ho
         assert "repeated" in manager.state.paused_reason.lower()
         assert goals.GoalManager("repeated-answer").evaluate_after_turn("The report is complete.")["should_continue"] is False
         manager.resume()
+        assert manager.state is not None
+        assert manager.state.consecutive_transport_failures == 0
         assert manager.evaluate_after_turn("The report is complete.")["should_continue"] is True
 
 

@@ -1240,6 +1240,7 @@ class GoalManager(GoalContinuationMixin):
         self._state.status = "active"
         self._state.paused_reason = None
         self._state.last_transport_response_sha256 = ""
+        self._state.consecutive_transport_failures = 0
         self._state.clear_wait()   # resuming starts fresh
         self._state.consecutive_blocked_verdicts = 0
         self._state.recovery_attempts = 0
