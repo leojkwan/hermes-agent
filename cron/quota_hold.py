@@ -16,6 +16,7 @@ closed provider window. Any run that reaches the model clears the marker.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -31,6 +32,16 @@ SCHEDULE_EXPR_KEY = "quota_hold_cron_expr"
 # The provider's remaining seconds were measured when the probe ran; by the time the run is
 # recorded a little wall clock has passed, so land clearly past the boundary.
 HOLD_SLACK_SECONDS = 60
+
+# Conservatively decline waits above seven days: a bogus reset must not silence a job for years.
+# A longer genuine provider limit remains on the ordinary error cadence rather than creating a hold.
+MAX_HOLD_SECONDS = 7 * 86400
+
+
+def _plausible_wait(seconds: Optional[float]) -> Optional[float]:
+    if seconds is None or not math.isfinite(seconds) or not 0 < seconds <= MAX_HOLD_SECONDS:
+        return None
+    return seconds
 
 _RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
 
@@ -51,9 +62,28 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
             if hint is None:
                 m = _RETRY_AFTER_RE.search(str(cur))
                 hint = float(m.group(1)) if m else None
-            return float(hint) if hint is not None and float(hint) > 0 else None
+            return _plausible_wait(float(hint)) if hint is not None else None
         cur = cur.__cause__ or cur.__context__
     return None
+
+
+def hold_seconds_from_result(result: Any) -> Optional[float]:
+    """Seconds until the provider's reported reset for a turn-time rate limit, else None.
+
+    A limit hit mid-turn never reaches cron as an exception: the agent returns a result the error
+    classifier already labelled (``failed``, ``failure_reason``, ``failure_resets_at`` epoch).
+    Anchored on that verdict plus the provider's numeric reset — never on response/error text —
+    so billing, auth, unknown, or a bool/non-finite/past/non-numeric reset cannot park a job."""
+    if not isinstance(result, dict) or result.get("failed") is not True:
+        return None
+    if result.get("failure_reason") != "rate_limit":
+        return None
+    resets_at = result.get("failure_resets_at")
+    if isinstance(resets_at, bool) or not isinstance(resets_at, (int, float)):
+        return None
+    if not math.isfinite(resets_at):
+        return None
+    return _plausible_wait(float(resets_at) - _hermes_now().timestamp())
 
 
 def hold_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:

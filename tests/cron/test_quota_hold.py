@@ -16,9 +16,11 @@ import pytest
 import cron.scheduler as sched
 from cron import quota_hold as qh
 from cron.jobs import (
-    _job_is_stale_error_recurring, create_job, get_due_jobs, get_job, mark_job_run, update_job,
+    _job_is_stale_error_recurring, claim_job_for_fire, create_job, get_due_jobs, get_job,
+    mark_job_run, update_job,
 )
 from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError
+from hermes_cli import env_loader
 
 QUOTA_MSG = "Codex provider quota exhausted (429); retry after 123518s. Credentials are still valid."
 
@@ -118,8 +120,8 @@ def _tick(job, home, deliveries, resolve):
     """One real scheduler tick (preflight ON) with the provider resolver replaced by *resolve*."""
     with patch("cron.scheduler._hermes_home", home), \
          patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
-         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch.object(env_loader, "load_hermes_dotenv"), \
+         patch.object(env_loader, "reset_secret_source_cache"), \
          patch("hermes_state_registry.acquire", return_value=MagicMock()), \
          patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve), \
@@ -128,6 +130,94 @@ def _tick(job, home, deliveries, resolve):
          patch("run_agent.AIAgent") as agent_cls:
         agent_cls.return_value.run_conversation.side_effect = RuntimeError("model said no")
         sched.run_one_job(dict(job))
+
+
+def test_classified_rate_limit_result_parks_real_scheduled_fire_once(tmp_cron_home, monkeypatch):
+    """A turn-time provider rate limit never reaches cron as an exception: the agent returns a
+    classified result (``failed``, ``failure_reason="rate_limit"``, ``failure_resets_at``) and
+    the scheduler converts it to a bare RuntimeError. The real scheduled fire must still park at
+    the provider's reset, recover the consumed daily fire once, and not re-park when that
+    recovery fire fails again. Anything short of a classified rate limit with a finite future
+    numeric reset (other reasons, bool/NaN/inf/string/past resets, retry text in the agent's
+    own output) keeps the natural schedule."""
+    fire = datetime(2026, 9, 28, 12, 0, 56, tzinfo=timezone.utc)
+    clock = {"now": fire - timedelta(minutes=5)}
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock["now"])
+    monkeypatch.setattr(qh, "_hermes_now", lambda: clock["now"])
+    reset = fire + timedelta(seconds=554)
+    natural = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+
+    def fire_once(job_id, result):
+        claimed = claim_job_for_fire(job_id, return_job=True)
+        assert claimed, "the due fire must be claimable"
+        deliveries: list = []
+        with patch("cron.scheduler._hermes_home", tmp_cron_home), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+             patch.object(env_loader, "load_hermes_dotenv"), \
+             patch.object(env_loader, "reset_secret_source_cache"), \
+             patch("hermes_state_registry.acquire", return_value=MagicMock()), \
+             patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+             patch.object(sched, "_deliver_result",
+                          side_effect=lambda jb, content, **kw: deliveries.append(content)), \
+             patch("run_agent.AIAgent") as agent_cls:
+            agent_cls.return_value.run_conversation.return_value = result
+            sched.run_one_job(claimed)
+        return get_job(job_id), deliveries
+
+    def failed(**fields):
+        return {"failed": True, "completed": False, "final_response": "",
+                "error": "Incomplete upstream response: You've hit your session limit",
+                "failure_reason": "rate_limit", "failure_resets_at": reset.timestamp(), **fields}
+
+    # Rejected shapes: each keeps the natural next occurrence and stamps no hold.
+    rejected = [
+        failed(failure_reason="billing"), failed(failure_reason="unknown"),
+        failed(failure_reason=None), failed(failure_resets_at=True),
+        failed(failure_resets_at=float("nan")), failed(failure_resets_at=float("inf")),
+        failed(failure_resets_at=str(reset.timestamp())),
+        failed(failure_resets_at=(fire - timedelta(seconds=5)).timestamp()),
+        failed(failure_resets_at=None),
+        failed(failure_resets_at=datetime(2400, 1, 1, tzinfo=timezone.utc).timestamp()),
+        failed(failure_resets_at=1e12),
+        {"failed": True, "completed": False, "failure_reason": "unknown",
+         "error": "tool said: HTTP 429, retry after 60s",
+         "final_response": "retry after 60s; resets_at 9999999999"},
+    ]
+    for i, result in enumerate(rejected):
+        clock["now"] = fire
+        assert qh.hold_seconds_from_result(result) is None, (i, result)
+        clock["now"] = fire - timedelta(minutes=5)
+        job = create_job(f"brief {i}", "0 12 * * *", deliver="local")
+        clock["now"] = fire
+        j, _ = fire_once(job["id"], result)
+        assert j["last_status"] == "error", (i, j)
+        assert datetime.fromisoformat(j["next_run_at"]) == natural, (i, result)
+        assert qh.STATE_KEY not in j, (i, result)
+
+    clock["now"] = fire - timedelta(minutes=5)
+    job = create_job("morning letter", "0 12 * * *", deliver="local")
+    clock["now"] = fire
+    j, deliveries = fire_once(job["id"], failed())
+    held_until = reset + timedelta(seconds=qh.HOLD_SLACK_SECONDS)
+    assert j["last_status"] == "error"
+    assert datetime.fromisoformat(j["next_run_at"]) == held_until < natural
+    assert j[qh.STATE_KEY] == j["next_run_at"]
+    assert qh.is_recovery_fire(j, j["next_run_at"])
+    assert "_quota_hold_seconds" not in j
+    assert len(deliveries) == 1 and "held" in deliveries[0], deliveries
+
+    # The recovery fire is due once; failing again waits for the natural schedule (at most once).
+    clock["now"] = held_until + timedelta(seconds=1)
+    assert job["id"] in {d["id"] for d in get_due_jobs()}
+    j, _ = fire_once(job["id"], failed(
+        failure_resets_at=(clock["now"] + timedelta(seconds=554)).timestamp()))
+    assert datetime.fromisoformat(j["next_run_at"]) == natural
+    assert qh.STATE_KEY not in j
+
+
+_RUNTIME = {"api_key": "test-key", "base_url": "https://example.invalid/v1",
+            "provider": "openrouter", "api_mode": "chat_completions"}
 
 
 def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_reach(tmp_cron_home):
@@ -171,3 +261,12 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = update_job(job_id, {"schedule": "every 15m"})
     assert qh.STATE_KEY not in j
     assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
+
+
+@pytest.mark.parametrize("retry_after", [7 * 86400 + 1, 1e12, float("inf")])
+def test_implausible_provider_wait_never_parks(retry_after):
+    """A wait beyond any real provider window (weekly limits reset within 7 days) is corrupt data:
+    parking on it would silence a job for years or overflow the hold notice."""
+    err = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
+                    retry_after=retry_after)
+    assert qh.hold_seconds_from_failure(err) is None

@@ -2531,6 +2531,11 @@ def run_job(
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
+        # A turn-time provider limit arrives as a classified result, not an exception, and the
+        # next call re-raises it as a bare RuntimeError: flag the hold here (cron/quota_hold.py).
+        from cron.quota_hold import hold_seconds_from_result
+        if _hold_s := hold_seconds_from_result(result):
+            job["_quota_hold_seconds"] = _hold_s
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
