@@ -26,6 +26,7 @@ logger = logging.getLogger("tools.computer_use.cua_backend")
 _CUA_DRIVER_BUNDLE_ID = CUA_DRIVER_BUNDLE_ID
 _CUA_DRIVER_TEAM_IDS = ("4YEC26S9KF", "YCK386LBJ7")
 _QUIET_ERRORS = (OSError, subprocess.SubprocessError)
+_OWNER_WATCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cua_owner_watch.py")
 
 def _cb():
     """Facade module (config/policy helpers), looked up lazily to avoid the import cycle."""
@@ -123,6 +124,8 @@ class _EmbeddedCuaDaemon:
         self.permission_mode, self._driver_cmd, self._command = permission_mode, driver_cmd, driver_cmd
         self._mcp_args: List[str] = list(_driver._CUA_DRIVER_ARGS)
         self._process: Any = None
+        self._watcher: Any = None
+        self._watch_fd: Optional[int] = None
         self._owns_runtime = self._running = False
         self._stderr_tail: deque[str] = deque(maxlen=20)
         token = uuid.uuid4().hex[:12]
@@ -172,6 +175,7 @@ class _EmbeddedCuaDaemon:
                                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                                          env=env)
         self._owns_runtime = True
+        self._start_owner_watch(env)
         threading.Thread(target=self._drain_stderr, args=(self._process,), name="hermes-cua-daemon-stderr", daemon=True).start()
         deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
@@ -186,7 +190,38 @@ class _EmbeddedCuaDaemon:
         self.stop()
         self._startup_failure("embedded cua-driver startup timed out", "daemon did not become ready")
 
+    def _start_owner_watch(self, env: Dict[str, str]) -> None:
+        """Stop this daemon if we die without calling ``stop()``: a signal skips atexit, and on macOS launchd owns
+        the daemon from birth, so it would outlive us. The watcher runs in
+        its own session so a process-group kill spares it, and reads our end of a pipe: the byte ``stop()`` writes
+        means a clean exit; EOF without it means we died. Started before the readiness wait, so death mid-startup
+        is covered. POSIX only."""
+        if sys.platform == "win32":
+            return
+        read_fd, self._watch_fd = os.pipe()
+        try:
+            self._watcher = subprocess.Popen([sys.executable, "-I", _OWNER_WATCH_SCRIPT, self._command, self.socket_path],
+                                             stdin=read_fd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             env=env, start_new_session=True)
+        except _QUIET_ERRORS:
+            logger.warning("could not start the cua-driver owner watch; this daemon stops only on a clean exit",
+                           exc_info=True)
+        finally:
+            os.close(read_fd)
+
+    def _end_owner_watch(self) -> None:
+        fd, self._watch_fd, watcher, self._watcher = self._watch_fd, None, self._watcher, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.write(fd, b"x")
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if watcher is not None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                watcher.wait(timeout=2.0)
+
     def _startup_failure(self, what: str, fallback: str) -> None:
+        self._end_owner_watch()
         raise RuntimeError(f"{what}: {'; '.join(self._stderr_tail) or fallback}")
 
     def _socket_ready(self, env: Dict[str, str]) -> bool:
@@ -210,3 +245,4 @@ class _EmbeddedCuaDaemon:
         if sys.platform != "win32" and os.path.exists(self.socket_path):
             with contextlib.suppress(OSError):
                 os.remove(self.socket_path)
+        self._end_owner_watch()
