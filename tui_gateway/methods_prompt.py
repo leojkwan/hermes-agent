@@ -933,10 +933,9 @@ def _(rid, params: dict) -> dict:
         try:
             # Emit the ready answer before memory shutdown, but retain #50197's
             # close boundary under the same profile, secrets and terminal policy.
-            with _session_profile_runtime_scope(session):
-                if agent is not None:
-                    with contextlib.suppress(Exception):
-                        agent.close()
+            if agent is not None:
+                with contextlib.suppress(Exception):
+                    agent.close()
         finally:
             resources.close()
 
@@ -1183,17 +1182,20 @@ def _spawn_side_agent(
         # background server running under this task_id, and AIAgent.close() would kill every process for
         # the task_id and tear down the very server the restart just started.
         try:
-            with _session_profile_runtime_scope(session):
-                text = body()
-            _emit(event, parent, {"task_id": task_id, **extra, "text": text})
-        except Exception as e:
-            _emit(event, parent, {"task_id": task_id, **extra, "text": f"error: {e}"})
+            # Hold the original scope through cleanup: reacquiring it can fail
+            # after an agent has been constructed, skipping its owner shutdown.
+            with contextlib.ExitStack() as runtime_scope:
+                try:
+                    runtime_scope.enter_context(_session_profile_runtime_scope(session))
+                    text = body()
+                    _emit(event, parent, {"task_id": task_id, **extra, "text": text})
+                except Exception as e:
+                    _emit(event, parent, {"task_id": task_id, **extra, "text": f"error: {e}"})
+                finally:
+                    if cleanup is not None:
+                        cleanup()
         finally:
-            try:
-                if cleanup is not None:
-                    cleanup()
-            finally:
-                _clear_session_context(session_tokens)
+            _clear_session_context(session_tokens)
 
     if _start_session_work(run, name=f"side-agent-{task_id}") is None:
         return _err(rid, 5035, "backend is retiring; reconnect to continue")

@@ -1,5 +1,6 @@
 """A ready side answer must not wait for memory shutdown, or release its store early."""
 
+import contextlib
 from pathlib import Path
 import queue
 import sys
@@ -82,7 +83,7 @@ def test_background_answer_arrives_while_cleanup_holds_profile_store_and_admissi
         registry.close_all()
 
 
-@pytest.mark.parametrize("failure", ["constructor", "turn"])
+@pytest.mark.parametrize("failure", ["constructor", "turn", "scope_reentry"])
 def test_background_failure_closes_once_and_releases_its_store(tmp_path, monkeypatch, failure):
     import hermes_state_registry as registry
     from tui_gateway import server
@@ -98,6 +99,8 @@ def test_background_failure_closes_once_and_releases_its_store(tmp_path, monkeyp
                 raise RuntimeError("constructor failed")
 
         def run_conversation(self, **kwargs):
+            if failure == "scope_reentry":
+                return {"final_response": "ready answer"}
             raise RuntimeError("turn failed")
 
         def close(self):
@@ -110,13 +113,28 @@ def test_background_failure_closes_once_and_releases_its_store(tmp_path, monkeyp
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
     monkeypatch.setattr(server, "_start_session_work", lambda target, **kwargs: (target(), SimpleNamespace())[1])
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    if failure == "scope_reentry":
+        original_scope = server._session_profile_runtime_scope
+        entered = []
+
+        @contextlib.contextmanager
+        def scope(session):
+            entered.append(True)
+            if len(entered) > 1:
+                raise RuntimeError("profile scope cannot be reacquired")
+            with original_scope(session):
+                yield
+
+        monkeypatch.setattr(server, "_session_profile_runtime_scope", scope)
     try:
         result = server._methods["prompt.background"]("r", {"session_id": "parent", "text": "ask"})
         assert result["result"]["task_id"].startswith("bg_")
         assert len(emitted) == 1
         assert emitted[0][0:2] == ("background.complete", "parent")
-        assert emitted[0][2]["text"] == f"error: {failure} failed"
+        assert emitted[0][2]["text"] == ("ready answer" if failure == "scope_reentry" else f"error: {failure} failed")
         assert closed == ([] if failure == "constructor" else [True])
+        if failure == "scope_reentry":
+            assert entered == [True]
     finally:
         registry.release_or_close(parent_db)
         registry.close_all()
