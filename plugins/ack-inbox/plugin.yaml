@@ -1,0 +1,5 @@
+name: ack-inbox
+version: 0.1.0
+description: "Keep admitted asks open until an explicit acknowledgement."
+provides_tools:
+  - inbox_ack
