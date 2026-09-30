@@ -274,10 +274,10 @@ def test_implausible_provider_wait_never_parks(monkeypatch):
 
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(qh, "_hermes_now", lambda: now)
-    for wait in (604800, 604801, 1e12, float("nan"), float("inf")):
+    for wait in (604800, 604801, 1e12, float("nan"), float("inf"), 10**1000):
         expected = 604800.0 if wait == 604800 else None
         result = {"failed": True, "failure_reason": "rate_limit",
-                  "failure_resets_at": now.timestamp() + wait}
+                  "failure_resets_at": int(now.timestamp()) + wait}
         assert qh.hold_seconds_from_result(result) == expected, wait
         err = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
                         retry_after=wait)
