@@ -57,12 +57,27 @@ _MAX_BARRIER_WAIT_S = 30 * 60
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
+_REAL_USER_GATE_TAXONOMY = (
+    "(a) credentials or account access; (b) spending money; (c) sending or "
+    "publishing anything outside this machine; (d) a destructive or "
+    "irreversible action; or (e) a product decision that cannot be undone"
+)
+
+
+_REAL_USER_GATE_CONTINUATION = (
+    "Ask the user and stop only when every remaining step requires one of "
+    f"these five user-gate classes and no recorded grant covers it: "
+    f"{_REAL_USER_GATE_TAXONOMY}. Otherwise, choose the reasonable reversible "
+    "default, or note what is waiting on the user and continue with the rest."
+)
+
+
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
     "Continue working toward this goal. Take the next concrete step. "
     "If you believe the goal is complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly and stop."
+    f"{_REAL_USER_GATE_CONTINUATION}"
 )
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
@@ -76,8 +91,9 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Stay within the stated boundaries and do not violate the constraints. "
     "Before claiming the goal is done, satisfy the Verification criterion and "
     "show the concrete evidence (command output, file contents, test result). "
-    "If you hit the stated stop condition or are otherwise blocked and need "
-    "user input, say so clearly and stop."
+    "If you hit the stated stop condition, record the exact wake and apply "
+    "the user-gate rule below while preserving the boundaries. "
+    f"{_REAL_USER_GATE_CONTINUATION}"
 )
 
 # With /subgoal criteria: surfaced verbatim to the agent and to the judge.
@@ -89,8 +105,7 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Continue working toward the goal AND all additional criteria. Take "
     "the next concrete step. If you believe the goal and every "
     "additional criterion are complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly "
-    "and stop."
+    f"{_REAL_USER_GATE_CONTINUATION}"
 )
 
 # Fed back when a quality gate fails: bounded output is the evidence to repair against (no judge).
@@ -116,20 +131,27 @@ JUDGE_SYSTEM_PROMPT = (
     "most recent response, and — when present — a list of background "
     "processes the agent has running. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
-    "- The response explicitly confirms the goal was completed, OR\n"
-    "- The response clearly shows the final deliverable was produced.\n"
-    "DONE requires the deliverable to actually exist. If the response only "
-    "explains why the goal cannot be reached, the verdict is BLOCKED, not "
-    "DONE.\n\n"
+    "- The response shows evidence that the user's whole stated goal, including "
+    "every required contract criterion and subgoal, was satisfied.\n"
+    "A completed slice or one produced deliverable is not DONE while required "
+    "work within that goal remains, even if a protected remainder was recorded "
+    "as waiting on the user. If every remaining required step is behind a "
+    "protected user gate without an applicable recorded grant, return "
+    "BLOCKED; otherwise choose CONTINUE or WAIT only under the verified "
+    "async criteria below. Do not treat the agent's bare completion claim "
+    "as evidence.\n\n"
     "BLOCKED — the goal cannot be satisfied as stated:\n"
-    "- The response explains the goal is genuinely unachievable (impossible, "
-    "out of scope, no valid path to the deliverable), or refuses to "
-    "fabricate a deliverable that cannot exist, OR\n"
-    "- The response explains progress is blocked and the next step needs "
-    "user input to proceed.\n"
-    "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
+    "- Every remaining step is behind one of the five user-gate classes with "
+    f"no recorded grant: {_REAL_USER_GATE_TAXONOMY}.\n"
+    "Name the applicable gate class, the remaining action, and the missing "
+    "grant in the BLOCKED reason. BLOCKED is "
     "a refusal, not a completion — never return BLOCKED for a goal that "
-    "was achieved.\n"
+    "was achieved. A question about a reversible choice, a local merge, or "
+    "a test that needs the user's hands is NOT BLOCKED by itself; return "
+    "CONTINUE and take the next concrete step. A local-only deployment within "
+    "the authorized task can continue. External deployment or publication "
+    "requires an applicable recorded grant naming its destination and payload; "
+    "rollback alone does not authorize it.\n"
     "When the block is an error the agent hit (an HTTP status, an API, "
     "sign-in or token failure), quote the error text verbatim in the reason "
     "and attribute it only to a provider, service or credential the response "
@@ -146,8 +168,10 @@ JUDGE_SYSTEM_PROMPT = (
     "watch_patterns trigger fires (use this for a long-lived watcher that "
     "signals mid-run and may never exit). Otherwise return its pid in "
     "``wait_on_pid`` (releases on exit only).\n"
-    "- The agent says it is rate-limited / backing off / must wait a fixed "
-    "period — return seconds in ``wait_for_seconds``.\n"
+    "- A narrated rate limit, backoff, or fixed delay alone is not a WAIT "
+    "target on a successful turn. Provider failure recovery is separate; "
+    "without a listed running process or active "
+    "delegation, return CONTINUE.\n"
     "- The agent has delegated subagents still running (stated below as "
     "active delegations) and the response says it is waiting on them with "
     "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
@@ -205,8 +229,10 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
     "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
-    "background process).\n\n"
+    "is NOT done. Return BLOCKED only when every remaining required step "
+    "is behind one of the five user-gate classes with no applicable "
+    "recorded grant; otherwise return CONTINUE (or WAIT under the verified "
+    "async criteria above).\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
 
@@ -219,7 +245,8 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision rules:\n"
-    "- The goal is DONE only when the Verification criterion is satisfied AND "
+    "- The goal is DONE only when every required part of the goal and "
+    "contract, including additional criteria, is satisfied AND "
     "the response shows concrete evidence of it (a command result, file "
     "contents excerpt, test/benchmark output) — not a claim like 'done' or "
     "'all tests pass' without evidence.\n"
@@ -228,9 +255,9 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
-    "- If the response explains the work is genuinely unachievable or hits "
-    "the stated Stop condition and needs user input, the goal is NOT done — "
-    "return BLOCKED with the reason describing the block.\n"
+    "- Return BLOCKED only when every remaining required step is behind one "
+    "of the five user-gate classes listed above with no applicable recorded "
+    "grant. Name the gate class, remaining action, and missing grant.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
@@ -1452,7 +1479,11 @@ class GoalManager:
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
         unobservable here, so the caller continues instead."""
         if wait_directive.get("session_id"):
-            tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
+            session_id = str(wait_directive["session_id"])
+            if not _session_waiting(session_id):
+                logger.info("goal judge: wait_on_session %s is not waiting in the process registry; continuing", session_id)
+                return None
+            tgt = f"session {self.wait_on_session(session_id, reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):
             pid = int(wait_directive["pid"])
             try:
@@ -1465,8 +1496,13 @@ class GoalManager:
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
-            tgt = f"{wait_directive['seconds']}s"
+            seconds = int(wait_directive["seconds"])
+            if active_delegations <= 0:
+                logger.info("goal judge: refused wait_for_seconds=%s without active delegations; continuing", seconds)
+                return None
+            seconds = max(600, min(1800, seconds))
+            self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+            tgt = f"{seconds}s"
         return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:

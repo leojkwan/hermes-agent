@@ -67,3 +67,35 @@ def test_a_delegation_wait_lifts_when_a_batch_returns_not_only_when_the_timer_ru
     with patch.object(goals, "count_active_delegations", return_value=0):
         assert mgr.is_waiting() is True
     goals._DB_CACHE.clear()
+
+
+def test_judge_delegation_seconds_are_bounded_and_release_on_result(tmp_path, monkeypatch):
+    from pathlib import Path
+    import time
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    try:
+        for proposed, expected in ((1, 600), (999999, 1800)):
+            mgr = goals.GoalManager(session_id=f"delegated-{proposed}", default_max_turns=10)
+            mgr.set("integrate worker results")
+            with patch.object(
+                goals, "judge_goal",
+                return_value=("wait", "workers still running", False, {"seconds": proposed}, False),
+            ):
+                before = time.time()
+                decision = mgr.evaluate_after_turn("Waiting on four workers.", active_delegations=4)
+                after = time.time()
+            assert decision["verdict"] == "wait"
+            assert decision["should_continue"] is False
+            persisted = goals.GoalManager(mgr.session_id)
+            assert before + expected <= persisted.state.waiting_until <= after + expected
+            assert persisted.state.waiting_on_delegations == 4
+            with patch.object(goals, "count_active_delegations", return_value=3):
+                assert persisted.is_waiting() is False
+            assert persisted.state.waiting_until == 0.0
+    finally:
+        goals._DB_CACHE.clear()

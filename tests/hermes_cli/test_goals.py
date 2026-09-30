@@ -622,6 +622,29 @@ class TestJudgeDrivenWait:
         assert mgr.state.waiting_on_pid is None
 
 
+    def test_judge_seconds_without_live_delegations_continues(self, hermes_home):
+        """A model-proposed timer alone cannot park a successful goal turn."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-unsupported-seconds", default_max_turns=10)
+        mgr.set("land the tested local branch")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("wait", "waiting for a local merge", False, {"seconds": 900}, False),
+        ):
+            decision = mgr.evaluate_after_turn("The branch is ready to merge.", active_delegations=0)
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.last_verdict == "wait"  # raw judge proposal remains inspectable
+        reloaded = GoalManager("jw-unsupported-seconds")
+        assert reloaded.state.last_verdict == "wait"
+        assert reloaded.state.waiting_until == 0.0
+        assert reloaded.state.turns_used == 1
+
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Session/trigger barrier — wait on a process's OWN trigger, not just exit
 # ──────────────────────────────────────────────────────────────────────
@@ -673,6 +696,49 @@ class TestSessionTriggerBarrier:
             assert False, "expected ValueError"
         except ValueError:
             pass
+
+
+    def test_judge_session_wait_requires_a_live_registry_target(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+        from tools.process_registry import process_registry
+
+        missing = "proc_hg07_not_registered"
+        assert process_registry.is_session_waiting(missing) is False
+        manager = GoalManager("judge-session-missing", default_max_turns=10)
+        manager.set("finish the local task")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("wait", "claimed watcher", False, {"session_id": missing}, False),
+        ):
+            decision = manager.evaluate_after_turn("No registered watcher is active.")
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert GoalManager(manager.session_id).state.last_verdict == "wait"
+        assert GoalManager(manager.session_id).state.waiting_on_session is None
+
+        live_id = "proc_hg07_live_watcher"
+        session, registry = self._inject(live_id, watch_patterns=["READY"])
+        try:
+            assert registry.is_session_waiting(live_id) is True
+            manager = GoalManager("judge-session-live", default_max_turns=10)
+            manager.set("finish after the watcher signal")
+            with patch.object(
+                goals, "judge_goal",
+                return_value=("wait", "watcher running", False, {"session_id": live_id}, False),
+            ):
+                decision = manager.evaluate_after_turn(
+                    "Watching the registered build.",
+                    background_processes=[{"session_id": live_id, "pid": 4242, "status": "running"}],
+                )
+            assert decision["verdict"] == "wait"
+            assert GoalManager(manager.session_id).state.waiting_on_session == live_id
+            session._watch_hits = 1
+            assert manager.is_waiting() is False
+            assert manager.state.waiting_on_session is None
+        finally:
+            registry._running.pop(live_id, None)
+
 
 
 
