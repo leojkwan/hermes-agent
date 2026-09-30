@@ -4184,12 +4184,17 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply: bool, event_thread_ts, user_id: str, team_id: str, is_dm: bool,
         force_process: bool) -> bool:
         """Channel/MPIM gate: respond in a free-response channel (still gated by
-        ``thread_require_mention``), when @mentioned, or when a wake check passes. Always silent
+        ``thread_require_mention``), when @mentioned, or when a wake check passes. Always rejects
         outside ``allowed_channels`` or when addressed to another user; ``force_process`` skips only
         the mention rule."""
         allowed_channels = self._slack_allowed_channels()
         if allowed_channels and channel_id not in allowed_channels:
-            logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
+            if is_mentioned:
+                logger.warning(
+                    "[Slack] Channel-filtered mention dropped: channel=%s team=%s thread_ts=%s",
+                    channel_id, team_id, event_thread_ts)
+            else:
+                logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
             return False
         self_uids = {u for u in (bot_uid, self._bot_user_id) if u}
         if (
