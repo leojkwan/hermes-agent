@@ -445,7 +445,9 @@ class _CuaDriverSession:
         from tools.environments.local import _sanitize_subprocess_env
 
         call_args, shot_file = dict(args), None
-        if name == "get_window_state" and "screenshot_out_file" not in call_args:
+        # The driver's file-output option forces capture even when include_screenshot is false.
+        if (name == "get_window_state" and call_args.get("include_screenshot") is not False
+                and "screenshot_out_file" not in call_args):
             fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
             os.close(fd)
             call_args["screenshot_out_file"] = shot_file
