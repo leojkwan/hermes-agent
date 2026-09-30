@@ -89,9 +89,9 @@ A contract has five fields, all optional:
 | `verification` | The specific test / command / artifact that *proves* the outcome. |
 | `constraints` | What must not change or regress. |
 | `boundaries` | Which files, dirs, tools, or systems are in scope. |
-| `stop_when` | The condition under which Hermes should stop and ask for input. |
+| `stop_when` | A condition to record with an exact wake; the continuation applies the user-gate rule below while preserving the contract's boundaries and constraints. |
 
-When a contract is set, both prompts change: the **continuation prompt** tells the agent to target the verification surface and respect the constraints, and the **judge prompt** decides `done` *only when the verification criterion is met with concrete evidence* (a command result, file excerpt, test output) — not a loose "looks done" claim. This directly tightens the most common `/goal` failure mode (premature completion or endless over-continuation on an underspecified objective).
+When a contract is set, both prompts change: the **continuation prompt** tells the agent to target the verification surface and respect the constraints, and the **judge prompt** requires concrete evidence for every required part of the goal and contract, including verification and added criteria. An arbitrary stop condition or ordinary question does not automatically classify the goal as blocked. The agent records the exact wake and continues other authorized work unless every remaining required step meets the protected user-gate rule below. Explicit `/goal pause` remains available.
 
 ### Two ways to set a contract
 
@@ -182,10 +182,14 @@ Typical flow: the agent pushes a PR, starts a CI watcher with `terminal(backgrou
 After every turn, Hermes calls an auxiliary model with:
 
 - The standing goal text
-- The agent's most recent final response (last ~4 KB of text)
+- A bounded excerpt of the agent's most recent final response (up to 4,000 characters)
 - A system prompt telling the judge to reply with strict one-line JSON: `{"verdict": "done" | "blocked" | "continue" | "wait", "reason": "<one-sentence rationale>"}` (wait verdicts add `wait_on_session` / `wait_on_pid` / `wait_for_seconds`; the legacy `{"done": <bool>, "reason": "..."}` shape is still accepted)
 
-The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced. A goal the agent explains is **unachievable** (impossible, out of scope, needs user input) gets a `blocked` verdict instead — never `done`: the goal **pauses** with the judge's reason (`🚫 Goal judged unachievable — paused`), so you can re-scope it with `/goal <text>` or override with `/goal resume` rather than burning budget or having an impossible task waved through as complete.
+The judge marks a goal `done` only when the response gives concrete evidence for the **whole stated goal**, including every required contract criterion and subgoal. A completion claim or one finished deliverable is insufficient while required work remains.
+
+The judge returns `blocked` only when **every remaining required step** needs one of five protected user gates without an applicable recorded grant: credentials or account access, spending money, sending or publishing anything outside this machine, a destructive or irreversible action, or a product decision that cannot be undone. Its reason must name the gate class, remaining action, and missing grant. Reversible choices, local merges, and tests needing the user's hands do not qualify by themselves; the agent records a wake and continues other authorized work. External deployment requires a grant covering its destination and payload; a rollback plan alone is insufficient.
+
+`blocked` keeps the goal unfinished and pauses it with the judge's reason. You can re-scope with `/goal <text>` or resume with `/goal resume`. The judge sees only the supplied goal, response, contract or subgoals, runtime status and clock; earlier session grants and linked artifacts are not fetched automatically. A verdict does not grant authority to send, publish, spend, or change access.
 
 ### Fail-open semantics
 
