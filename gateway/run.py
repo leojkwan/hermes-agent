@@ -4302,8 +4302,8 @@ class GatewayRunner(
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
         loop = asyncio.get_running_loop()
-        ctx = copy_context()
-        return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
+        from hermes_cli.backend_retirement import retirement
+        return await retirement.submit_worker(loop, lambda: func(*args), executor=self._get_executor())
 
     async def _run_housekeeping_in_executor(self, func, *args):
         """Run best-effort session housekeeping off the TURN pool.
@@ -4317,8 +4317,9 @@ class GatewayRunner(
         exhausting that one delays only more housekeeping, which is best-effort by construction.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._get_housekeeping_executor(), copy_context().run, func, *args)
+        from hermes_cli.backend_retirement import retirement
+        return await retirement.submit_worker(
+            loop, lambda: func(*args), executor=self._get_housekeeping_executor())
 
     def _get_or_create_pool(self, attr: str, make_pool: Callable[[], concurrent.futures.Executor]) -> concurrent.futures.Executor:
         """Return (creating under ``_executor_lock``) the pool at ``attr``; one lock + closing flag fences both."""
@@ -5631,27 +5632,54 @@ async def _start_gateway_start_control_socket(runner):
         # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
-        def _pause_for_update_handler() -> dict:
+        def _pause_for_update_handler(params: dict) -> dict:
+            safe = params.get("graceful_only", False)
+            action = params.get("action", "start")
+            if not isinstance(safe, bool) or action not in {"start", "status", "cancel"}:
+                raise ValueError("invalid safe pause parameters")
+            if action != "start" and not safe:
+                raise ValueError("status/cancel require graceful_only")
+            operation_id = params.get("operation_id")
+            if action == "cancel" and (not isinstance(operation_id, str) or not operation_id):
+                raise ValueError("cancel requires operation_id")
             try:
                 from hermes_cli.gateway import _get_restart_drain_timeout
                 _drain = float(_get_restart_drain_timeout())
             except Exception:
                 _drain = 30.0
-            accepted_box: list[bool] = []
+            result_box: list[dict] = []
             _done = threading.Event()
 
             def _request() -> None:
                 try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
+                    if action == "status":
+                        result_box.append(runner.graceful_restart_status())
+                    elif action == "cancel":
+                        cancelled = runner.cancel_graceful_restart(operation_id)
+                        result_box.append({"cancelled": cancelled, **runner.graceful_restart_status()})
+                    else:
+                        kwargs = {"detached": False, "via_service": True}
+                        if safe:
+                            kwargs.update(graceful_only=True)
+                            if "timeout_seconds" in params:
+                                kwargs["timeout_seconds"] = params["timeout_seconds"]
+                        accepted = runner.request_restart(**kwargs)
+                        result_box.append({
+                            "pausing": accepted, "already_stopping": not accepted,
+                            "pid": os.getpid(), "drain_timeout": _drain,
+                            **(runner.graceful_restart_status() if safe else {})})
                 finally:
                     _done.set()
 
             _main_loop.call_soon_threadsafe(_request)
             _done.wait(timeout=5.0)
-            accepted = bool(accepted_box and accepted_box[0])
-            return {
-                "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+            if result_box:
+                return result_box[0]
+            # A delayed loop acknowledgment is an unknown result, never proof of a stop.
+            if safe:
+                return {"pending": True, "pid": os.getpid()}
+            return {"pausing": False, "already_stopping": True,
+                    "pid": os.getpid(), "drain_timeout": _drain}
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now

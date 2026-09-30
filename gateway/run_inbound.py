@@ -1310,6 +1310,14 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from hermes_cli.backend_retirement import retirement
+        # Reserve before auth/routing/skill rewrite can await and become invisible to a drain.
+        with retirement.work() as admitted:
+            if not admitted:
+                return None  # Pre-auth refusal must not reply to an ignored/unauthorized source.
+            return await self._handle_admitted_message(event)
+
+    async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL

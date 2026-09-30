@@ -11,11 +11,14 @@ import asyncio
 import dataclasses
 import json
 import logging
+import math
 import os
 import shlex
 import sys
 import threading
 import time
+import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import Context
 from pathlib import Path
@@ -1667,7 +1670,133 @@ class GatewayShutdownMixin:
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def _strict_restart_work_count(self) -> int:
+        """Safe pause proof: no best-effort zeroes, wedged exclusions or executor blind spots."""
+        from gateway.platforms.api_server_runs import api_worker_live_count
+        from hermes_cli.backend_retirement import retirement
+
+        agents = self._running_agents
+        workers = getattr(self, "_deferred_agent_workers", {})
+        if not isinstance(agents, Mapping) or not isinstance(workers, Mapping):
+            raise RuntimeError("work registry unavailable")
+        api = self.adapters.get(Platform.API_SERVER)
+        api_count = api.active_agent_work_count(strict=True) if api is not None else 0
+        counts = [sum(agent is not None for agent in list(agents.values())),
+                  self._running_cron_job_count(), api_count, api_worker_live_count(),
+                  sum(not future.done() for future in list(workers)), retirement.active_count()]
+        if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in counts):
+            raise RuntimeError("invalid work count")
+        return sum(counts)
+
+    def graceful_restart_status(self) -> dict:
+        attempt = getattr(self, "_graceful_restart", None)
+        return ({key: attempt[key] for key in ("operation_id", "state", "reason")}
+                if attempt else {"operation_id": None, "state": "none", "reason": None})
+
+    def cancel_graceful_restart(self, operation_id: str) -> bool:
+        """Cancel only the named, still-abortable attempt; committed shutdown never reopens."""
+        attempt = getattr(self, "_graceful_restart", None)
+        if (not attempt or attempt["operation_id"] != operation_id
+                or attempt["state"] != "draining"):
+            return False
+        attempt["cancelled"] = True
+        return True
+
+    def _request_graceful_restart(self, *, detached: bool, via_service: bool,
+                                  timeout_seconds: Optional[float]) -> bool:
+        from hermes_cli.backend_retirement import retirement
+
+        if (detached or not via_service or self._restart_task_started
+                or self._restart_requested or self._stop_task is not None or not self._running):
+            return False
+        timeout = self._restart_after_turn_timeout if timeout_seconds is None else timeout_seconds
+        if isinstance(timeout, bool):
+            return False
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(timeout) or timeout < 0:
+            return False
+        previous = {key: getattr(self, key) for key in (
+            "_draining", "_restart_requested", "_restart_task_started", "_restart_detached", "_restart_via_service")}
+        attempt = self._graceful_restart = {"operation_id": uuid.uuid4().hex,
+                                            "state": "draining", "reason": None, "cancelled": False}
+        self._restart_task_started = self._draining = True
+
+        def abort(reason):
+            attempt.update(state="aborted", reason=reason)
+            # An independent stop owns intake once it starts. Preserve external drains.
+            if (getattr(self, "_graceful_restart", None) is attempt
+                    and self._stop_task is None and self._running):
+                for key, value in previous.items():
+                    setattr(self, key, value)
+                self._scale_to_zero_status(
+                    "draining" if self._draining or getattr(self, "_external_drain_active", False) else "running",
+                    "safe restart abort: status mark failed")
+
+        async def _run_safe_restart():
+            permit = None
+            committed = False
+            reason = "work-unreadable"
+            try:
+                deadline = asyncio.get_running_loop().time() + timeout
+                while True:
+                    if attempt["cancelled"]:
+                        reason = "cancelled"
+                        return
+                    if self._stop_task is not None or not self._running:
+                        reason = "shutdown-owned-elsewhere"
+                        return
+                    if self._strict_restart_work_count() == 0:
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        reason = "timeout"
+                        return
+                    await asyncio.sleep(0.1)
+                # Freeze + strict proof + commit are one non-awaiting decision. Existing thread
+                # dispatchers and inbound prefixes hold this same process-owned fence.
+                prepared = retirement.prepare(idle_predicate=lambda: self._strict_restart_work_count() == 0)
+                if not prepared.get("ok"):
+                    reason = "idle-proof-refused"
+                    return
+                permit = prepared["token"]
+                if not retirement.commit(permit).get("ok"):
+                    reason = "permit-expired"
+                    return
+                committed = True
+                attempt["state"] = "committed"
+                self._restart_requested = self._restart_via_service = True
+                self._restart_detached = False
+                # No durable shutdown metadata, helper, watchdog or kill before commitment.
+                await asyncio.shield(self.stop(restart=True, detached_restart=False, service_restart=True))
+                attempt["state"] = "stopped"
+            except asyncio.CancelledError:
+                reason = "cancelled"
+                if committed:
+                    raise
+            except Exception:
+                logger.warning("Safe restart could not establish/complete its idle boundary", exc_info=True)
+                if committed:
+                    attempt["state"] = "shutdown-error"
+                    raise
+            finally:
+                if not committed:
+                    if permit is not None:
+                        retirement.cancel(permit)
+                    abort(reason)
+
+        self._restart_task = Context().run(lambda: asyncio.create_task(_run_safe_restart()))
+        # A task canceled before its first step never enters the coroutine's finally.
+        self._restart_task.add_done_callback(
+            lambda done: abort("cancelled") if done.cancelled() and attempt["state"] == "draining" else None)
+        return True
+
+    def request_restart(self, *, detached: bool = False, via_service: bool = False,
+                        graceful_only: bool = False, timeout_seconds: Optional[float] = None) -> bool:
+        if graceful_only:
+            return self._request_graceful_restart(
+                detached=detached, via_service=via_service, timeout_seconds=timeout_seconds)
         if self._restart_task_started:
             return False
         self._restart_requested = True

@@ -55,24 +55,19 @@ def _submit_api_worker(loop, fn):
     -> RuntimeError) the worker never runs, so the count is released here instead — a leaked
     count would make the shutdown close gate skip the SessionDB close for the process lifetime.
     """
-    global _API_WORKER_LIVE
-    with _API_WORKER_LOCK:
-        _API_WORKER_LIVE += 1
+    from hermes_cli.backend_retirement import retirement
 
-    def _counted():
-        try:
-            return fn()
-        finally:
-            global _API_WORKER_LIVE
-            with _API_WORKER_LOCK:
-                _API_WORKER_LIVE -= 1
+    def admitted():
+        global _API_WORKER_LIVE
+        with _API_WORKER_LOCK:
+            _API_WORKER_LIVE += 1
 
-    try:
-        return loop.run_in_executor(None, _counted)
-    except BaseException:
+    def released():
+        global _API_WORKER_LIVE
         with _API_WORKER_LOCK:
             _API_WORKER_LIVE -= 1
-        raise
+
+    return retirement.submit_worker(loop, fn, on_admit=admitted, on_release=released)
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
@@ -554,6 +549,17 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 
 async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
                                 notification_category: str = "result", _api_server) -> None:
+    from hermes_cli.backend_retirement import retirement
+    with retirement.work() as admitted:
+        if not admitted:
+            raise RuntimeError("internal wake deferred: Gateway admission is closed")
+        await _run_admitted_internal_session_turn(
+            self, session_id=session_id, text=text, profile=profile,
+            notification_category=notification_category, _api_server=_api_server)
+
+
+async def _run_admitted_internal_session_turn(self, *, session_id: str, text: str, profile: str,
+                                            notification_category: str, _api_server) -> None:
     """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key).
 
     The HTTP wake self-post cannot serve a multiplexed *served* profile: ``/p/<profile>/`` on

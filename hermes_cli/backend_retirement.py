@@ -9,6 +9,7 @@ import logging
 import secrets
 import threading
 import time
+from contextvars import copy_context
 
 
 class RetirementFence:
@@ -47,6 +48,50 @@ class RetirementFence:
         with self._lock:
             return self._active
 
+    def submit_worker(self, loop, fn, *, executor=None, on_admit=None, on_release=None):
+        """Hold admission until the actual thread exits, including after await cancellation.
+
+        A canceled queued body never starts after its reservation is released. Context belongs
+        to the submitting activity, exactly as with asyncio.to_thread.
+        """
+        context = copy_context()
+        if not self.acquire():
+            raise RuntimeError("Gateway admission is closed")
+        state_lock = threading.Lock()
+        state = {"started": False, "released": False, "counted": False}
+
+        def release(*, only_before_start=False):
+            with state_lock:
+                if state["released"] or (only_before_start and state["started"]):
+                    return
+                state["released"] = True
+            try:
+                if state["counted"] and on_release is not None:
+                    on_release()
+            finally:
+                self.release()
+
+        def run():
+            with state_lock:
+                if state["released"]:
+                    return None
+                state["started"] = True
+            try:
+                return context.run(fn)
+            finally:
+                release()
+
+        try:
+            if on_admit is not None:
+                on_admit()
+                state["counted"] = True
+            future = loop.run_in_executor(executor, run)
+            future.add_done_callback(lambda done: release(only_before_start=True) if done.cancelled() else None)
+            return future
+        except BaseException:
+            release(only_before_start=True)
+            raise
+
     @contextmanager
     def work(self):
         admitted = self.acquire()
@@ -56,9 +101,7 @@ class RetirementFence:
             if admitted:
                 self.release()
 
-    def prepare(self):
-        from hermes_cli.web_server_idle_proof import idle_proof
-
+    def prepare(self, *, idle_predicate=None):
         with self._lock:
             self._expire()
             if self._committed:
@@ -70,7 +113,11 @@ class RetirementFence:
         # some callers already hold a session/cron lock when reserving their work.
         verdict = None
         try:
-            verdict = idle_proof()["idle"]
+            if idle_predicate is None:
+                from hermes_cli.web_server_idle_proof import idle_proof
+                verdict = idle_proof()["idle"]
+            else:
+                verdict = idle_predicate()
         except Exception:
             logging.getLogger(__name__).warning("Retirement idle probe unavailable", exc_info=True)
         finally:

@@ -75,3 +75,23 @@ def test_only_uncommitted_permits_expire_and_unreadable_work_never_grants(monkey
         assert not admitted
     monkeypatch.setattr(web_server_idle_proof, "idle_proof", lambda: {"idle": None})
     assert RetirementFence().prepare() == {"ok": False, "idle": None}
+
+
+def test_selected_idle_predicate_freezes_admission_and_fails_closed():
+    from hermes_cli.backend_retirement import RetirementFence
+    fence = RetirementFence()
+    def probe():
+        assert not fence.acquire()
+        return True
+    permit = fence.prepare(idle_predicate=probe)['token']
+    assert not fence.acquire()
+    assert fence.cancel(permit)['ok']
+    for verdict in (False, None, 1, 'true'):
+        assert not fence.prepare(idle_predicate=lambda: verdict)['ok']
+        assert fence.acquire()
+        fence.release()
+    def unreadable():
+        raise RuntimeError('synthetic unknown work')
+    assert fence.prepare(idle_predicate=unreadable) == {'ok': False, 'idle': None}
+    assert fence.acquire()
+    fence.release()

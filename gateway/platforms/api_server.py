@@ -968,14 +968,20 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
-        token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
-        try:
-            return await handler(self, request, *args, **kwargs)
-        finally:
-            _release_pending_api_work(self, reservation)
-            _api_agent_request_reservation.reset(token)
+        from hermes_cli.backend_retirement import retirement
+        with retirement.work() as admitted:
+            if not admitted:
+                return _error_response("Gateway admission is closed", 503, headers={"Retry-After": "5"})
+            reservation = {"active": True}
+            token = _api_agent_request_reservation.set(reservation)
+            try:
+                self._pending_agent_requests += 1
+                try:
+                    return await handler(self, request, *args, **kwargs)
+                finally:
+                    _release_pending_api_work(self, reservation)
+            finally:
+                _api_agent_request_reservation.reset(token)
     return _wrapped
 
 
@@ -984,6 +990,9 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        if reservation.get("fence"):
+            from hermes_cli.backend_retirement import retirement
+            retirement.release()
 
 
 def _require_auth(handler):
@@ -1001,8 +1010,11 @@ def _require_auth(handler):
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits; a handler may detach
     the reservation to a task whose done callback then owns release."""
-    reservation = {"active": True, "detached": False}
-    adapter._pending_agent_requests += 1
+    from hermes_cli.backend_retirement import retirement
+    admitted = retirement.acquire()
+    reservation = {"active": admitted, "detached": False, "fence": admitted, "admitted": admitted}
+    if admitted:
+        adapter._pending_agent_requests += 1
     try:
         yield reservation
     finally:
@@ -1292,14 +1304,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._metrics_last_request_at: Optional[float] = None
         self._metrics_last_heartbeat_at: Optional[float] = None
 
-    def active_agent_work_count(self) -> int:
+    def active_agent_work_count(self, *, strict: bool = False) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
         (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
         try:
+            if strict:
+                counts = [self._pending_agent_requests, self._inflight_agent_runs,
+                          sum(not task.done() for task in self._active_run_tasks.values())]
+                if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in counts):
+                    raise RuntimeError("invalid API work count")
+                return sum(counts)
             return (int(getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
+            if strict:
+                raise
             return 0
 
     def interrupt_active_runs(self, reason: str) -> int:
@@ -4033,6 +4053,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if draining is not None:
             return draining
         with _reserve_pending_api_work(self) as reservation:
+            if not reservation["admitted"]:
+                return _error_response("Gateway admission is closed", 503, headers={"Retry-After": "5"})
             body = {}
             with suppress(Exception):
                 body = await request.json()
@@ -4067,7 +4089,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
             def _detach_fire(fire_fn, *fire_args) -> "web.Response":
                 # The done callback owns the reservation once the task is detached.
-                task = asyncio.create_task(asyncio.to_thread(fire_fn, *fire_args, adapters=adapters, loop=loop))
+                task = asyncio.ensure_future(_api_runs._submit_api_worker(
+                    loop, lambda: fire_fn(*fire_args, adapters=adapters, loop=loop)))
                 reservation["detached"] = True
                 task.add_done_callback(lambda _task: _release_pending_api_work(self, reservation))
                 self._track_background_task(task, tolerate_missing=True)
@@ -4080,7 +4103,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Persist the attempt + exact store owner before acknowledging NAS; a failure here
             # is retryable and the reservation remains attached.
             try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                claimed_job = await _api_runs._submit_api_worker(loop, lambda: provider.claim_fire(job_id))
             except Exception as exc:
                 logger.error("cron fire admission failed for %s: %s", job_id, exc)
                 return web.json_response({"error": "cron fire admission failed", "job_id": job_id}, status=503)
