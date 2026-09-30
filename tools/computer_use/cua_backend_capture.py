@@ -81,13 +81,20 @@ def _sorted_windows(out: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _tree_and_title(out: Dict[str, Any]) -> Tuple[str, str]:
     """``(tree_markdown, window_title)`` from a get_window_state result."""
     tree = _split_tree_text(data if isinstance((data := out.get("data")), str) else "")[1]
-    return tree, (match.group(1) if (match := re.search(r'AXWindow\s+"([^"]+)"', tree))
-                  else (out.get("structuredContent") or {}).get("window_title", ""))
+    if match := re.search(r'AXWindow\s+"([^"]+)"', tree):
+        return tree, match.group(1)
+    structured = out.get("structuredContent")
+    title = structured.get("window_title") if isinstance(structured, dict) else None
+    return tree, title if isinstance(title, str) else ""
 
-def _gws_is_empty(out: Dict[str, Any]) -> bool:
-    """True when a get_window_state result carries neither a screenshot nor a parseable tree. Modern
-    drivers put the payload in structuredContent with no markdown tree — that is NOT empty."""
-    sc_ = out.get("structuredContent") or {}
+def _gws_is_empty(out: Dict[str, Any], *, include_screenshot: bool = True) -> bool:
+    """Missing payload, not a valid zero-element snapshot requested without pixels."""
+    structured = out.get("structuredContent")
+    sc_ = structured if isinstance(structured, dict) else {}
+    if (not include_screenshot and sc_.get("elements") == []
+            and type(sc_.get("element_count")) is int and sc_["element_count"] == 0
+            and isinstance(sc_.get("window_title"), str)):
+        return False
     return not (out.get("images") or sc_.get("elements") or sc_.get("screenshot_png_b64")
                 or _tree_and_title(out)[0].strip())
 
@@ -280,7 +287,8 @@ class _CaptureMixin:
         # A flaky bridge can return a degenerate result (no screenshot AND no parseable tree) WITHOUT raising
         # — a silent 0x0 to the model. Distinct from the EAGAIN path handled in call_tool: here MCP "succeeded".
         gws_out = self._fetch_or_refetch(
-            "get_window_state", args, 30.0, "get_window_state", _gws_is_empty,
+            "get_window_state", args, 30.0, "get_window_state",
+            lambda out: _gws_is_empty(out, include_screenshot=include_screenshot),
             "cua-driver get_window_state returned an empty result over MCP (pid=%s window_id=%s); re-fetching via CLI "
             "transport", self._active_pid, self._active_window_id)
         tree, window_title = _tree_and_title(gws_out)
