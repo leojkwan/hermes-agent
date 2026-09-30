@@ -916,22 +916,31 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
 
+    agent = None
+    resources = contextlib.ExitStack()
+
     def body():
+        nonlocal agent
         from run_agent import AIAgent
         kwargs = _background_agent_kwargs(session["agent"], task_id)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
-            agent = AIAgent(**{**kwargs, "session_db": session_db})
-            try:
-                result = agent.run_conversation(user_message=text, task_id=task_id)
-            finally:
-                # AIAgent.close() is the owner boundary (memory shutdown, tool
-                # subprocesses, httpx clients); an unclosed side agent leaks
-                # all of them for the gateway's life (#50197).
-                with contextlib.suppress(Exception):
-                    agent.close()
+        # Keep the side store alive through close, even if its parent closes first.
+        session_db = resources.enter_context(_side_agent_session_db(kwargs.get("session_db")))
+        agent = AIAgent(**{**kwargs, "session_db": session_db})
+        result = agent.run_conversation(user_message=text, task_id=task_id)
         return _final_response_text(result)
 
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
+    def cleanup():
+        try:
+            # Emit the ready answer before memory shutdown, but retain #50197's
+            # close boundary under the same profile, secrets and terminal policy.
+            with _session_profile_runtime_scope(session):
+                if agent is not None:
+                    with contextlib.suppress(Exception):
+                        agent.close()
+        finally:
+            resources.close()
+
+    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body, cleanup=cleanup)
 
 
 @method("prompt.btw")
@@ -1180,9 +1189,11 @@ def _spawn_side_agent(
         except Exception as e:
             _emit(event, parent, {"task_id": task_id, **extra, "text": f"error: {e}"})
         finally:
-            if cleanup is not None:
-                cleanup()
-            _clear_session_context(session_tokens)
+            try:
+                if cleanup is not None:
+                    cleanup()
+            finally:
+                _clear_session_context(session_tokens)
 
     if _start_session_work(run, name=f"side-agent-{task_id}") is None:
         return _err(rid, 5035, "backend is retiring; reconnect to continue")
