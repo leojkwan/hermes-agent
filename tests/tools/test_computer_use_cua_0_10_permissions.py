@@ -158,7 +158,9 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
         # Wayland dev box) can't add a `--help` capability-probe subprocess.run
         # call that the fixed two-entry side_effect below doesn't budget for.
         cua_backend, "_cua_no_overlay", return_value=False,
-    ), patch.object(cua_backend.subprocess, "Popen", return_value=process) as popen, patch.object(
+    ), patch.object(daemon, "_start_owner_watch"), patch.object(
+        cua_backend.subprocess, "Popen", return_value=process
+    ) as popen, patch.object(
         cua_backend.subprocess, "run", side_effect=[status, stopped]
     ):
         daemon.start()

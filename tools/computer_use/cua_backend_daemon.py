@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ logger = logging.getLogger("tools.computer_use.cua_backend")
 _CUA_DRIVER_BUNDLE_ID = CUA_DRIVER_BUNDLE_ID
 _CUA_DRIVER_TEAM_IDS = ("4YEC26S9KF", "YCK386LBJ7")
 _QUIET_ERRORS = (OSError, subprocess.SubprocessError)
+_OWNER_WATCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cua_owner_watch.py")
 
 def _cb():
     """Facade module (config/policy helpers), looked up lazily to avoid the import cycle."""
@@ -123,6 +125,8 @@ class _EmbeddedCuaDaemon:
         self.permission_mode, self._driver_cmd, self._command = permission_mode, driver_cmd, driver_cmd
         self._mcp_args: List[str] = list(_driver._CUA_DRIVER_ARGS)
         self._process: Any = None
+        self._watcher: Any = None
+        self._watch_fd: Optional[int] = None
         self._owns_runtime = self._running = False
         self._stderr_tail: deque[str] = deque(maxlen=20)
         token = uuid.uuid4().hex[:12]
@@ -168,23 +172,62 @@ class _EmbeddedCuaDaemon:
         self._command, self._mcp_args = _driver._resolve_mcp_invocation(driver_cmd)
         env = self._sanitized_env()
         command = _embedded_daemon_spawn_command(self._command, self._serve_args(), platform=sys.platform)
-        self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                                         env=env)
-        self._owns_runtime = True
-        threading.Thread(target=self._drain_stderr, args=(self._process,), name="hermes-cua-daemon-stderr", daemon=True).start()
-        deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            return_code = self._process.poll()
-            # `open` exits 0 once LaunchServices took the request: on macOS only a non-zero exit means the daemon died.
-            if return_code is not None and (sys.platform != "darwin" or return_code != 0):
-                self._startup_failure("embedded cua-driver exited during startup", "no diagnostic output")
-            if self._socket_ready(env):
-                self._running = True
-                return
-            time.sleep(0.1)
-        self.stop()
-        self._startup_failure("embedded cua-driver startup timed out", "daemon did not become ready")
+        # Arm the guard first: LaunchServices may detach the daemon immediately.
+        self._start_owner_watch(env)
+        try:
+            self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                             env=env)
+            self._owns_runtime = True
+            threading.Thread(target=self._drain_stderr, args=(self._process,), name="hermes-cua-daemon-stderr", daemon=True).start()
+            deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                return_code = self._process.poll()
+                # `open` exits 0 once LaunchServices took the request: on macOS only a non-zero exit means the daemon died.
+                if return_code is not None and (sys.platform != "darwin" or return_code != 0):
+                    self._startup_failure("embedded cua-driver exited during startup", "no diagnostic output")
+                if self._socket_ready(env):
+                    self._running = True
+                    return
+                time.sleep(0.1)
+            self._startup_failure("embedded cua-driver startup timed out", "daemon did not become ready")
+        except BaseException:
+            self.stop()
+            raise
+
+    def _start_owner_watch(self, env: Dict[str, str]) -> None:
+        """A detached reader survives owner group death; pipe EOF stops only this socket.
+
+        Adapted from Leo Kwan's e41c50e042773e76f514e0869134de7036824c01.
+        Refuse launch unless the guard acknowledges startup. POSIX only.
+        """
+        if sys.platform == "win32":
+            return
+        read_fd, self._watch_fd = os.pipe()
+        try:
+            self._watcher = subprocess.Popen([sys.executable, "-I", _OWNER_WATCH_SCRIPT, self._command, self.socket_path],
+                                             stdin=read_fd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                             env=env, start_new_session=True)
+            ready = self._watcher.stdout
+            try:
+                if not select.select([ready], [], [], 2.0)[0] or os.read(ready.fileno(), 1) != b"r":
+                    raise RuntimeError("could not start the cua-driver owner watch; refusing private daemon launch")
+            finally:
+                ready.close()
+        except BaseException:
+            self._end_owner_watch()
+            raise
+        finally:
+            os.close(read_fd)
+
+    def _end_owner_watch(self) -> None:
+        fd, self._watch_fd, watcher, self._watcher = self._watch_fd, None, self._watcher, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.write(fd, b"x")
+            os.close(fd)
+        if watcher is not None:
+            _wait_or_kill(watcher)
 
     def _startup_failure(self, what: str, fallback: str) -> None:
         raise RuntimeError(f"{what}: {'; '.join(self._stderr_tail) or fallback}")
@@ -202,11 +245,14 @@ class _EmbeddedCuaDaemon:
     def stop(self) -> None:
         process, self._process = self._process, None
         owns_runtime, self._owns_runtime, self._running = self._owns_runtime, False, False
-        if owns_runtime:
-            _cb()._run_quiet([self._command, "stop", "--socket", self.socket_path], timeout=3.0, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, env=self._sanitized_env(), swallow=_QUIET_ERRORS)
-        if process is not None:
-            _wait_or_kill(process)
-        if sys.platform != "win32" and os.path.exists(self.socket_path):
-            with contextlib.suppress(OSError):
-                os.remove(self.socket_path)
+        try:
+            if owns_runtime:
+                _cb()._run_quiet([self._command, "stop", "--socket", self.socket_path], timeout=3.0, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, env=self._sanitized_env(), swallow=_QUIET_ERRORS)
+            if process is not None:
+                _wait_or_kill(process)
+            if sys.platform != "win32" and os.path.exists(self.socket_path):
+                with contextlib.suppress(OSError):
+                    os.remove(self.socket_path)
+        finally:
+            self._end_owner_watch()

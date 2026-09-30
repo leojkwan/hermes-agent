@@ -248,7 +248,9 @@ class TestEmbeddedDaemonOverlayFlag:
             cua_backend.subprocess, "Popen", return_value=process,
         ) as popen, patch.object(
             cua_backend.subprocess, "run", return_value=status,
-        ), patch.object(cua_backend_daemon.threading, "Thread"):
+        ), patch.object(cua_backend_daemon.threading, "Thread"), patch.object(
+            daemon, "_start_owner_watch"
+        ):
             daemon.start()
 
         command = popen.call_args.args[0]
