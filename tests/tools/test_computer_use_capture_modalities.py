@@ -40,7 +40,7 @@ class _WireDriver:
         return SimpleNamespace(tools=[SimpleNamespace(name=name, inputSchema=schema)
                                      for name, schema in schemas.items()])
 
-    def execute(self, name, args, transport):
+    def execute(self, name, args, transport) -> dict:
         self.calls.append((name, dict(args), transport))
         if name == "list_windows":
             return {"windows": [dict(TARGET)]}
@@ -188,3 +188,52 @@ def test_cli_respects_explicit_screenshot_omission(monkeypatch, tmp_path):
     assert out["structuredContent"]["elements"][0]["element_token"] == "snapshot-1"
     assert "screenshot_out_file" not in driver.calls[-1][1]
     assert "screenshot_out_file" not in args
+
+
+def test_empty_ax_snapshot_is_not_repeated_or_reuses_old_tokens(monkeypatch, tmp_path):
+    driver = _WireDriver({"properties": {key: {} for key in CONTROLS}})
+    backend = _backend(monkeypatch, tmp_path, driver)
+    backend.capture(mode="som", app="Fixture")
+    assert backend._snapshot_tokens
+    execute = driver.execute
+
+    def empty_snapshot(name, args, transport):
+        result = execute(name, args, transport)
+        if name == "get_window_state":
+            result.pop("tree_markdown", None)
+            result.update(elements=[], element_count=0)
+        return result
+
+    monkeypatch.setattr(driver, "execute", empty_snapshot)
+    before = len(driver.calls)
+    cap = backend.capture(mode="ax", app="Fixture")
+    requests = [call for call in driver.calls[before:] if call[0] == "get_window_state"]
+    assert len(requests) == 1
+    assert requests[0][2] == "mcp"
+    assert cap.png_b64 is None and cap.elements == []
+    assert cap.window_title == TARGET["title"]
+    assert backend._snapshot_tokens == {}
+
+
+@pytest.mark.parametrize("metadata", [
+    {"window_title": {"unexpected": "object"}},
+    {"window_title": 7},
+    [1],
+])
+def test_vision_ignores_malformed_optional_title_with_usable_pixels(monkeypatch, tmp_path, metadata):
+    driver = _WireDriver({"properties": {key: {} for key in CONTROLS}})
+    backend = _backend(monkeypatch, tmp_path, driver)
+    call_tool = driver.call_tool
+
+    async def malformed_title(name, args):
+        result = await call_tool(name, args)
+        if name == "get_window_state":
+            result.structuredContent = metadata
+        return result
+
+    monkeypatch.setattr(driver, "call_tool", malformed_title)
+    cap = backend.capture(mode="vision", app="Fixture")
+    assert cap.png_b64 == PIXELS and (cap.width, cap.height) == (8, 8)
+    assert isinstance(cap.window_title, str) and cap.window_title == TARGET["title"]
+    assert cap.elements == [] and backend._snapshot_tokens == {}
+    assert backend._last_target == {"pid": TARGET["pid"], "window_id": TARGET["window_id"]}
