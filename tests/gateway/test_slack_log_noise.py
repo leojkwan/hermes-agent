@@ -206,6 +206,77 @@ class TestInboundLogPrivacy:
         assert "bot_id=B_OTHER" in entry_lines[0]
         assert secret not in caplog.text
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_type", ["channel", "mpim"])
+    async def test_channel_filtered_mention_warns_without_private_content(
+        self, caplog, channel_type
+    ):
+        adapter = self._make_adapter()
+        adapter.config.token = "synthetic-secret-token"
+        adapter.config.extra["allowed_channels"] = ["C_ALLOWED"]
+        adapter._team_bot_user_ids["T_FAKE"] = "U_BOT"
+        private_text = "private message body"
+        private_attachment = "private attachment preview"
+        event = {
+            "type": "message", "user": "U_USER", "channel": "C_FILTERED",
+            "channel_type": channel_type, "ts": "12345.6789", "thread_ts": "12345.0000",
+            "text": f"<@U_BOT> {private_text}",
+            "attachments": [{"text": private_attachment, "is_msg_unfurl": True}],
+            "files": [{"id": "F_PRIVATE", "mimetype": "image/png", "title": "private file title"}],
+        }
+        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
+            await adapter._handle_slack_message(event, {"team_id": "T_FAKE"})
+
+        adapter.handle_message.assert_not_awaited()
+        warnings = [
+            r for r in caplog.records
+            if r.name == ADAPTER_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert len(warnings) == 1, "an explicitly addressed channel-filtered drop must warn"
+        assert warnings[0].levelno == logging.WARNING
+        assert "channel=C_FILTERED" in warnings[0].getMessage()
+        assert "team=T_FAKE" in warnings[0].getMessage()
+        assert "thread_ts=12345.0000" in warnings[0].getMessage()
+        assert all(
+            value not in caplog.text
+            for value in (private_text, private_attachment, "private file title", adapter.config.token)
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("allowed,mentioned", [(True, True), (False, False)])
+    async def test_channel_filter_preserves_dispatch_and_unaddressed_log_level(
+        self, caplog, allowed, mentioned
+    ):
+        adapter = self._make_adapter()
+        adapter.config.extra["allowed_channels"] = ["C_ALLOWED"]
+        adapter._team_bot_user_ids["T_FAKE"] = "U_BOT"
+        adapter._hydrate_thread_context = AsyncMock(return_value=(None, [], []))
+        adapter._collect_inbound_media = AsyncMock(return_value=([], [], [], "hello"))
+        adapter._resolve_user_name = AsyncMock(return_value="Sender")
+        adapter._resolve_channel_name = AsyncMock(return_value="Channel")
+        event = {
+            "type": "message", "user": "U_USER",
+            "channel": "C_ALLOWED" if allowed else "C_FILTERED", "channel_type": "channel",
+            "ts": "12345.6789", "text": "<@U_BOT> hello" if mentioned else "hello",
+        }
+        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
+            await adapter._handle_slack_message(event, {"team_id": "T_FAKE"})
+
+        assert not [
+            r for r in caplog.records
+            if r.name == ADAPTER_LOGGER and r.levelno >= logging.WARNING
+        ]
+        if allowed:
+            adapter.handle_message.assert_awaited_once()
+            source = adapter.handle_message.await_args.args[0].source
+            assert (source.chat_id, source.scope_id) == ("C_ALLOWED", "T_FAKE")
+        else:
+            adapter.handle_message.assert_not_awaited()
+            assert any(
+                r.levelno == logging.DEBUG and "non-allowed channel" in r.getMessage()
+                for r in caplog.records
+            )
+
 
 class TestClarifyLogPrivacy:
     """Clarify choice text is user content: index at INFO, text DEBUG-only."""
