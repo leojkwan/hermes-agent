@@ -80,7 +80,8 @@ _PROMPT_HEADERS = {
     ),
     "hybrid": (
         "# Honcho Memory\nActive (hybrid mode). Relevant context is auto-injected AND memory tools "
-        f"are available. {_TOOL_GUIDE}"
+        "are available. Answer from the injected memory context first; call a memory tool only when "
+        f"it lacks what the question needs. {_TOOL_GUIDE}"
     ),
 }
 

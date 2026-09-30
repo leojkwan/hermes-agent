@@ -18,6 +18,105 @@ from plugins.memory.honcho.session import (
 from plugins.memory.honcho import HonchoMemoryProvider
 
 
+@pytest.mark.parametrize("current_query_only", [False, True])
+def test_prefetch_keeps_relevant_middle_fact_in_final_spill_payload(
+    current_query_only, tmp_path, monkeypatch,
+):
+    """Both peer-context paths must bound recall before a head/tail preview loses relevant facts."""
+    import httpx
+    from honcho import Honcho
+    from honcho.peer import Peer
+    from tools.hook_output_spill import spill_if_oversized
+
+    workspace = "fixture-recall-workspace"
+    user_id, assistant_id = "fixture-user", "fixture-assistant"
+    question = "What kind of creative work does this user want time for?"
+    fact = "The user wants free evenings to edit videos and make a travel channel."
+    conclusions = {
+        target: [f"{target} synthetic conclusion {index}: ".ljust(200, "x") for index in range(100)]
+        for target in (user_id, assistant_id)
+    }
+    conclusions[user_id][7] = fact.ljust(200, "x")
+    context_requests, unexpected_requests = [], []
+
+    def handle(request):
+        if request.method == "POST" and request.url.path == "/v3/workspaces":
+            assert json.loads(request.content) == {"id": workspace}
+            return httpx.Response(200, json={"id": workspace})
+        if (
+            request.method == "GET"
+            and request.url.path == f"/v3/workspaces/{workspace}/peers/{assistant_id}/context"
+        ):
+            params = dict(request.url.params)
+            target = params["target"]
+            assert target in conclusions
+            assert params.get("search_query") == (question if target == user_id else None)
+            context_requests.append(params)
+            limit = int(params.get("max_conclusions", "100"))
+            return httpx.Response(200, json={
+                "peer_id": assistant_id,
+                "target_id": target,
+                "representation": "\n".join(conclusions[target][:limit]),
+                "peer_card": [f"Synthetic card for {target}"],
+            })
+        unexpected_requests.append((request.method, str(request.url)))
+        raise AssertionError(f"Unexpected Honcho request: {request.method} {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        client = Honcho(
+            api_key="fixture-key", base_url="https://honcho.invalid", workspace_id=workspace,
+            max_retries=0, http_client=http_client,
+        )
+        monkeypatch.setattr("plugins.memory.honcho.session.get_honcho_client", lambda config: client)
+        manager = HonchoSessionManager(honcho=client)
+        session = HonchoSession(
+            key="fixture:recall", user_peer_id=user_id, assistant_peer_id=assistant_id,
+            honcho_session_id="fixture-session",
+        )
+        manager._cache[session.key] = session
+        manager._peers_cache.update({target: Peer(target, client) for target in conclusions})
+        provider = HonchoMemoryProvider()
+        observer = manager._peers_cache[assistant_id]
+        uncapped_user = observer.context(target=user_id, search_query=question)
+        uncapped_ai = observer.context(target=assistant_id)
+        uncapped = provider._format_first_turn_context({
+            "representation": uncapped_user.representation,
+            "card": "\n".join(uncapped_user.peer_card),
+            "ai_representation": uncapped_ai.representation,
+            "ai_card": "\n".join(uncapped_ai.peer_card),
+        })
+        spill_config = {
+            "enabled": True, "max_chars": 10_000, "preview_head": 500, "preview_tail": 500,
+            "directory": str(tmp_path / "uncapped"),
+        }
+        uncapped_preview = spill_if_oversized(
+            uncapped, session_id=session.key, source="honcho", config=spill_config,
+        )
+        assert len(uncapped) > 10_000 and fact in uncapped
+        assert fact not in uncapped_preview
+        uncapped_files = list((tmp_path / "uncapped").rglob("*.txt"))
+        assert len(uncapped_files) == 1 and fact in uncapped_files[0].read_text()
+
+        context_requests.clear()
+        context = manager.get_prefetch_context(
+            session.key, question, current_query_only=current_query_only,
+        )
+        formatted = provider._format_first_turn_context(context)
+        payload = spill_if_oversized(
+            formatted, session_id=session.key, source="honcho",
+            config={**spill_config, "directory": str(tmp_path / "bounded")},
+        )
+
+        assert not unexpected_requests
+        assert fact in payload
+        assert payload == formatted and len(payload) <= 10_000
+        assert not (tmp_path / "bounded").exists()
+        assert context_requests == [
+            {"target": user_id, "search_query": question, "max_conclusions": "15"},
+            {"target": assistant_id, "max_conclusions": "15"},
+        ]
+
+
 # ---------------------------------------------------------------------------
 # HonchoSessionManager._sanitize_id
 # ---------------------------------------------------------------------------

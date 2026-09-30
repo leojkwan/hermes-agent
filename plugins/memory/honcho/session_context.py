@@ -10,6 +10,8 @@ from plugins.memory.honcho.session_auth import HonchoAuthError
 
 logger = logging.getLogger("plugins.memory.honcho.session")
 
+# Bound each peer's conclusion batch; total context can still exceed the spill cap.
+_CONTEXT_MAX_CONCLUSIONS = 15
 _FAILED = object()  # sentinel: a guarded call raised (distinct from a legitimately empty/None result)
 
 # Reasoning-channel markers a summarizer model can leave inside a persisted session summary.
@@ -93,6 +95,7 @@ class SessionContextMixin:
         empty, fall back to the dedicated representation / card getters. Raises HonchoAuthError when
         auth is dead or a 401 survives the forced refresh; the fallback chain would just repeat it."""
         context_kwargs: dict[str, Any] = self._target_kwargs(target)
+        context_kwargs["max_conclusions"] = _CONTEXT_MAX_CONCLUSIONS
         if search_query is not None:
             context_kwargs["search_query"] = search_query
         peer = lambda: self._get_or_create_peer(peer_id)  # noqa: E731
@@ -148,6 +151,7 @@ class SessionContextMixin:
                 # or failed current-query lookup must not silently become generic recall.
                 ctx = self._authed_call("peer context fetch", lambda: self._get_or_create_peer(observer_peer_id).context(
                     search_query=user_message, target=target_peer_id or session.user_peer_id,
+                    max_conclusions=_CONTEXT_MAX_CONCLUSIONS,
                 ))
                 result["representation"] = getattr(ctx, "representation", None) or getattr(ctx, "peer_representation", None) or ""
                 result["card"] = "\n".join(self._normalize_card(getattr(ctx, "peer_card", None)))
