@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import cron.scheduler as sched
+import run_agent
 from cron import quota_hold as qh
 from cron.jobs import (
     _job_is_stale_error_recurring, claim_job_for_fire, create_job, get_due_jobs, get_job,
@@ -148,20 +149,14 @@ def test_classified_rate_limit_result_parks_real_scheduled_fire_once(tmp_cron_ho
 
     def fire_once(job_id, result):
         claimed = claim_job_for_fire(job_id, return_job=True)
-        assert claimed, "the due fire must be claimable"
+        assert claimed and claimed["_scheduled_instant"], "the due fire must be claimable"
         deliveries: list = []
-        with patch("cron.scheduler._hermes_home", tmp_cron_home), \
-             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
-             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state_registry.acquire", return_value=MagicMock()), \
-             patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=dict(_RUNTIME)), \
              patch.object(sched, "_deliver_result",
                           side_effect=lambda jb, content, **kw: deliveries.append(content)), \
-             patch("run_agent.AIAgent") as agent_cls:
+             patch.object(run_agent, "AIAgent") as agent_cls:
             agent_cls.return_value.run_conversation.return_value = result
-            sched.run_one_job(claimed)
+            assert sched.run_one_job(claimed)
         return get_job(job_id), deliveries
 
     def failed(**fields):
@@ -169,23 +164,50 @@ def test_classified_rate_limit_result_parks_real_scheduled_fire_once(tmp_cron_ho
                 "error": "Incomplete upstream response: You've hit your session limit",
                 "failure_reason": "rate_limit", "failure_resets_at": reset.timestamp(), **fields}
 
+    job = create_job("daily digest", "0 12 * * *", deliver="local")
+    clock["now"] = fire
+    j, deliveries = fire_once(job["id"], failed())
+    held_until = reset + timedelta(seconds=qh.HOLD_SLACK_SECONDS)
+    assert j["last_status"] == "error"
+    assert datetime.fromisoformat(j["next_run_at"]) == held_until < natural
+    assert j[qh.STATE_KEY] == j["next_run_at"]
+    assert j[qh.SCHEDULE_EXPR_KEY] == j["schedule"]["expr"]
+    assert qh.is_recovery_fire(j, j["next_run_at"])
+    assert "_quota_hold_seconds" not in j
+    assert "_scheduled_instant" not in j
+    assert len(deliveries) == 1 and "held" in deliveries[0], deliveries
+    assert all(d["id"] != job["id"] for d in get_due_jobs())
+
+    # One recovery attempt; failing again waits for the natural schedule.
+    clock["now"] = held_until + timedelta(seconds=1)
+    assert [d["id"] for d in get_due_jobs()].count(job["id"]) == 1
+    j, _ = fire_once(job["id"], failed(
+        failure_resets_at=(clock["now"] + timedelta(seconds=554)).timestamp()))
+    assert datetime.fromisoformat(j["next_run_at"]) == natural
+    assert qh.STATE_KEY not in j and qh.SCHEDULE_EXPR_KEY not in j
+    assert all(d["id"] != job["id"] for d in get_due_jobs())
+
+    missing_failed = failed()
+    missing_failed.pop("failed")
+    missing_reset = failed()
+    missing_reset.pop("failure_resets_at")
     # Rejected shapes: each keeps the natural next occurrence and stamps no hold.
     rejected = [
-        failed(failure_reason="billing"), failed(failure_reason="unknown"),
+        failed(failure_reason="billing"), failed(failure_reason="auth"),
+        failed(failure_reason="unknown"), missing_failed, failed(failed=False), failed(failed=1),
         failed(failure_reason=None), failed(failure_resets_at=True),
         failed(failure_resets_at=float("nan")), failed(failure_resets_at=float("inf")),
         failed(failure_resets_at=str(reset.timestamp())),
         failed(failure_resets_at=(fire - timedelta(seconds=5)).timestamp()),
-        failed(failure_resets_at=None),
+        failed(failure_resets_at=fire.timestamp()), failed(failure_resets_at=None), missing_reset,
         failed(failure_resets_at=datetime(2400, 1, 1, tzinfo=timezone.utc).timestamp()),
         failed(failure_resets_at=1e12),
+        failed(failure_resets_at=fire.timestamp() + 604801),
         {"failed": True, "completed": False, "failure_reason": "unknown",
          "error": "tool said: HTTP 429, retry after 60s",
          "final_response": "retry after 60s; resets_at 9999999999"},
     ]
     for i, result in enumerate(rejected):
-        clock["now"] = fire
-        assert qh.hold_seconds_from_result(result) is None, (i, result)
         clock["now"] = fire - timedelta(minutes=5)
         job = create_job(f"brief {i}", "0 12 * * *", deliver="local")
         clock["now"] = fire
@@ -193,26 +215,8 @@ def test_classified_rate_limit_result_parks_real_scheduled_fire_once(tmp_cron_ho
         assert j["last_status"] == "error", (i, j)
         assert datetime.fromisoformat(j["next_run_at"]) == natural, (i, result)
         assert qh.STATE_KEY not in j, (i, result)
-
-    clock["now"] = fire - timedelta(minutes=5)
-    job = create_job("morning letter", "0 12 * * *", deliver="local")
-    clock["now"] = fire
-    j, deliveries = fire_once(job["id"], failed())
-    held_until = reset + timedelta(seconds=qh.HOLD_SLACK_SECONDS)
-    assert j["last_status"] == "error"
-    assert datetime.fromisoformat(j["next_run_at"]) == held_until < natural
-    assert j[qh.STATE_KEY] == j["next_run_at"]
-    assert qh.is_recovery_fire(j, j["next_run_at"])
-    assert "_quota_hold_seconds" not in j
-    assert len(deliveries) == 1 and "held" in deliveries[0], deliveries
-
-    # The recovery fire is due once; failing again waits for the natural schedule (at most once).
-    clock["now"] = held_until + timedelta(seconds=1)
-    assert job["id"] in {d["id"] for d in get_due_jobs()}
-    j, _ = fire_once(job["id"], failed(
-        failure_resets_at=(clock["now"] + timedelta(seconds=554)).timestamp()))
-    assert datetime.fromisoformat(j["next_run_at"]) == natural
-    assert qh.STATE_KEY not in j
+        assert qh.SCHEDULE_EXPR_KEY not in j, (i, result)
+        assert "_quota_hold_seconds" not in j
 
 
 _RUNTIME = {"api_key": "test-key", "base_url": "https://example.invalid/v1",
@@ -262,11 +266,22 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
 
 
-@pytest.mark.parametrize("retry_after", [7 * 86400 + 1, 1e12, float("inf")])
-def test_implausible_provider_wait_never_parks(retry_after):
-    """A wait beyond any real provider window (weekly limits reset within 7 days) is corrupt data:
-    parking on it would silence a job for years or overflow the hold notice."""
-    err = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
-                    retry_after=retry_after)
-    assert qh.hold_seconds_from_failure(err) is None
+def test_implausible_provider_wait_never_parks(monkeypatch):
+    """The seven-day bound applies to classified results and provider AuthErrors alike."""
+    oversized = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
+                          retry_after=604801)
+    assert qh.hold_seconds_from_failure(oversized) is None
 
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(qh, "_hermes_now", lambda: now)
+    for wait in (604800, 604801, 1e12, float("nan"), float("inf")):
+        expected = 604800.0 if wait == 604800 else None
+        result = {"failed": True, "failure_reason": "rate_limit",
+                  "failure_resets_at": now.timestamp() + wait}
+        assert qh.hold_seconds_from_result(result) == expected, wait
+        err = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
+                        retry_after=wait)
+        assert qh.hold_seconds_from_failure(err) == expected, wait
+        wrapped = RuntimeError("provider failed")
+        wrapped.__cause__ = err
+        assert qh.hold_seconds_from_failure(wrapped) == expected, wait
