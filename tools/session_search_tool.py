@@ -42,7 +42,7 @@ _READ_MAX_CONTENT = 2000
 # returns, so interactive matches buried under cron hits survive the demotion pass.
 _DISCOVER_SCAN_LIMIT = 300
 # exclude_session_ids: ids already inspected this task; capped so a runaway list can't fan out lineage walks.
-_EXCLUDE_SESSION_IDS_CAP = 20
+_EXCLUDE_SESSION_IDS_CAP = 50
 # Relative time bounds: "7d" / "24h" / "2w" = now minus N hours/days/weeks.
 _RELATIVE_BOUND_RE = re.compile(r"^(\d+)\s*(h|d|w)$", re.IGNORECASE)
 _RELATIVE_UNIT_SECONDS = {"h": 3600, "d": 86400, "w": 604800}
@@ -378,7 +378,7 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
     raw_results = sorted(raw_results, key=lambda r: (r.get("source") or "") in _DEMOTED_SESSION_SOURCES)
     # See #19434.
     if not raw_results and not title_result:
-        return _discover_payload(db, query, detail, [], message=(
+        return _discover_payload(db, query, detail, [], has_more=False, message=(
             "No matching sessions found. FTS5 ANDs all terms by default — "
             "broaden with OR (`alpha OR beta`), exact-match with quoted "
             "phrases, exclude with NOT, or prefix-match with `deploy*`."))
@@ -386,14 +386,14 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
     results = [title_result] if title_result else []
     if title_result and (title_lineage := title_result.pop("_lineage_root", None)):
         seen_sessions[title_lineage] = {"_title_only": True}
-    # Dedupe by lineage (lineage_root -> first surviving FTS row) up to `limit`. The raw
-    # owning session_id stays on the row — only it pairs validly with the FTS match id.
+    has_more = None if len(raw_results) >= _DISCOVER_SCAN_LIMIT else False
+    # Select up to `limit` lineages, then look for one more eligible lineage without
+    # hydrating it. A full scan batch cannot prove exhaustion. The raw owning
+    # session_id stays on the row — only it pairs validly with the FTS match id.
     # Current-lineage hits are skipped UNLESS the transcript left live context
     # (compression-ended, /new-reset predecessor, or an in-place compacted row on the
     # SAME session); a live delegation child (end_reason=None) stays excluded.
     for r in raw_results:
-        if len(seen_sessions) >= limit:
-            break
         raw_sid, resolved_sid = r["session_id"], _resolve_lineage(db, r["session_id"])
         if raw_sid in excluded_roots or resolved_sid in excluded_roots:
             continue
@@ -413,6 +413,9 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
             continue
         if current_session_id and raw_sid == current_session_id and not is_compacted_hit:
             continue
+        if resolved_sid not in seen_sessions and len(seen_sessions) >= limit:
+            has_more = True
+            break
         seen_sessions.setdefault(resolved_sid, {**r, "_lineage_root": resolved_sid})
     for lineage_root, match_info in seen_sessions.items():
         if match_info.get("_title_only"):
@@ -421,9 +424,11 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
         entry = _hydrate_hit(db, lineage_root, match_info, "full" if detail == "full" or not results else "compact")
         if entry is not None:
             results.append(entry)
+        elif has_more is False:
+            has_more = None
     for entry in results:
         entry["link"] = _session_link(entry["session_id"], link_profile)
-    return _discover_payload(db, query, detail, results, sessions_searched=len(seen_sessions), link_hint=(
+    return _discover_payload(db, query, detail, results, sessions_searched=len(seen_sessions), has_more=has_more, link_hint=(
         "When referring the user to a session, write its `link` value "
         "verbatim inline mid-sentence (it renders as a titled link) — never "
         "as markdown, in backticks, on its own line, or next to the "
@@ -661,7 +666,11 @@ SESSION_SEARCH_SCHEMA = {
         "Searches conversation history ONLY — when the user gave a direct "
         "source (URL, file, contact, live system), inspect that first; never "
         "conclude 'not found' from history alone. Use for questions about past "
-        "conversations: 'what did we do about X', 'where did we leave Y'. When "
+        "conversations: 'what did we do about X', 'where did we leave Y'. If none "
+        "fits, repeat the same query with already-inspected session ids excluded. "
+        "has_more describes this bounded indexed search; null means a scan ceiling "
+        "or failed read leaves further results unknown. "
+        "Read distinguishing facts and the unfinished step before selecting. When "
         "referring the user to a session, write its `link` value verbatim "
         "inline (it renders as a titled link)."
     ),
@@ -730,15 +739,14 @@ SESSION_SEARCH_SCHEMA = {
                 "description": (
                     "Discovery shape only. Session ids already inspected this task. "
                     "Those sessions and their lineage are omitted so a later query "
-                    "explores instead of repeating the same hit. Cap 20."
+                    "explores instead of repeating the same hit. Cap 50."
                 ),
             },
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Scroll shape. Session to read inside. Use the session_id returned "
-                    "from a prior discovery call. Must be paired with "
-                    "around_message_id."
+                    "Session to read. Use the session_id returned from a prior discovery call. "
+                    "Pass alone to read the session, or pair with around_message_id to scroll."
                 ),
             },
             "around_message_id": {

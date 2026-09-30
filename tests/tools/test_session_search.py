@@ -29,6 +29,104 @@ def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
 
 
+def test_discovery_explores_fifty_sessions_without_repeats_and_reports_bounded_frontier(db, monkeypatch):
+    """Continuation can inspect fifty candidates without mistaking the scan cutoff for exhaustion."""
+    from tools.registry import registry
+
+    def search(**args):
+        result = json.loads(registry.dispatch("session_search", args, db=db))
+        assert result["success"] is True
+        return result
+
+    hydrated, failed_views = [], set()
+    anchored_view = db.get_anchored_view
+
+    def record_view(session_id, *args, **kwargs):
+        hydrated.append(session_id)
+        if session_id in failed_views:
+            raise RuntimeError("fixture selected view unavailable")
+        return anchored_view(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(db, "get_anchored_view", record_view)
+    candidates = {f"candidate-{index:02d}" for index in range(50)}
+    for index in range(50):
+        sid = f"candidate-{index:02d}"
+        db.create_session(sid, source="cli")
+        db.append_message(
+            sid, role="user", content=f"explorationfixture distinguishing fact {index}",
+            timestamp=1000 + index,
+        )
+        db.append_message(
+            sid, role="assistant", content=f"Unfinished step: render fixture clip {index}",
+            timestamp=1000.5 + index,
+        )
+
+    default_limit = search(query="explorationfixture", sort="newest")
+    assert [entry["session_id"] for entry in default_limit["results"]] == [
+        "candidate-49", "candidate-48", "candidate-47",
+    ]
+    assert default_limit.get("has_more") is True and len(hydrated) == 3
+
+    inspected = []
+    for page in range(5):
+        hydrated.clear()
+        result = search(
+            query="explorationfixture", limit=10, sort="newest", exclude_session_ids=inspected,
+        )
+        ids = [entry["session_id"] for entry in result["results"]]
+        assert len(ids) == 10
+        assert not set(ids).intersection(inspected)
+        assert len(hydrated) == 10 and set(hydrated) == set(ids)
+        assert ids == [f"candidate-{index:02d}" for index in range(49 - page * 10, 39 - page * 10, -1)]
+        assert result.get("has_more") is (page < 4)
+        inspected.extend(ids)
+
+    assert set(inspected) == candidates and len(inspected) == 50
+    failed_views.add("candidate-09")
+    hydrated.clear()
+    failed_read = search(
+        query="explorationfixture", limit=10, sort="newest", exclude_session_ids=inspected[:40],
+    )
+    assert failed_read["count"] == 9
+    assert len(hydrated) == 10 and set(hydrated) == set(inspected[40:])
+    assert failed_read.get("has_more") is None
+    failed_views.clear()
+
+    exhausted = search(query="explorationfixture", limit=10, exclude_session_ids=inspected)
+    assert exhausted["results"] == [] and exhausted.get("has_more") is False
+    missing = search(query="absentfixtureterm")
+    assert missing["results"] == [] and missing.get("has_more") is False
+
+    read = search(session_id="candidate-07")
+    assert read["mode"] == "read"
+    assert [message["content"] for message in read["messages"]] == [
+        "explorationfixture distinguishing fact 7", "Unfinished step: render fixture clip 7",
+    ]
+    anchor = read["messages"][0]["id"]
+    scroll = search(session_id="candidate-07", around_message_id=anchor, window=1)
+    assert scroll["mode"] == "scroll"
+    assert scroll["around_message_id"] == anchor
+    assert scroll["messages"][0]["anchor"] is True
+    assert [message["id"] for message in scroll["messages"]] == [
+        message["id"] for message in read["messages"]
+    ]
+
+    db.create_session("scan-unseen", source="cli")
+    db.append_message("scan-unseen", role="user", content="scanfrontier unseen candidate", timestamp=9000)
+    db.create_session("scan-duplicates", source="cli")
+    for index in range(300):
+        db.append_message(
+            "scan-duplicates", role="user", content=f"scanfrontier repeated row {index}",
+            timestamp=10_000 + index,
+        )
+    bounded = search(query="scanfrontier", limit=1, sort="newest")
+    assert [entry["session_id"] for entry in bounded["results"]] == ["scan-duplicates"]
+    assert "has_more" in bounded and bounded["has_more"] is None
+    observed = search(query="scanfrontier", limit=1, sort="oldest")
+    assert [entry["session_id"] for entry in observed["results"]] == ["scan-unseen"]
+    assert observed.get("has_more") is True
+
+
 def _seed_modpack_sessions(db):
     """Create three sessions about a modpack so FTS5 has hits to dedupe."""
     now = int(time.time())
