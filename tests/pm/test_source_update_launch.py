@@ -368,7 +368,8 @@ def test_real_bootstrap_reexecs_before_app_imports(source_launch, tmp_path, isol
     repository = Path(__file__).resolve().parents[2]
     # Copy the real bootstrap so it owns this disposable source install. The
     # other modules remain real checkout imports; only acquisition is injected.
-    shutil.copy2(repository / "hermes_bootstrap.py", root / "hermes_bootstrap.py")
+    real_bootstrap = root / "real_hermes_bootstrap.py"
+    shutil.copy2(repository / "hermes_bootstrap.py", real_bootstrap)
     (root / "launch_test_tools.py").write_text(
         "import sys\n"
         "from pathlib import Path\n"
@@ -377,6 +378,14 @@ def test_real_bootstrap_reexecs_before_app_imports(source_launch, tmp_path, isol
         "from pm import paths\n"
         f"paths.lockfile_path = lambda: Path({str(tmp_path / 'tool-lock.json')!r})\n"
         f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n",
+        encoding="utf-8",
+    )
+    # Acquisition belongs before bootstrap, including a managed-interpreter reexec.
+    (root / "hermes_bootstrap.py").write_text(
+        "import launch_test_tools\n"
+        "from pathlib import Path\n"
+        f"__file__ = {str(real_bootstrap)!r}\n"
+        "exec(compile(Path(__file__).read_bytes(), __file__, 'exec'))\n",
         encoding="utf-8",
     )
     entry = root / "launch_probe.py"

@@ -48,6 +48,63 @@ def test_bare_harness_rejects_third_party_import():
     assert result.returncode != 0 and 'ModuleNotFoundError' in result.stderr
 
 
+@pytest.mark.parametrize("mode", ["inline", "script", "module"])
+def test_relaunch_activates_dependencies_before_application_imports(tmp_path, mode):
+    root = tmp_path / "source"
+    root.mkdir()
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    (dependencies / "relaunch_dependency.py").write_text("value = 'activated'\n")
+    (root / "hermes_bootstrap.py").write_text(
+        "import sys\n"
+        "launch_argv = sys.argv.copy()\n"
+        f"sys.path.insert(1, {str(dependencies)!r})\n"
+    )
+    program = textwrap.dedent("""\
+        import relaunch_dependency
+        import json, sys
+        print(json.dumps({
+            'dependency': relaunch_dependency.value,
+            'argv': sys.argv,
+            'bootstrap_argv': sys.modules['hermes_bootstrap'].launch_argv,
+            'name': __name__,
+            'no_bytecode': sys.dont_write_bytecode,
+            'no_site': sys.flags.no_site,
+            'dev_mode': sys.flags.dev_mode,
+            'warnings': sys.warnoptions,
+        }))
+    """)
+    entry = root / "relaunch_app.py"
+    entry.write_text(program)
+    args = ["--profile", "name with spaces", "-c", "session"]
+    options = ["-B", "-S", "-W", "error::UserWarning", "-X", "dev"]
+    invocation = {
+        "inline": ["-c", program],
+        "script": [str(entry)],
+        "module": ["-m", "relaunch_app"],
+    }[mode]
+    argv = ["-c" if mode == "inline" else str(entry), *args]
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, argv,
+        [sys.executable, *options, *invocation, *args],
+        "relaunch_app" if mode == "module" else None,
+    )
+
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "dependency": "activated",
+        "argv": argv,
+        "bootstrap_argv": argv,
+        "name": "__main__",
+        "no_bytecode": True,
+        "no_site": 1,
+        "dev_mode": True,
+        "warnings": ["default", "error::UserWarning"],
+    }
+
+
 def _checkout(tmp_path: Path, name: str = "co") -> Path:
     root = tmp_path / name
     (root / ".git").mkdir(parents=True)

@@ -502,7 +502,9 @@ def relaunch_command(
         if option in ("-W", "-X") and index < len(original):
             options.append(original[index])
             index += 1
-    prefix = f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
+    # The managed Python is bare: activate before re-entering application imports.
+    prefix = (f"import sys, runpy; sys.path.insert(0, {str(root)!r}); "
+              f"sys.argv = {argv!r}; import hermes_bootstrap; ")
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":
