@@ -1673,6 +1673,13 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     attributes DELETE the key rather than skip the write: resume reads provider/endpoint from this JSON
     (model column written separately), so a stale provider would route the resumed chat to the wrong endpoint."""
     config = dict(existing or {})
+    if isinstance(runtime := config.get("gateway_runtime"), dict):
+        # Resume prefers the gateway's nested route; this live write supersedes it with the top-level route.
+        metadata = {key: value for key, value in runtime.items() if key not in ("provider", "base_url", "api_mode")}
+        if metadata:
+            config["gateway_runtime"] = metadata
+        else:
+            config.pop("gateway_runtime")
     attr = lambda k: str(getattr(agent, k, "") or "").strip()
     model, provider, base_url = attr("model"), attr("provider"), attr("base_url")
     if provider.lower() == "custom":
