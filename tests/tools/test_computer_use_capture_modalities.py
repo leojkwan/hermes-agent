@@ -205,8 +205,18 @@ def test_empty_ax_snapshot_is_not_repeated_or_reuses_old_tokens(monkeypatch, tmp
         return result
 
     monkeypatch.setattr(driver, "execute", empty_snapshot)
+    cli_calls = []
+
+    def refetch(name, args, timeout):
+        cli_calls.append((name, dict(args)))
+        return {"data": None, "images": [], "isError": False,
+                "structuredContent": {"elements": [], "element_count": 0,
+                                      "window_title": TARGET["title"]}}
+
+    monkeypatch.setattr(backend._session, "_call_tool_via_cli", refetch)
     before = len(driver.calls)
     cap = backend.capture(mode="ax", app="Fixture")
+    assert cli_calls == []
     requests = [call for call in driver.calls[before:] if call[0] == "get_window_state"]
     assert len(requests) == 1
     assert requests[0][2] == "mcp"
