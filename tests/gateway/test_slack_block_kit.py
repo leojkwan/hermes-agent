@@ -1,5 +1,9 @@
 """Unit tests for the Slack Block Kit renderer (pure function, no adapter)."""
 
+from copy import deepcopy
+
+import pytest
+
 from plugins.platforms.slack.block_kit import (
     MAX_BLOCKS,
     MAX_SECTION_TEXT,
@@ -194,6 +198,111 @@ class TestSanitizeBlocks:
     (#56615 null column_settings, #62054 / #53693 >3000-char sections on
     approval chat.update after HTML-escaping inflation).
     """
+
+    @pytest.mark.parametrize("source", ["markdown", "direct"])
+    @pytest.mark.parametrize(
+        "sizes, expected_types",
+        [
+            ([4990, 4990], ["table", "table"]),  # exactly 10,000 visible chars
+            ([4990, 4991], ["table", "rich_text"]),
+            ([6000, 6000], ["table", "rich_text"]),
+            ([6990, 6990, 2990], ["table", "rich_text", "table"]),
+        ],
+    )
+    def test_native_table_budget_is_shared_and_overflow_does_not_spend_it(
+        self, source, sizes, expected_types
+    ):
+        values = [chr(65 + i) * size for i, size in enumerate(sizes)]
+        if source == "markdown":
+            blocks = render_blocks("\n\n".join(
+                f"| Job | Detail |\n| --- | --- |\n| {chr(65 + i)} | {value} |"
+                for i, value in enumerate(values)
+            ))
+        else:
+            blocks = [
+                {
+                    "type": "table",
+                    "rows": [
+                        [{"type": "raw_text", "text": "Job"},
+                         {"type": "raw_text", "text": "Detail"}],
+                        [{"type": "raw_text", "text": chr(65 + i)},
+                         {"type": "raw_text", "text": value}],
+                    ],
+                }
+                for i, value in enumerate(values)
+            ]
+        original = deepcopy(blocks)
+        out = sanitize_blocks(blocks)
+        assert _types(out) == expected_types
+        for i, (block, value) in enumerate(zip(out, values)):
+            if block["type"] == "table":
+                assert value in str(block["rows"])
+            else:
+                assert "rows" not in block
+                assert [section["type"] for section in block["elements"]] == [
+                    "rich_text_section", "rich_text_section"
+                ]
+                assert "".join(e.get("text", "") for e in
+                               block["elements"][1]["elements"]) == f"{chr(65 + i)} | {value}"
+        TestEmptyContentGuards._assert_schema_valid(out)
+        assert blocks == original
+        assert sanitize_blocks(out) == out
+
+    @pytest.mark.parametrize("content_type", ["text", "link", "bare_link", "raw_text", "raw_number"])
+    def test_overflow_preserves_styled_links_and_ragged_cells(self, content_type):
+        long_url = "https://example.com/" + "u" * 11000
+        styled_link = {
+            "type": "link", "url": long_url, "text": "Open", "style": {"bold": True}
+        }
+        styled_text = {"type": "text", "text": "kept", "style": {"italic": True}}
+        visible = {
+            "text": {"type": "text", "text": "1234"},
+            "link": {"type": "link", "url": long_url, "text": "1234"},
+            "bare_link": {"type": "link", "url": "https://example.com"},
+            "raw_text": {"type": "raw_text", "text": "1234"},
+            "raw_number": {"type": "raw_number", "value": 1234},
+        }[content_type]
+        cell = lambda elements: {
+            "type": "rich_text",
+            "elements": [{"type": "rich_text_section", "elements": elements}],
+        }
+        visible_size = 19 if content_type == "bare_link" else 4
+        blocks = [
+            {"type": "table", "rows": [[cell([{"type": "text", "text": "x" * (10000 - visible_size)}])]]},
+            {"type": "table", "rows": [[visible]]},
+            {"type": "table", "rows": [[{"type": "raw_text", "text": "1"}]]},
+            {
+                "type": "table",
+                "rows": [
+                    [cell([styled_link, styled_text]), {"type": "raw_text", "text": ""}],
+                    [{"type": "raw_number", "value": 0}],
+                    [cell([{"type": "link", "url": "https://bare.example/"}])],
+                ],
+                "column_settings": [None, {"align": "right"}],
+            },
+        ]
+        original = deepcopy(blocks)
+        out = sanitize_blocks(blocks)
+        assert _types(out) == ["table", "table", "rich_text", "rich_text"]
+        rows = out[3]["elements"]
+        assert rows == [
+            {"type": "rich_text_section", "elements": [
+                styled_link, styled_text, {"type": "text", "text": " | "},
+                {"type": "text", "text": " "},
+            ]},
+            {"type": "rich_text_section", "elements": [
+                {"type": "text", "text": "0"}, {"type": "text", "text": " | "},
+                {"type": "text", "text": " "},
+            ]},
+            {"type": "rich_text_section", "elements": [
+                {"type": "link", "url": "https://bare.example/"},
+                {"type": "text", "text": " | "}, {"type": "text", "text": " "},
+            ]},
+        ]
+        TestEmptyContentGuards._assert_schema_valid(out)
+        assert "rows" not in out[3] and "column_settings" not in out[3]
+        assert blocks == original
+        assert sanitize_blocks(out) == out
 
 
     def test_oversized_section_text_is_clamped(self):

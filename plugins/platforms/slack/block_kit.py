@@ -9,9 +9,10 @@ Design constraints (why this module is deliberately conservative):
 
 * **Markdown pipe-tables render as native ``table`` blocks** — real grid
   cells with per-column alignment and inline-formatted ``rich_text`` content.
-  A table that exceeds Slack's limits (100 rows / 20 cols / 10k aggregate
-  cell chars) or won't parse falls back to aligned monospace
-  ``rich_text_preformatted`` so a large table never breaks the message.
+  A table that exceeds structural limits (100 rows / 20 cols) or won't parse
+  falls back to aligned monospace ``rich_text_preformatted``. The outbound
+  sanitizer admits tables within the message's 10k visible-character budget
+  and converts overflow to rich-text rows, preserving styles and links.
 * **Slack caps a message at 50 blocks** and a ``section``/text object at 3000
   characters.  :func:`render_blocks` enforces both and, if the content simply
   cannot be expressed within them, returns ``None`` so the caller falls back
@@ -38,7 +39,7 @@ MAX_HEADER_TEXT = 150
 # Native table block limits (https://docs.slack.dev/reference/block-kit/blocks/table-block)
 MAX_TABLE_ROWS = 100
 MAX_TABLE_COLS = 20
-MAX_TABLE_CHARS = 10000  # aggregate across all cells
+MAX_TABLE_CHARS = 10000  # aggregate across native table cells in one message
 
 Block = Dict[str, Any]
 
@@ -268,7 +269,7 @@ def _table_block(rows: List[str], sep_line: str) -> Optional[Block]:
     """Build a native Slack ``table`` block from markdown pipe-table rows.
     ``rows`` includes the header row (index 0) and body rows; ``sep_line`` is the ``|---|``
     alignment row (already consumed by the caller). Returns ``None`` when the table exceeds Slack's
-    limits (100 rows / 20 cols / 10,000 aggregate cell chars) or parses to nothing — the caller then
+    structural limits (100 rows / 20 cols) or parses to nothing — the caller then
     falls back to the monospace preformatted rendering."""
     parsed = [_split_row(r) for r in rows if r.strip()]
     if not parsed:
@@ -279,9 +280,6 @@ def _table_block(rows: List[str], sep_line: str) -> Optional[Block]:
         return None
     for r in parsed:
         r.extend([""] * (ncols - len(r)))
-    total_chars = sum(len(c) for r in parsed for c in r)
-    if total_chars > MAX_TABLE_CHARS:
-        return None
     aligns = _parse_alignment(sep_line)
     # Slack requires every provided ``column_settings`` entry to be an object.
     # Missing trailing entries inherit defaults, so only emit settings through
@@ -476,7 +474,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[List[Block]]:
             # Too structurally complex to express safely — let the caller fall
             # back to plain text rather than truncating and losing content.
             return None
-        return blocks
+        return sanitize_blocks(blocks)
     except Exception:
         # Never let a rendering bug drop a message.
         return None
@@ -522,6 +520,35 @@ def _split_text(text: str, limit: int) -> List[str]:
 # ----------------------------------------------------------------------------
 
 
+def _table_cell_elements(cell: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Reuse visible cell content when a native table exceeds the message budget."""
+    kind = cell.get("type", "")
+    if kind in ("raw_text", "raw_number"):
+        value = cell.get("value") if kind == "raw_number" else cell.get("text")
+        return _nonempty_elements([{"type": "text", "text": str(value) if value is not None else ""}])
+    if kind.startswith("rich_text"):
+        return _nonempty_elements([
+            element
+            for child in cell.get("elements", [])
+            for element in _table_cell_elements(child)
+        ])
+    return _nonempty_elements([cell] if kind else [])
+
+
+def _table_as_rich_text(rows: List[List[List[Dict[str, Any]]]]) -> Block:
+    """Keep row and cell order without flattening styled text or clickable links."""
+    width = max(len(row) for row in rows)
+    sections = []
+    for row in rows:
+        elements = []
+        for column in range(width):
+            if column:
+                elements.append({"type": "text", "text": " | "})
+            elements.extend(row[column] if column < len(row) else [{"type": "text", "text": " "}])
+        sections.append({"type": "rich_text_section", "elements": _nonempty_elements(elements)})
+    return {"type": "rich_text", "elements": sections}
+
+
 def _clamp_text_obj(text_obj: Dict[str, Any], limit: int) -> Dict[str, Any]:
     """Return ``text_obj`` with its ``text`` clamped to ``limit`` chars."""
     txt = text_obj.get("text") or ""
@@ -551,6 +578,8 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
       (emitted by older renderers, per the "use null to skip" misreading of
       the schema) are replaced with ``{}`` and default trailing entries are
       trimmed (#56615).
+    * Native table cells share a 10,000-character message budget. Overflow
+      becomes rich-text rows without spending the remaining native budget.
     * The payload is capped at Slack's 50-block maximum.
 
     Returns the sanitized list, or ``None`` when nothing valid remains — the
@@ -559,6 +588,7 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
         return None
     try:
         out: List[Block] = []
+        table_chars = 0
         for block in blocks:
             if not isinstance(block, dict) or not block.get("type"):
                 continue
@@ -602,6 +632,15 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
             elif btype == "table":
                 if not block.get("rows"):
                     continue
+                rows = [[_table_cell_elements(cell) for cell in row] for row in block["rows"]]
+                chars = sum(
+                    len(element.get("text") or element.get("url") or "")
+                    for row in rows for cell in row for element in cell
+                )
+                if table_chars + chars > MAX_TABLE_CHARS:
+                    out.append(_table_as_rich_text(rows))
+                    continue
+                table_chars += chars
                 settings = block.get("column_settings")
                 if isinstance(settings, list) and any(not isinstance(cs, dict) for cs in settings):
                     fixed = [cs if isinstance(cs, dict) else {} for cs in settings]
