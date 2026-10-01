@@ -4637,6 +4637,19 @@ class TestWrapMarkdownTables:
         text = "Just a paragraph with | one pipe but no table."
         assert _wrap_markdown_tables(text) == text
 
+    def test_table_wider_than_a_phone_reads_as_labelled_records(self):
+        text = (
+            "| | Alpha | Beta Long Name | Gamma |\n"
+            "|---|---|---|---|\n"
+            "| Price | $339 | ~$310 | ~$270 |\n"
+            "| Score | 3.5 |  | not checked |"
+        )
+        out = _wrap_markdown_tables(text)
+        assert "```" not in out
+        assert out.split("\n") == [
+            "**Price** — Alpha: $339 · Beta Long Name: ~$310 · Gamma: ~$270",
+            "**Score** — Alpha: 3.5 · Gamma: not checked",
+        ]
 
 class TestAlignTable:
     def test_normalizes_column_count(self):
@@ -4667,6 +4680,16 @@ class TestFormatMessageTableIntegration:
         a.config = config
         return a
 
+
+    @pytest.mark.parametrize("key", ["docs", "`a ** b`"])
+    def test_wide_table_link_is_clickable_mrkdwn(self, adapter, key):
+        out = adapter.format_message(
+            f"| Job | Owner | Status |\n|---|---|---|\n| {key} | release team | [open](https://example.com) |"
+        )
+        assert "```" not in out
+        assert key in out
+        assert out.split("\n")[1].startswith(f"*{key}")
+        assert "Owner: release team · Status: <https://example.com|open>" in out
 
     def test_table_fence_carries_no_language_tag(self, adapter):
         """The emitted table fence must survive the lang-tag strip pass."""

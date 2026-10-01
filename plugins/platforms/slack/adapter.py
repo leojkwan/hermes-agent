@@ -206,8 +206,39 @@ def _align_table(rows: List[str]) -> List[str]:
     return out
 
 
+# A phone shows about 36 monospace columns in a Slack code block; a wider fenced table wraps
+# and its columns fall apart. Markup inside a fence is shown literally, so a cell with a link
+# or bold can't be fenced either. Both read as labelled records instead.
+_PHONE_TABLE_COLUMNS = 36
+_TABLE_MARKUP_RE = re.compile(r"\[[^\]]+\]\([^)]+\)|\*\*")
+
+
+def _table_record_label(cell: str) -> str:
+    """Keep existing emphasis and literal code intact when labelling a record."""
+    return cell if cell.startswith("**") and cell.endswith("**") else f"**{cell}**"
+
+
+def _table_records(rows: List[str]) -> List[str]:
+    """One line per row: the first cell in bold, then each non-empty cell after its header."""
+    parsed = [_split_table_row(r) for i, r in enumerate(rows) if i != 1]
+    header, body = parsed[0], parsed[1:]
+    if not body:
+        return [" · ".join(c for c in header if c)]
+    out = [_table_record_label(header[0])] if header[0] else []
+    for row in body:
+        name = row[0] if row else ""
+        parts = [
+            f"{header[c]}: {row[c]}" if c < len(header) and header[c] else row[c]
+            for c in range(1, len(row)) if row[c]
+        ]
+        lead = _table_record_label(name) if name else ""
+        out.append(lead + (" — " if lead and parts else "") + " · ".join(parts))
+    return out
+
+
 def _wrap_markdown_tables(text: str) -> str:
-    """Wrap GFM pipe tables in ``` fences and align columns; tables already in fences are left alone."""
+    """Wrap GFM pipe tables in ``` fences and align columns; tables already in fences are left alone.
+    A table too wide for a phone, or with markup in a cell, becomes labelled records instead."""
     if not text or "|" not in text or "-" not in text:
         return text
     lines = text.split("\n")
@@ -226,9 +257,14 @@ def _wrap_markdown_tables(text: str) -> str:
             while j < len(lines) and _is_table_row(lines[j]):
                 block.append(lines[j])
                 j += 1
-            out.append("```")
-            out.extend(_align_table(block))
-            out.append("```")
+            aligned = _align_table(block)
+            if max(_disp_width(r) for r in aligned) > _PHONE_TABLE_COLUMNS or any(
+                    _TABLE_MARKUP_RE.search(r) for r in block):
+                out.extend(_table_records(block))
+            else:
+                out.append("```")
+                out.extend(aligned)
+                out.append("```")
             i = j
             continue
         out.append(line)
