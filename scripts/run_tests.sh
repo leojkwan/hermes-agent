@@ -160,6 +160,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  HERMES_TEST_DURATION_FILE HERMES_TEST_OUT_OF_TREE_CACHE \
   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS; do
   if [ -n "${!_test_var:-}" ]; then
@@ -180,8 +181,17 @@ cd "$REPO_ROOT"
 # Pre-building the bytecode cache once here (instead of each subprocess
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
-echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+NO_WRITE_ENV=()
+if [ -n "${HERMES_TEST_OUT_OF_TREE_CACHE:-}" ]; then
+  mkdir -p "$HERMES_TEST_OUT_OF_TREE_CACHE/pytest"
+  export HERMES_TEST_DURATION_FILE="$HERMES_TEST_OUT_OF_TREE_CACHE/test_durations.json"
+  TEST_ENV+=("HERMES_TEST_DURATION_FILE=$HERMES_TEST_DURATION_FILE")
+  TEST_ENV+=("HERMES_GATEWAY_GUARD_CACHE_DIR=$HERMES_TEST_OUT_OF_TREE_CACHE/gateway-guard")
+  NO_WRITE_ENV+=(PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS="-p no:cacheprovider")
+else
+  echo "▶ pre-compiling bytecode cache"
+  "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+fi
 
 echo "▶ launching test runner"
 exec env -i \
@@ -199,4 +209,5 @@ exec env -i \
   ${HERMES_RUN_E2E:+HERMES_RUN_E2E="$HERMES_RUN_E2E"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
+  ${NO_WRITE_ENV[@]+"${NO_WRITE_ENV[@]}"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"

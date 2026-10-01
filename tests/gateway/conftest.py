@@ -493,7 +493,7 @@ def pytest_configure(config):
        the rest wait and read the cached result.
     """
     fp = _fingerprint_gateway_tests()
-    cache_dir = Path.cwd() / ".pytest-cache"
+    cache_dir = Path(os.environ.get("HERMES_GATEWAY_GUARD_CACHE_DIR") or Path.cwd() / ".pytest-cache")
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 

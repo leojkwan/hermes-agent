@@ -797,14 +797,20 @@ def _print_inline_failure(
     print(flush=True)
 
 
+def _durations_path(repo_root: Path) -> Path:
+    """Return the duration cache path, honoring an out-of-tree cache root."""
+    configured = os.environ.get("HERMES_TEST_DURATION_FILE")
+    return Path(configured).expanduser() if configured else repo_root / _DURATIONS_FILE
+
+
 def _load_durations(repo_root: Path) -> dict[str, float]:
-    """Read the duration cache from the repo root.
+    """Read the duration cache.
 
     Returns a dict mapping relative file paths (e.g.
     ``tests/tools/test_code_execution.py``) to wall-clock seconds from
     the last run. Missing or corrupt file → empty dict (safe fallback).
     """
-    path = repo_root / _DURATIONS_FILE
+    path = _durations_path(repo_root)
     if not path.is_file():
         return {}
     try:
@@ -829,7 +835,8 @@ def _save_durations(
     for f, t in file_times:
         key = _format_file(f, repo_root)
         data[key] = round(t, 3)
-    path = repo_root / _DURATIONS_FILE
+    path = _durations_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -1459,7 +1466,7 @@ def main() -> int:
     )
     if clean_times:
         _save_durations(clean_times, repo_root)
-        print(f"  Durations cached to {_DURATIONS_FILE} ({len(clean_times)} files)")
+        print(f"  Durations cached to {_durations_path(repo_root)} ({len(clean_times)} files)")
 
     # Per-file time distribution (throwaway diagnostic — shows how
     # subprocess time is distributed so we can see if startup dominates).
