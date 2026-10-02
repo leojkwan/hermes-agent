@@ -3699,6 +3699,18 @@ def _recoverable_pool_provider(
     return None
 
 
+def _load_aux_credential_pool(provider: str):
+    """Return a usable recovery pool, not merely a pool-eligible provider."""
+    normalized = _normalize_aux_provider(provider)
+    try:
+        pool = load_pool(normalized)
+        if pool and pool.has_credentials():
+            return pool
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, exc)
+    return None
+
+
 def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
     """Try same-provider credential-pool recovery for auxiliary calls.
 
@@ -3706,12 +3718,8 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     another process already rotated (current() would be None).
     """
     normalized = _normalize_aux_provider(provider)
-    try:
-        pool = load_pool(normalized)
-    except Exception as load_exc:
-        logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, load_exc)
-        return False
-    if not pool or not pool.has_credentials():
+    pool = _load_aux_credential_pool(normalized)
+    if pool is None:
         return False
     status_code = getattr(exc, "status_code", None)
 
@@ -7648,7 +7656,11 @@ def _ladder_credential_rungs(
         recovery_err = first_err
         # Skip the extra retry for clear payment/quota errors — the endpoint won't accept
         # another request with the same exhausted key.
-        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+        if (
+            _is_rate_limit_error(first_err)
+            and not _is_payment_error(first_err)
+            and _load_aux_credential_pool(pool_provider) is not None
+        ):
             resp, recovery_err = yield from _rung(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:
