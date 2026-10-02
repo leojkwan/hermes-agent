@@ -7654,13 +7654,20 @@ def _ladder_credential_rungs(
     # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
     if pool_provider and _credential_rung_accepts(first_err):
         recovery_err = first_err
-        # Skip the extra retry for clear payment/quota errors — the endpoint won't accept
-        # another request with the same exhausted key.
-        if (
-            _is_rate_limit_error(first_err)
-            and not _is_payment_error(first_err)
-            and _load_aux_credential_pool(pool_provider) is not None
-        ):
+        # Probe native availability for the requested model only before the
+        # immediate ordinary-429 retry. Pool presence includes dead, keyless,
+        # and cooling-down entries; keep auth refresh/rotation below available.
+        retry_failed_key = False
+        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+            pool = _load_aux_credential_pool(pool_provider)
+            try:
+                retry_failed_key = pool is not None and pool.has_available(model=kwargs.get("model"))
+            except Exception as exc:
+                logger.debug(
+                    "Auxiliary %s: recovery-pool availability check failed (%s)",
+                    task or "call", type(exc).__name__,
+                )
+        if retry_failed_key:
             resp, recovery_err = yield from _rung(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:

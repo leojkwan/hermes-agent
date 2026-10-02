@@ -3,7 +3,9 @@ import asyncio
 import importlib.util
 import os
 from pathlib import Path
+import socket
 import sys
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -13,6 +15,10 @@ from openai import AsyncOpenAI, OpenAI
 
 @pytest.fixture
 def aux(monkeypatch):
+    def forbid_network(*args, **kwargs):
+        pytest.fail("offline control attempted a real network connection")
+    monkeypatch.setattr(socket.socket, "connect", forbid_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbid_network)
     source = Path(os.environ.get("AR01_SOURCE", str(Path(__file__).parents[2] / "agent" / "auxiliary_client.py")))
     name = "ar01_frozen_auxiliary_client"
     spec = importlib.util.spec_from_file_location(name, source)
@@ -31,7 +37,7 @@ def run_control(aux, monkeypatch, mode, pool_state, *, eligible=True, status=429
 
     def handler(request):
         requests.append(request)
-        if pool_state == "usable" and len(requests) == 2:
+        if pool_state in {"usable", "other_model_cooldown"} and len(requests) == 2:
             return httpx.Response(200, json={
                 "id": "offline-ok", "object": "chat.completion", "created": 0,
                 "model": "offline-control", "choices": [{"index": 0,
@@ -45,12 +51,36 @@ def run_control(aux, monkeypatch, mode, pool_state, *, eligible=True, status=429
             return None
         if pool_state == "unreadable":
             raise OSError("offline unreadable-pool control")
-        def has_credentials():
-            if pool_state == "invalid":
+        if pool_state == "invalid":
+            def has_credentials():
                 raise ValueError("offline invalid-pool control")
-            return pool_state == "usable"
-        return SimpleNamespace(has_credentials=has_credentials,
-            mark_exhausted_and_rotate=lambda **k: None, try_refresh_current=lambda: None)
+            return SimpleNamespace(has_credentials=has_credentials)
+        from agent import credential_pool as native
+        monkeypatch.setattr(native, "get_pool_strategy", lambda *a: "ordered")
+        now = time.time()
+        row = {"id": "offline-row", "source": "manual", "auth_type": "api_key",
+               "access_token": "offline-pool-key", "last_status_at": now}
+        if pool_state == "all_dead":
+            row["last_status"] = native.STATUS_DEAD
+        elif pool_state == "keyless":
+            row["access_token"] = ""
+        elif pool_state == "all_in_cooldown":
+            row.update(last_status=native.STATUS_EXHAUSTED, last_error_code=429,
+                       last_error_reset_at=now + 3600)
+        elif pool_state in {"model_cooldown", "other_model_cooldown"}:
+            model = "offline-control" if pool_state == "model_cooldown" else "other-model"
+            row["model_cooldowns"] = {model: now + 3600}
+        entries = [] if pool_state == "empty" else [native.PooledCredential.from_dict("zai", row)]
+        pool = native.CredentialPool("zai", entries)
+        monkeypatch.setattr(pool, "_resync_stale_entry", lambda entry: entry)
+        def forbid_persist(*args, **kwargs):
+            pytest.fail("offline native pool attempted auth-store persistence")
+        monkeypatch.setattr(pool, "_persist", forbid_persist)
+        if pool_state == "availability_error":
+            def has_available(**kwargs):
+                raise OSError("offline availability-probe failure")
+            monkeypatch.setattr(pool, "has_available", has_available)
+        return pool
 
     monkeypatch.setattr(aux, "load_pool", load_pool)
     monkeypatch.setattr(aux, "_recoverable_pool_provider", lambda *a, **k: "zai" if eligible else None)
@@ -98,17 +128,22 @@ def run_control(aux, monkeypatch, mode, pool_state, *, eligible=True, status=429
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
-@pytest.mark.parametrize("pool_state", ["missing", "empty", "unreadable", "invalid"])
+@pytest.mark.parametrize("pool_state", ["missing", "empty", "unreadable", "invalid",
+    "all_dead", "keyless", "all_in_cooldown", "model_cooldown", "availability_error"])
 def test_no_recovery_pool_does_not_repeat_failed_key(aux, monkeypatch, mode, pool_state):
     requests, response, error, original = run_control(aux, monkeypatch, mode, pool_state)
     assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == "https://offline.invalid/v1/chat/completions"
+    assert requests[0].headers["authorization"] == "Bearer offline-test-key"
     assert response is None
     assert error is original
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
-def test_usable_pool_preserves_existing_retry(aux, monkeypatch, mode):
-    requests, response, error, _ = run_control(aux, monkeypatch, mode, "usable")
+@pytest.mark.parametrize("pool_state", ["usable", "other_model_cooldown"])
+def test_usable_pool_preserves_existing_retry(aux, monkeypatch, mode, pool_state):
+    requests, response, error, _ = run_control(aux, monkeypatch, mode, pool_state)
     assert len(requests) == 2
     assert response.choices[0].message.content == "ok"
     assert error is None
