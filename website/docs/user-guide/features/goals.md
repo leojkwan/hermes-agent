@@ -90,9 +90,9 @@ A contract has five fields, all optional:
 | `verification` | The specific test / command / artifact that *proves* the outcome. |
 | `constraints` | What must not change or regress. |
 | `boundaries` | Which files, dirs, tools, or systems are in scope. |
-| `stop_when` | The condition under which Hermes should stop and ask for input. |
+| `stop_when` | A condition to record with an exact wake; the continuation applies the user-gate rule below while preserving the contract's boundaries and constraints. |
 
-When a contract is set, both prompts change: the **continuation prompt** tells the agent to target the verification surface and respect the constraints, and the **judge prompt** decides `done` *only when the verification criterion is met with concrete evidence* (a command result, file excerpt, test output) — not a loose "looks done" claim. This directly tightens the most common `/goal` failure mode (premature completion or endless over-continuation on an underspecified objective).
+When a contract is set, both prompts change: the **continuation prompt** tells the agent to target the verification surface and respect the constraints, and the **judge prompt** requires concrete evidence for every required part of the goal and contract, including verification and added criteria. An arbitrary stop condition or ordinary question does not automatically classify the goal as blocked. The agent records the exact wake and continues other authorized work unless every remaining required step meets the protected user-gate rule below. Explicit `/goal pause` remains available.
 
 ### Two ways to set a contract
 
@@ -157,13 +157,13 @@ Gates and contracts compose: use a contract to shape *what the agent aims for*, 
 
 Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, a deploy, a rate-limit cooldown. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
 
-**This is handled automatically.** Every turn, the judge is shown the agent's own live background processes (the `terminal(background=true)` registry entries this session spawned — pid, session id, command, uptime, recent output, and any `watch_patterns` / `notify_on_complete` trigger; processes started by delegated subagents are not shown, so a fan-out parent is never parked on a worker's poller) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the wait is satisfied — then it resumes normally with the result in hand. A pid/session wait is capped at 30 minutes; a process that never exits (a watcher, a forgotten poller) cannot park the goal indefinitely. The judge can also park on a **time** basis (`wait_for_seconds`) for backoff/cooldown waits. `/goal status` shows `⏳ Goal (parked …)` while parked.
+**This is handled automatically.** Every turn, the judge is shown the agent's own live background processes (the `terminal(background=true)` registry entries this session spawned — pid, session id, command, uptime, recent output, and any `watch_patterns` / `notify_on_complete` trigger; processes started by delegated subagents are not shown, so a fan-out parent is never parked on a worker's poller) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the wait is satisfied — then it resumes normally with the result in hand. A pid/session wait is capped at 30 minutes; a process that never exits (a watcher, a forgotten poller) cannot park the goal indefinitely. The judge can also park on a **time** basis (`wait_for_seconds`) while this session has live delegated batches and nothing else dispatchable; the delay is bounded to 600–1800 seconds and an arriving batch result releases it early. A narrated backoff on a successful turn does not create a timer. Explicit user timers are unchanged. `/goal status` shows `⏳ Goal (parked …)` while parked.
 
 The judge picks the right kind of wait from the process's own signal:
 
 - **`wait_on_session <id>`** — releases when the process's *own trigger* fires: it exits, **or** (if it was started with `watch_patterns`) its pattern matches. This is the one for a long-lived watcher / server / poller that signals **mid-run** (e.g. a build process that prints `BUILD SUCCESSFUL` and keeps running, or a `notify_on_complete` watcher) and may never exit on its own.
 - **`wait_on_pid <pid>`** — releases on process exit only.
-- **`wait_for_seconds <n>`** — releases after a fixed delay.
+- **`wait_for_seconds <n>`** — judge timers require live delegations; explicit user timers still release after their fixed delay.
 
 You don't type anything for this — it's the judge's decision, made from the process context the loop hands it. The manual commands exist as an override:
 
@@ -183,10 +183,14 @@ Typical flow: the agent pushes a PR, starts a CI watcher with `terminal(backgrou
 After every turn, Hermes calls an auxiliary model with:
 
 - The standing goal text
-- The agent's most recent final response (last ~4 KB of text)
+- A bounded excerpt of the agent's most recent final response (up to 4,000 characters)
 - A system prompt telling the judge to reply with strict one-line JSON: `{"verdict": "done" | "blocked" | "continue" | "wait", "reason": "<one-sentence rationale>"}` (wait verdicts add `wait_on_session` / `wait_on_pid` / `wait_for_seconds`; the legacy `{"done": <bool>, "reason": "..."}` shape is still accepted)
 
-The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced. A goal the agent explains is **unachievable** (impossible, out of scope, needs user input) gets a `blocked` verdict instead — never `done`: the goal **pauses** with the judge's reason (`🚫 Goal judged unachievable — paused`), so you can re-scope it with `/goal <text>` or override with `/goal resume` rather than burning budget or having an impossible task waved through as complete.
+The judge marks a goal `done` only when the response gives concrete evidence for the **whole stated goal**, including every required contract criterion and subgoal. A completion claim or one finished deliverable is insufficient while required work remains. Optional follow-ups outside the stated goal do not prevent `done` once all required work is proven.
+
+The judge returns `blocked` only when **every remaining required step** needs one of five protected user gates without an applicable recorded grant: credentials or account access, spending money, sending or publishing anything outside this machine, a destructive or irreversible action, or a product decision that cannot be undone. Its reason must name the gate class, remaining action, and missing grant. Reversible choices, local merges, and tests needing the user's hands do not qualify by themselves; the agent records a wake and continues other authorized work. External deployment requires a grant covering its destination and payload; a rollback plan alone is insufficient.
+
+`blocked` keeps the goal unfinished and pauses it with the judge's reason. You can re-scope with `/goal <text>` or resume with `/goal resume`. The judge sees only the supplied goal, response, contract or subgoals, runtime status and clock; earlier session grants and linked artifacts are not fetched automatically. A verdict does not grant authority to send, publish, spend, or change access.
 
 ### Fail-open semantics
 
