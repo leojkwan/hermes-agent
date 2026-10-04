@@ -8,6 +8,9 @@ and prompt-cache integrity.
 from __future__ import annotations
 
 import threading
+from contextvars import copy_context
+from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,6 +81,368 @@ class TestSteerDrain:
         agent.steer("hello")
         assert agent._drain_pending_steer() == "hello"
         assert agent._pending_steer is None
+
+    def test_legacy_boolean_results_and_empty_input_remain_unchanged(self):
+        agent = _bare_agent()
+        assert agent.steer(" ") is False
+        assert agent.steer(" first ") is True
+        assert agent.steer("second") is True
+        assert agent._drain_pending_steer() == "first\nsecond"
+
+
+def _bind_native_turn(agent, turn_id, *, qualified=True, context_turn_id=None):
+    from agent.turn_context import _bind_turn_identity
+    from agent.turn_facade import native_turn_context
+
+    agent.session_id = "correction-fixture"
+    agent._persist_disabled = True
+    agent._relay_pending_turn_id = turn_id
+    token = native_turn_context.set((context_turn_id or turn_id, 0) if qualified else None)
+    try:
+        return _bind_turn_identity(agent, "task", None, None, None, None)
+    finally:
+        native_turn_context.reset(token)
+
+
+class _CorrectionBarrier:
+    """Pause one correction thread just before acquisition or after release."""
+
+    def __init__(self, lock, *, after=False):
+        self.lock = lock
+        self.after = after
+        self.reached = threading.Event()
+        self.resume = threading.Event()
+        self.used = False
+
+    def _pause(self):
+        if threading.current_thread().name == "native-correction" and not self.used:
+            self.used = True
+            self.reached.set()
+            assert self.resume.wait(5), "correction barrier was not released"
+
+    def __enter__(self):
+        if not self.after:
+            self._pause()
+        return self.lock.__enter__()
+
+    def __exit__(self, *args):
+        result = self.lock.__exit__(*args)
+        if self.after:
+            self._pause()
+        return result
+
+
+def _correction_worker(agent, method):
+    outcome = {}
+
+    def correct():
+        try:
+            outcome["receipt"] = getattr(agent, method)("A correction", expected_turn_id="A")
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=copy_context().run, args=(correct,), name="native-correction")
+    worker.start()
+    return worker, outcome
+
+
+def _correction_receipt(worker, outcome):
+    worker.join(5)
+    assert not worker.is_alive(), "native correction did not finish"
+    assert "error" not in outcome, f"native correction contract failed: {outcome.get('error')!r}"
+    return outcome["receipt"]
+
+
+@pytest.mark.parametrize("method,tools", [("steer", False), ("redirect", False), ("redirect", True)])
+@pytest.mark.parametrize("after", [False, True], ids=["B-before-mutation", "A-before-B"])
+def test_native_correction_rollover_is_fenced_at_mutation(method, tools, after):
+    """Moving ownership before mutation rejects A; after mutation the receipt stays A.
+
+    Model abort and tool yield must never reread B's execution targets after accepting A.
+    """
+    from tools.interrupt import is_thread_interrupted, is_thread_yield_requested, set_interrupt
+
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    agent._model_request_active.set()
+    agent._executing_tools = tools
+    agent._tool_worker_threads = {470001}
+    agent._tool_worker_threads_lock = threading.Lock()
+    agent._execution_thread_id = 470002
+    aborts = []
+    agent._active_request_abort = lambda reason: aborts.append(("A", reason))
+    lock_attr = "_pending_steer_lock" if method == "steer" or tools else "_pending_redirect_lock"
+    barrier = _CorrectionBarrier(getattr(agent, lock_attr), after=after)
+    setattr(agent, lock_attr, barrier)
+    worker, outcome = _correction_worker(agent, method)
+    try:
+        assert barrier.reached.wait(5), f"correction did not reach its mutation edge: {outcome}"
+        if after:
+            assert (agent._pending_steer if method == "steer" or tools else agent._pending_redirect) == "A correction"
+        _bind_native_turn(agent, "B")
+        agent._pending_steer = "B steer"
+        agent._pending_redirect = "B redirect"
+        agent._execution_thread_id = 470003
+        agent._tool_worker_threads = {470004}
+        agent._active_request_abort = lambda reason: aborts.append(("B", reason))
+        agent._interrupt_requested = False
+        barrier.resume.set()
+        receipt = _correction_receipt(worker, outcome)
+        assert (receipt.accepted, receipt.turn_id, receipt.changed) == (
+            (True, "A", False) if after else (False, None, True))
+        assert agent._pending_steer == "B steer"
+        assert agent._pending_redirect == "B redirect"
+        assert not agent._interrupt_requested
+        assert not is_thread_interrupted(470003)
+        assert not is_thread_yield_requested(470004)
+        assert aborts == ([("A", "redirect_abort")] if after and method == "redirect" and not tools else [])
+        if after and method == "redirect" and not tools:
+            assert is_thread_interrupted(470002)
+        with pytest.raises(FrozenInstanceError):
+            receipt.turn_id = "B"
+    finally:
+        barrier.resume.set()
+        worker.join(5)
+        for tid in (470001, 470002, 470003, 470004):
+            set_interrupt(False, tid)
+
+
+@pytest.mark.parametrize("method", ["steer", "redirect"])
+@pytest.mark.parametrize("qualification", ["absent", "different-turn"])
+def test_expected_correction_rejects_unqualified_binding_and_empty_text(method, qualification):
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A", qualified=qualification != "absent", context_turn_id="other")
+    agent._model_request_active.set()
+    receipt = getattr(agent, method)("guidance", expected_turn_id="A")
+    assert (receipt.accepted, receipt.turn_id, receipt.changed) == (False, None, True)
+    empty = getattr(agent, method)(" \n ", expected_turn_id="A")
+    assert (empty.accepted, empty.turn_id, empty.changed) == (False, None, False)
+    assert agent._pending_steer is None and agent._pending_redirect is None
+    assert not agent._interrupt_requested
+
+
+@pytest.mark.parametrize("method,tools", [("steer", False), ("redirect", False), ("redirect", True)])
+def test_expected_correction_accepts_current_native_turn(method, tools):
+    from tools.interrupt import is_thread_interrupted, is_thread_yield_requested, set_interrupt
+
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    agent._model_request_active.set()
+    agent._executing_tools = tools
+    agent._tool_worker_threads = {470005}
+    agent._tool_worker_threads_lock = threading.Lock()
+    try:
+        receipt = getattr(agent, method)(" current guidance ", expected_turn_id="A")
+        assert (receipt.accepted, receipt.turn_id, receipt.changed) == (True, "A", False)
+        assert (agent._pending_steer if method == "steer" or tools else agent._pending_redirect) == "current guidance"
+        assert is_thread_yield_requested(470005) is tools
+        assert not is_thread_interrupted(470005)
+    finally:
+        set_interrupt(False, 470005)
+
+
+@pytest.mark.parametrize("lock_attr", ["_pending_steer_lock", "_pending_redirect_lock"])
+def test_native_binding_cannot_publish_past_pending_correction_lock(lock_attr):
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    lock = getattr(agent, lock_attr)
+    boundary = threading.Event()
+    outcome = {}
+
+    class ObservedLock:
+        def __enter__(self):
+            boundary.set()
+            return lock.__enter__()
+
+        def __exit__(self, *args):
+            return lock.__exit__(*args)
+
+    setattr(agent, lock_attr, ObservedLock())
+
+    def bind():
+        try:
+            _bind_native_turn(agent, "B")
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            boundary.set()
+
+    worker = threading.Thread(target=copy_context().run, args=(bind,))
+    try:
+        with lock:
+            worker.start()
+            assert boundary.wait(5)
+            assert agent._current_turn_id == "A", "B published while a correction mutation held the lock"
+    finally:
+        # Join after leaving the held lock so a correctly fenced binder can proceed.
+        worker.join(5)
+    assert not worker.is_alive()
+    assert "error" not in outcome
+    assert agent._current_turn_id == "B"
+
+
+@pytest.mark.parametrize("after", [False, True], ids=["B-before-interrupt", "A-before-B"])
+def test_native_fallback_interrupt_fences_mutation_and_captures_targets(after):
+    from tools.interrupt import is_thread_interrupted, set_interrupt
+
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    agent._pending_redirect = "A redirect"
+    agent._execution_thread_id = 471001
+    agent._tool_worker_threads = {471002}
+    agent._tool_worker_threads_lock = threading.Lock()
+    aborts, children = [], []
+    agent._active_children = [SimpleNamespace(interrupt=lambda message: children.append("A child"))]
+    agent._active_request_abort = lambda reason: aborts.append(("A", reason))
+    barrier = _CorrectionBarrier(agent._pending_redirect_lock, after=after)
+    agent._pending_redirect_lock = barrier
+    worker, outcome = _correction_worker(agent, "interrupt")
+    try:
+        assert barrier.reached.wait(5), f"interrupt did not reach its mutation edge: {outcome}"
+        _bind_native_turn(agent, "B")
+        agent._interrupt_requested = False
+        agent._interrupt_message = None
+        agent._pending_steer = "B steer"
+        agent._pending_redirect = "B redirect"
+        agent._execution_thread_id = 471003
+        agent._tool_worker_threads = {471004}
+        agent._active_request_abort = lambda reason: aborts.append(("B", reason))
+        agent._active_children = [SimpleNamespace(interrupt=lambda message: children.append("B child"))]
+        barrier.resume.set()
+        receipt = _correction_receipt(worker, outcome)
+        assert (receipt.accepted, receipt.turn_id, receipt.changed) == (
+            (True, "A", False) if after else (False, None, True))
+        assert not agent._interrupt_requested and agent._interrupt_message is None
+        assert agent._pending_steer == "B steer" and agent._pending_redirect == "B redirect"
+        assert not is_thread_interrupted(471003) and not is_thread_interrupted(471004)
+        assert aborts == ([("A", "interrupt_abort")] if after else [])
+        assert children == (["A child"] if after else [])
+        assert is_thread_interrupted(471001) is after
+        assert is_thread_interrupted(471002) is after
+    finally:
+        barrier.resume.set()
+        worker.join(5)
+        for tid in (471001, 471002, 471003, 471004):
+            set_interrupt(False, tid)
+
+
+@pytest.mark.parametrize("generation", [10, 11])
+def test_native_fallback_interrupt_preserves_liveness_generation_admission(generation):
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    activity_lock = threading.Lock()
+    agent._liveness_activity_lock = lambda: activity_lock
+    agent._turn_liveness_activity_generation = 10
+    receipt = agent.interrupt(expected_turn_id="A", require_generation=generation)
+    assert (receipt.accepted, receipt.turn_id, receipt.changed) == (
+        (True, "A", False) if generation == 10 else (False, None, False))
+    assert agent._interrupt_requested is (generation == 10)
+
+
+def test_native_fallback_interrupt_does_not_reserve_successor_liveness_claim():
+    agent = _bare_agent()
+    _bind_native_turn(agent, "B")
+    agent._turn_liveness_abort_claim = "B claim"
+    receipt = agent.interrupt(expected_turn_id="A", require_generation=10)
+    assert (receipt.accepted, receipt.turn_id, receipt.changed) == (False, None, True)
+    assert agent._turn_liveness_abort_claim == "B claim"
+    assert not agent._interrupt_requested
+
+
+def test_native_fallback_interrupt_revalidates_generation_after_compression_fence_wait():
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    activity_lock = threading.Lock()
+    agent._liveness_activity_lock = lambda: activity_lock
+    agent._turn_liveness_activity_generation = 10
+    class Fence:
+        commit_in_flight = True
+        def cancel_before_commit(self):
+            with activity_lock:
+                agent._turn_liveness_activity_generation = 11
+                agent._turn_liveness_abort_claim = None
+    agent._active_compression_commit_fence = Fence()
+    receipt = agent.interrupt(expected_turn_id="A", require_generation=10, hard_cancel=True)
+    assert (receipt.accepted, receipt.turn_id, receipt.changed) == (False, None, False)
+    assert not agent._interrupt_requested
+
+
+@pytest.mark.parametrize("hook", [False, True])
+def test_native_fallback_interrupt_external_codex_never_claims_native_binding(hook):
+    agent = _bare_agent()
+    _bind_native_turn(agent, "A")
+    agent.api_mode = "codex_app_server"
+    calls = []
+    if hook:
+        agent._codex_session = SimpleNamespace(request_interrupt=lambda: calls.append("external stop"))
+    receipt = agent.interrupt(expected_turn_id="A")
+    assert (receipt.accepted, receipt.turn_id, receipt.changed) == (True, None, False)
+    assert calls == (["external stop"] if hook else [])
+    assert agent._interrupt_requested
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_external_codex_redirect_keeps_boolean_behavior_without_native_binding(accepted):
+    agent = _bare_agent()
+    agent.api_mode = "codex_app_server"
+    seen = []
+    agent._codex_session = SimpleNamespace(request_steer=lambda text: seen.append(text) or accepted)
+    assert agent.redirect(" legacy ") is accepted
+    receipt = agent.redirect(" fenced ", expected_turn_id="A")
+    assert (receipt.accepted, receipt.turn_id, receipt.changed) == (accepted, None, False)
+    assert seen == ["legacy", "fenced"]
+    assert agent._pending_redirect is None and agent._pending_steer is None
+
+
+@pytest.mark.parametrize("rollover", [False, True], ids=["completed-A", "late-A-finally"])
+@pytest.mark.parametrize("raises", [False, True], ids=["return", "raise"])
+def test_facade_exit_seals_only_its_native_correction_authority(monkeypatch, rollover, raises):
+    from agent import conversation_loop, relay_runtime
+    from agent.turn_context import _bind_turn_identity
+
+    agent = _bare_agent()
+    agent.session_id = "correction-fixture"
+    agent.platform = "tui"
+    agent.model = "fixture"
+    agent._session_db = None
+    agent._persist_disabled = True
+    agent._conversation_root_id = lambda: agent.session_id
+    agent._reset_activity_labels_after_turn = lambda: None
+    coordinator = SimpleNamespace(
+        register_session_initializer=lambda *args, **kw: None,
+        acquire_conversation=lambda **kw: object(),
+        begin_turn=lambda *args, **kw: SimpleNamespace(relay_enabled=False),
+        finish_logical_calls=lambda *args, **kw: None,
+        end_turn=lambda *args, **kw: None,
+        release_conversation=lambda *args: None)
+    monkeypatch.setattr(relay_runtime, "SESSION_COORDINATOR", coordinator)
+    monkeypatch.setattr("agent.relay_cwd.resolve_relay_scope_cwds", lambda *args: ("", ""))
+
+    def loop(agent, *args, **kw):
+        _bind_turn_identity(agent, "task", None, None, None, None)
+        assert agent.steer("A inside", expected_turn_id="A").turn_id == "A"
+        agent._drain_pending_steer()
+        if rollover:
+            _bind_native_turn(agent, "B")
+        if raises:
+            raise ValueError("controlled turn failure")
+        return {"final_response": "done", "messages": []}
+
+    monkeypatch.setattr(conversation_loop, "run_conversation", loop)
+    if raises:
+        with pytest.raises(ValueError, match="controlled turn failure"):
+            agent.run_conversation("ask", task_id="task", turn_id="A")
+    else:
+        agent.run_conversation("ask", task_id="task", turn_id="A")
+    for method, tools in [("steer", False), ("redirect", False), ("redirect", True)]:
+        agent._executing_tools = tools
+        agent._model_request_active.set()
+        receipt = getattr(agent, method)("after A", expected_turn_id="B" if rollover else "A")
+        assert (receipt.accepted, receipt.turn_id, receipt.changed) == (
+            (True, "B", False) if rollover else (False, None, True))
+    if not rollover:
+        assert agent._pending_steer is None and agent._pending_redirect is None
+        assert not agent._interrupt_requested
 
 
 

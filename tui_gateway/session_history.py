@@ -386,16 +386,30 @@ def _inflight_text(value: Any) -> str:
 def _start_inflight_turn(
     session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    turn_id: str | None = None,
 ) -> None:
+    from agent.turn_facade import allocate_turn_id
+    if turn_id is None and not _session_uses_compute_host(session):
+        turn_id = allocate_turn_id(
+            str(getattr(session.get("agent"), "session_id", "") or session.get("session_key") or ""),
+            str(session.get("session_key") or ""))
     now = time.time()
     turn = {
         "assistant": "", "started_at": now, "streaming": True, "updated_at": now,
+        "observation_started_ns": time.monotonic_ns(),
         "user": _inflight_text(text),
     }
+    if turn_id:
+        turn["turn_id"] = turn_id
     if display_kind:
         turn["display_kind"] = display_kind
     if isinstance(display_metadata, dict):
         turn["display_metadata"] = dict(display_metadata)
+    if (session.get("inflight_turn") or {}).get("turn_id") != turn_id:
+        # Only the current execution needs pending previews and tool timings.
+        # Late callbacks carry their copied native owner and cannot refill these.
+        for key in ("edit_snapshots", "tool_result_metadata", "tool_started_at"):
+            session.pop(key, None)
     session["inflight_turn"] = turn
 
 

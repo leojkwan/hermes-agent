@@ -7,6 +7,7 @@ and voice / wake-word control (``methods_voice.py``).
 
 from __future__ import annotations
 
+from typing import Literal
 from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
@@ -71,6 +72,8 @@ class PromptSubmitResult(Result):
     survivor_user_row_ids: list[int | None] | None = None
     survivor_row_id_map: dict[str, int | None] | None = None
     turn_isolation: bool | None = None
+    turn_id: str | None = None
+    turn_binding: Literal["reserved", "shared", "active", "none"] | None = None
 
 
 method("prompt.submit", params=PromptSubmitParams, result=PromptSubmitResult,
@@ -227,6 +230,8 @@ class TaskIdResult(Result):
     this ``task_id``."""
 
     task_id: str
+    turn_id: str | None = None
+    turn_binding: Literal["reserved", "none"] | None = None
 
 
 method("prompt.background", params=SideAgentParams, result=TaskIdResult,

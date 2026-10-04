@@ -396,7 +396,7 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, _session, text, **_kwargs: inline_calls.append((rid, sid, text)),
+        lambda rid, sid, _session, text, **_kwargs: inline_calls.append((rid, sid, text, _kwargs.get("turn_id"))),
     )
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
@@ -414,9 +414,10 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     assert resp == {
         "jsonrpc": "2.0",
         "id": "fallback-turn",
-        "result": {"status": "streaming"},
+        "result": {"status": "streaming", "turn_binding": "reserved", "turn_id": resp["result"]["turn_id"]},
     }
-    assert inline_calls == [("fallback-turn", "iso-fallback", "hello")]
+    assert resp["result"]["turn_id"].startswith("session-key:session-key:")
+    assert inline_calls == [("fallback-turn", "iso-fallback", "hello", resp["result"]["turn_id"])]
     assert session.get("_compute_host_active") is not True
 
 
@@ -740,7 +741,19 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         finally:
             server._sessions.pop("sid", None)
 
-    assert run_flag_on() == run_flag_off()
+    def transcript_frames(frames):
+        # The isolated route has no admitted native progress. Its conversation output stays equivalent.
+        result = []
+        for event, sid, payload in frames:
+            if event == "turn.progress":
+                continue
+            if isinstance(payload, dict):
+                payload = {key: value for key, value in payload.items() if key != "turn_id"}
+            if event == "message.start" and not payload:
+                payload = None
+            result.append((event, sid, payload))
+        return result
+    assert transcript_frames(run_flag_on()) == transcript_frames(run_flag_off())
 
 
 def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
@@ -4926,6 +4939,342 @@ def _session(agent=None, **extra):
         "tool_progress_mode": "all",
         **extra,
     }
+
+
+def _fallback_native_agent():
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent.session_id = "fallback-native"
+    agent._persist_disabled = True
+    agent._pending_steer = None
+    agent._pending_steer_lock = threading.Lock()
+    agent._pending_redirect = None
+    agent._pending_redirect_lock = threading.Lock()
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._interrupt_thread_signal_pending = False
+    agent._hard_interrupt_requested = threading.Event()
+    agent._model_request_active = threading.Event()
+    agent._executing_tools = False
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent._execution_thread_id = 472001
+    agent._tool_worker_threads = {472002}
+    agent._tool_worker_threads_lock = threading.Lock()
+    agent._supports_active_turn_redirect = True
+    agent.api_mode = "chat_completions"
+    agent.quiet_mode = True
+    return agent
+
+
+def _bind_fallback_native_turn(agent, turn_id):
+    from contextvars import copy_context
+    from agent.turn_context import _bind_turn_identity
+    from agent.turn_facade import native_turn_context
+
+    def bind():
+        token = native_turn_context.set((turn_id, 0))
+        try:
+            agent._relay_pending_turn_id = turn_id
+            _bind_turn_identity(agent, "task", None, None, None, None)
+        finally:
+            native_turn_context.reset(token)
+    copy_context().run(bind)
+
+
+@pytest.mark.parametrize("rollover", ["redirect-rejected", "delayed-worker", "none"])
+def test_busy_fallback_interrupt_stays_with_original_native_turn(monkeypatch, rollover):
+    from tools.interrupt import is_thread_interrupted, is_thread_yield_requested, set_interrupt
+
+    agent = _fallback_native_agent()
+    _bind_fallback_native_turn(agent, "A")
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "A ask", turn_id="A")
+    server._sessions["native-fallback"] = session
+    aborts, pending = [], []
+    agent._active_request_abort = lambda reason: aborts.append(("A", reason))
+
+    def bind_successor():
+        _bind_fallback_native_turn(agent, "B")
+        server._start_inflight_turn(session, "B ask", turn_id="B")
+        agent._pending_steer = "B steer"
+        agent._pending_redirect = "B redirect"
+        agent._execution_thread_id = 472003
+        agent._tool_worker_threads = {472004}
+        agent._active_request_abort = lambda reason: aborts.append(("B", reason))
+
+    class AfterRejectLock:
+        def __init__(self, lock):
+            self.lock, self.used = lock, False
+        def __enter__(self):
+            return self.lock.__enter__()
+        def __exit__(self, *args):
+            result = self.lock.__exit__(*args)
+            if not self.used:
+                self.used = True
+                bind_successor()
+            return result
+
+    class ControlledThread:
+        def __init__(self, target=None, **kw):
+            self.target = target
+        def start(self):
+            if rollover == "delayed-worker":
+                pending.append(self.target)
+            else:
+                self.target()
+
+    if rollover == "redirect-rejected":
+        agent._pending_redirect_lock = AfterRejectLock(agent._pending_redirect_lock)
+    monkeypatch.setattr(server.threading, "Thread", ControlledThread)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    try:
+        response = server.handle_request({"id": "new-input", "method": "prompt.submit", "params": {
+            "session_id": "native-fallback", "text": "queued input"}})
+        assert response["result"]["status"] == "queued"
+        reservation = response["result"]["turn_id"]
+        assert reservation not in {"A", "B"}
+        assert response["result"]["turn_binding"] == "reserved"
+        assert session["queued_prompt"]["turn_id"] == reservation
+        assert session["queued_prompt"]["text"] == "queued input"
+        if rollover == "delayed-worker":
+            assert len(pending) == 1
+            bind_successor()
+            pending.pop()()
+        if rollover != "none":
+            assert not agent._interrupt_requested and agent._interrupt_message is None
+            assert agent._pending_steer == "B steer" and agent._pending_redirect == "B redirect"
+            assert not agent._hard_interrupt_requested.is_set()
+            assert not is_thread_interrupted(472003) and not is_thread_interrupted(472004)
+            assert not is_thread_yield_requested(472004)
+            assert aborts == []
+        else:
+            assert agent._interrupt_requested
+            assert is_thread_interrupted(472001) and is_thread_interrupted(472002)
+            assert aborts == [("A", "interrupt_abort")]
+    finally:
+        server._sessions.pop("native-fallback", None)
+        for tid in (472001, 472002, 472003, 472004):
+            set_interrupt(False, tid)
+
+
+def test_busy_fallback_legacy_interrupt_remains_unqualified(monkeypatch):
+    calls = []
+    agent = types.SimpleNamespace(interrupt=lambda: calls.append("legacy stop"))
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "legacy ask", turn_id="legacy-reservation")
+    class ImmediateThread:
+        def __init__(self, target=None, **kw):
+            self.target = target
+        def start(self):
+            self.target()
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    response = server._handle_busy_submit("input", "legacy-fallback", session, "next", None)
+    assert calls == ["legacy stop"]
+    assert response["result"]["status"] == "queued"
+    assert response["result"]["turn_id"] != "legacy-reservation"
+
+
+@pytest.mark.parametrize("method", ["prompt.submit", "session.steer", "session.redirect"])
+def test_correction_ack_keeps_the_accepted_native_turn_during_rollover(monkeypatch, method):
+    session = _session(running=True)
+    def accept_and_roll_over(text, *, expected_turn_id=None):
+        from agent.interrupt_control import CorrectionReceipt
+        server._start_inflight_turn(session, "next ask")
+        return CorrectionReceipt(True, expected_turn_id)
+    session["agent"] = types.SimpleNamespace(
+        steer=accept_and_roll_over, redirect=accept_and_roll_over,
+        _supports_active_turn_redirect=True)
+    server._start_inflight_turn(session, "first ask")
+    first_id = session["inflight_turn"]["turn_id"]
+    server._sessions["identity-rollover"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    try:
+        response = server.handle_request({"id": "same-rid", "method": method, "params": {
+            "session_id": "identity-rollover", "text": "correct first ask"}})
+        assert response["result"]["turn_id"] == first_id
+        assert response["result"]["turn_binding"] == "active"
+        assert session["inflight_turn"]["turn_id"] != first_id
+        assert session["inflight_turn"].get("corrections") is None
+    finally:
+        server._sessions.pop("identity-rollover", None)
+
+
+def test_native_identity_survives_final_before_ack_and_reused_rid(monkeypatch):
+    import contextvars
+    observed_ids, emissions = [], []
+    class Agent:
+        session_id = "native-session"
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None,
+                             task_id=None, turn_id=None, **kwargs):
+            observed_ids.append(turn_id)
+            self._stream_callback = stream_callback
+            if len(observed_ids) == 1:
+                self.previous_context = contextvars.copy_context()
+            else:
+                # A late SDK worker resolves B's mutable callback, carrying A's copied context.
+                self.previous_context.run(lambda: self._stream_callback("foreign A text"))
+            stream_callback("preview")
+            return {"final_response": "answer", "messages": [
+                {"role": "user", "content": prompt}, {"role": "assistant", "content": "answer"}]}
+    class ImmediateThread:
+        def __init__(self, target=None, **kwargs):
+            self.target = target
+        def start(self):
+            self.target()
+    session = _session(agent=Agent())
+    server._sessions["native-ack"] = session
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *args: (
+        types.SimpleNamespace(set=lambda: None), types.SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "render_message", lambda *args: "")
+    monkeypatch.setattr(server, "_emit", lambda *args: emissions.append(args))
+    try:
+        response = server.handle_request({"id": "reused", "method": "prompt.submit", "params": {
+            "session_id": "native-ack", "text": "first ask"}})
+        first_id = response["result"]["turn_id"]
+        assert response["result"]["turn_binding"] == "reserved"
+        assert observed_ids == [first_id]
+        first_frames = [frame for frame in emissions if frame[0] in {
+            "message.start", "message.delta", "message.complete"}]
+        assert [frame[0] for frame in first_frames] == ["message.start", "message.delta", "message.complete"]
+        assert all(frame[2]["turn_id"] == first_id for frame in first_frames)
+        session["running"] = True
+        assert server._run_prompt_submit("reused", "native-ack", session, "synthetic follow-on")
+        second_id = observed_ids[1]
+        assert second_id and second_id != first_id
+        assert [frame[2]["turn_id"] for frame in emissions if frame[0] == "message.complete"] == [
+            first_id, second_id]
+        assert [frame[2]["text"] for frame in emissions if frame[0] == "message.delta"] == ["preview", "preview"]
+    finally:
+        server._sessions.pop("native-ack", None)
+
+
+def test_abandoned_sequential_worker_cannot_resolve_the_next_turn_callbacks(monkeypatch):
+    from agent import tool_executor
+    from agent.turn_facade import native_turn_context
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    emits = []
+    agent = types.SimpleNamespace(
+        quiet_mode=True, verbose_logging=False, _checkpoint_mgr=types.SimpleNamespace(enabled=False),
+        _touch_activity=lambda *args: None, _tool_worker_threads_lock=threading.Lock(),
+        _tool_worker_threads=set(), _interrupt_requested=False, _current_turn_id="A",
+        _emit_event=lambda *args, **kwargs: None)
+    for name, callback in server._agent_cbs("late-native-tool").items():
+        setattr(agent, name, callback)
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "A", turn_id="A")
+    server._sessions["late-native-tool"] = session
+    def delayed_producer(worker_agent, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        try:
+            ref = tool_executor._ToolCallRef("terminal", {"command": "private input"}, "task", "reused-tool", [])
+            tool_executor._begin_tool_execution(worker_agent, ref, None)
+            tool_executor._emit_tool_complete_and_risk(worker_agent, ref, "private result", None, False)
+            return tool_executor._ManagedToolResult("done", {}, [], False, True)
+        finally:
+            finished.set()
+    monkeypatch.setattr(tool_executor, "_run_agent_tool_execution_middleware", delayed_producer)
+    monkeypatch.setattr(tool_executor, "_resolve_sequential_tool_timeout", lambda: 1.0)
+    def abandon(*args):
+        assert entered.wait(5)
+        return "timeout", None
+    monkeypatch.setattr(tool_executor, "_poll_sequential_future", abandon)
+    monkeypatch.setattr(tool_executor, "_interrupt_worker_tids", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    token = native_turn_context.set(("A", time.monotonic_ns()))
+    try:
+        tool_executor._run_sequential_tool_execution_middleware(agent, function_name="terminal",
+            function_args={}, effective_task_id="task", tool_call_id="reused-tool", execute=lambda *args: None)
+    finally:
+        native_turn_context.reset(token)
+    try:
+        server._start_inflight_turn(session, "B", turn_id="B")
+        agent._current_turn_id = "B"
+        for name, callback in server._agent_cbs("late-native-tool").items():
+            setattr(agent, name, callback)
+        emits.clear()
+        release.set()
+        assert finished.wait(5)
+        assert emits == []
+        assert session.get("tool_started_at", {}) == {}
+        assert session.get("tool_result_metadata", {}) == {}
+    finally:
+        release.set()
+        assert finished.wait(5)
+        server._sessions.pop("late-native-tool", None)
+
+
+@pytest.mark.parametrize("observer_fails", [False, True])
+def test_background_native_progress_and_preview_stay_with_their_task(monkeypatch, observer_fails):
+    gates = {name: threading.Event() for name in ("first", "second")}
+    done = {name: threading.Event() for name in ("first", "second")}
+    frames, closes = [], []
+    class Agent:
+        def __init__(self, **kwargs):
+            self.tool_start_callback = self.tool_complete_callback = self.event_callback = None
+            self.interim_assistant_callback = None
+        def run_conversation(self, user_message, task_id, turn_id=None, stream_callback=None, **kwargs):
+            assert gates[user_message].wait(5)
+            if self.tool_start_callback:
+                self.tool_start_callback("shared-tool-id", "terminal", {"command": "private args"})
+            if stream_callback:
+                stream_callback("draft " + user_message)
+            if self.interim_assistant_callback:
+                self.interim_assistant_callback("commentary " + user_message, already_streamed=False)
+            if self.tool_complete_callback:
+                self.tool_complete_callback("shared-tool-id", "terminal", {}, "private result")
+            return {"final_response": "answer " + user_message}
+        def close(self):
+            closes.append(self)
+    session = _session(agent=types.SimpleNamespace(), tool_started_at={"parent": 42.0})
+    server._sessions["background-native"] = session
+    monkeypatch.setattr(server, "_sess", lambda *args: (session, None))
+    monkeypatch.setattr(server, "_background_agent_kwargs", lambda *args: {})
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=Agent))
+    def emit(event, sid, payload=None):
+        if observer_fails and event == "turn.progress":
+            raise RuntimeError("observer unavailable")
+        frames.append((event, sid, payload))
+        if event == "background.complete":
+            done[payload["text"].removeprefix("answer ")].set()
+    monkeypatch.setattr(server, "_emit", emit)
+    try:
+        acks = {name: server._methods["prompt.background"](name, {
+            "session_id": "background-native", "text": name})["result"] for name in gates}
+        snapshot = server._turn_observation_snapshot(session)
+        assert {entry["turn_id"] for entry in snapshot["background_turns"]} == {
+            ack["turn_id"] for ack in acks.values()}
+        gates["second"].set()
+        assert done["second"].wait(5)
+        gates["first"].set()
+        assert done["first"].wait(5)
+        for name, ack in acks.items():
+            own = [frame for frame in frames if (frame[2] or {}).get("task_id") == ack["task_id"]]
+            assert all(frame[2]["turn_id"] == ack["turn_id"] for frame in own)
+            assert [frame[2]["text"] for frame in own if frame[0] == "background.delta"] == ["draft " + name]
+            assert [frame[2]["text"] for frame in own if frame[0] == "background.interim"] == ["commentary " + name]
+            assert [frame[2]["text"] for frame in own if frame[0] == "background.complete"] == ["answer " + name]
+            progress = [frame[2] for frame in own if frame[0] == "turn.progress"]
+            if not observer_fails:
+                tools = [payload for payload in progress if payload["stage"] == "tool"]
+                assert [payload["state"] for payload in tools] == ["start", "end"]
+                assert tools[-1]["duration_ms"] >= 0 and tools[-1]["outcome"] == "unknown"
+                assert all("args" not in payload and "result" not in payload and "text" not in payload for payload in progress)
+        assert not any(frame[0].startswith("message.") for frame in frames)
+        assert session["tool_started_at"] == {"parent": 42.0}
+    finally:
+        for gate in gates.values():
+            gate.set()
+        for event in done.values():
+            assert event.wait(5)
+        server._sessions.pop("background-native", None)
 
 
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
@@ -12917,6 +13266,7 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
     assert resp["result"] == {
         "status": "redirected",
         "text": "use Postgres",
+        "turn_binding": "none",
     }
     assert calls == ["use Postgres"]
     # The correction is recorded alongside the prompt that started the turn,
@@ -13005,7 +13355,10 @@ def test_session_redirect_build_window_scrubs_stale_p_when_queuing_q():
     finally:
         server._sessions.pop("sid", None)
 
-    assert resp["result"] == {"status": "queued", "text": "correction Q"}
+    assert resp["result"]["status"] == "queued"
+    assert resp["result"]["text"] == "correction Q"
+    assert resp["result"]["turn_binding"] == "reserved"
+    assert resp["result"]["turn_id"] == session["queued_prompt"]["turn_id"]
     assert session["queued_prompt"]["text"] == "correction Q"
     assert not session.get("queued_prompts")
 
@@ -13129,7 +13482,10 @@ def test_session_redirect_queues_during_agent_build_window(monkeypatch):
     finally:
         server._sessions.pop("sid", None)
 
-    assert resp["result"] == {"status": "queued", "text": "wait, use SQLite"}
+    assert resp["result"]["status"] == "queued"
+    assert resp["result"]["text"] == "wait, use SQLite"
+    assert resp["result"]["turn_binding"] == "reserved"
+    assert resp["result"]["turn_id"] == session["queued_prompt"]["turn_id"]
     assert session["queued_prompt"]["text"] == "wait, use SQLite"
 
 
@@ -17915,11 +18271,14 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
 
         inflight = resp["result"].get("inflight")
-        assert inflight == {
+        assert {key: inflight[key] for key in ("assistant", "streaming", "user")} == {
             "assistant": "partial answer",
             "streaming": True,
             "user": "write a long answer",
         }
+        assert inflight["turn_id"] == submit["result"]["turn_id"]
+        assert inflight["progress_available"] is True
+        assert all(progress["turn_id"] == inflight["turn_id"] for progress in inflight["progress"])
         turn_started_at = resp["result"]["turn_started_at"]
         assert turn_started_at == server._sessions["sid-live"]["inflight_turn"]["started_at"]
         assert turn_started_at > 0
@@ -17949,9 +18308,8 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
 def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     """A full client restart must recover an accepted next-turn prompt.
 
-    Busy prompts are intentionally not durable until they drain. Their only
-    authoritative copy is ``queued_prompt``, so the live projection must expose
-    that copy without leaking the transport object.
+    The live projection exposes the accepted queue's native reservation without
+    leaking its transport object; transcript durability is tested separately.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
@@ -17980,7 +18338,9 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
             }
         )
 
-        assert activated["result"]["queued"] == {"user": "newest prompt"}
+        assert activated["result"]["queued"] == {
+            "user": "newest prompt", "turn_id": queued["result"]["turn_id"]}
+        assert activated["result"]["queued_turns"][0]["turn_id"] == queued["result"]["turn_id"]
         assert "transport" not in activated["result"]["queued"]
     finally:
         server._sessions.pop("sid-live", None)

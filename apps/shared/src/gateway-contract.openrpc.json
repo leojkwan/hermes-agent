@@ -5416,6 +5416,90 @@
         "title": "AutoReloadCardKind",
         "type": "string"
       },
+      "BackgroundDeltaPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "turn_id",
+          "text"
+        ],
+        "title": "BackgroundDeltaPayload",
+        "type": "object"
+      },
+      "BackgroundInterimPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "already_streamed": {
+            "default": false,
+            "title": "Already Streamed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "task_id",
+          "turn_id",
+          "text"
+        ],
+        "title": "BackgroundInterimPayload",
+        "type": "object"
+      },
+      "BackgroundTurnObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "progress": {
+            "items": {
+              "$ref": "#/components/schemas/TurnProgressPayload"
+            },
+            "title": "Progress",
+            "type": "array"
+          },
+          "available": {
+            "default": true,
+            "title": "Available",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "task_id",
+          "turn_id"
+        ],
+        "title": "BackgroundTurnObservation",
+        "type": "object"
+      },
       "BatteryCategory": {
         "description": "``agent/battery.py::battery_category`` colour bucket.",
         "enum": [
@@ -13610,6 +13694,18 @@
           "message": {
             "title": "Message",
             "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           }
         },
         "required": [
@@ -16237,6 +16333,45 @@
             "title": "User",
             "type": "string"
           },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TurnProgressPayload"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Progress"
+          },
+          "progress_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Progress Available"
+          },
           "display_kind": {
             "anyOf": [
               {
@@ -18550,6 +18685,18 @@
               }
             ],
             "default": null
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           }
         },
         "title": "MessageCompletePayload",
@@ -18566,6 +18713,18 @@
           "already_streamed": {
             "title": "Already Streamed",
             "type": "boolean"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           }
         },
         "required": [
@@ -18741,6 +18900,25 @@
           "role"
         ],
         "title": "MessageReactionPayload",
+        "type": "object"
+      },
+      "MessageStartPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          }
+        },
+        "title": "MessageStartPayload",
         "type": "object"
       },
       "MoaAggregatingPayload": {
@@ -26442,6 +26620,36 @@
             ],
             "default": null,
             "title": "Turn Isolation"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
+          "turn_binding": {
+            "anyOf": [
+              {
+                "enum": [
+                  "reserved",
+                  "shared",
+                  "active",
+                  "none"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Binding"
           }
         },
         "title": "PromptSubmitResult",
@@ -26463,6 +26671,18 @@
           "user": {
             "title": "User",
             "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           }
         },
         "required": [
@@ -28402,6 +28622,60 @@
             ],
             "default": null
           },
+          "queued_turns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/QueuedPrompt"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Queued Turns"
+          },
+          "queued_turns_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Queued Turns Available"
+          },
+          "background_turns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTurnObservation"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Background Turns"
+          },
+          "background_turns_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Background Turns Available"
+          },
           "pending_approval": {
             "anyOf": [
               {
@@ -29610,6 +29884,36 @@
       "SessionCorrectionResult": {
         "additionalProperties": false,
         "properties": {
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
+          "turn_binding": {
+            "anyOf": [
+              {
+                "enum": [
+                  "reserved",
+                  "shared",
+                  "active",
+                  "none"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Binding"
+          },
           "status": {
             "$ref": "#/components/schemas/CorrectionStatus"
           },
@@ -31420,6 +31724,60 @@
             ],
             "default": null
           },
+          "queued_turns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/QueuedPrompt"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Queued Turns"
+          },
+          "queued_turns_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Queued Turns Available"
+          },
+          "background_turns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTurnObservation"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Background Turns"
+          },
+          "background_turns_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Background Turns Available"
+          },
           "pending_approval": {
             "anyOf": [
               {
@@ -33064,6 +33422,18 @@
             "title": "Task Id",
             "type": "string"
           },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
           "text": {
             "title": "Text",
             "type": "string"
@@ -34175,6 +34545,18 @@
             ],
             "default": null,
             "title": "Verbose"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           }
         },
         "required": [
@@ -35623,6 +36005,34 @@
           "task_id": {
             "title": "Task Id",
             "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
+          "turn_binding": {
+            "anyOf": [
+              {
+                "enum": [
+                  "reserved",
+                  "none"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Binding"
           }
         },
         "required": [
@@ -35814,6 +36224,18 @@
             "title": "Tool Id",
             "type": "string"
           },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -35938,6 +36360,18 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           }
         },
         "required": [
@@ -36086,6 +36520,18 @@
           "tool_id": {
             "title": "Tool Id",
             "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
           },
           "name": {
             "title": "Name",
@@ -36740,6 +37186,160 @@
           "role"
         ],
         "title": "TranscriptMessage",
+        "type": "object"
+      },
+      "TurnProgressPayload": {
+        "additionalProperties": false,
+        "description": "Observed native boundaries; elapsed time alone never manufactures progress.",
+        "properties": {
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task Id"
+          },
+          "stage": {
+            "enum": [
+              "admission",
+              "ready_wait",
+              "context",
+              "request_prepare",
+              "backend_call",
+              "output_observed",
+              "visible_text",
+              "tool",
+              "observation"
+            ],
+            "title": "Stage",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "start",
+              "end",
+              "observed",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "elapsed_ms": {
+            "minimum": 0,
+            "title": "Elapsed Ms",
+            "type": "number"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Duration Ms"
+          },
+          "api_request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Api Request Id"
+          },
+          "retry_count": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retry Count"
+          },
+          "iteration": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Iteration"
+          },
+          "tool_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Name"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "returned",
+                  "raised",
+                  "refused",
+                  "interrupted",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Outcome"
+          }
+        },
+        "required": [
+          "turn_id",
+          "stage",
+          "state",
+          "elapsed_ms"
+        ],
+        "title": "TurnProgressPayload",
         "type": "object"
       },
       "TurnStatus": {
@@ -39400,6 +40000,30 @@
       ]
     },
     {
+      "name": "background.delta",
+      "summary": "Provisional background answer text, outside the foreground stream.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/BackgroundDeltaPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "background.interim",
+      "summary": "Provisional background commentary; never completion or speech.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/BackgroundInterimPayload"
+          }
+        }
+      ]
+    },
+    {
       "name": "billing.step_up.verification",
       "summary": "Device-flow URL + code for the billing scope step-up; the client opens the browser.",
       "params": [
@@ -39641,13 +40265,12 @@
     },
     {
       "name": "message.start",
-      "summary": "A turn began streaming; no payload.",
+      "summary": "A turn began streaming; native identity when available.",
       "params": [
         {
           "name": "payload",
           "schema": {
-            "type": "object",
-            "additionalProperties": false
+            "$ref": "#/components/schemas/MessageStartPayload"
           }
         }
       ]
@@ -40212,6 +40835,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/ToolStartPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "turn.progress",
+      "summary": "An observed native execution phase or tool boundary.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/TurnProgressPayload"
           }
         }
       ]

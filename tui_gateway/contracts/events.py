@@ -15,6 +15,7 @@ closed, so a drifted emitter fails the suite (``registry.check_payload`` raises 
 
 from __future__ import annotations
 
+from typing import Literal
 from pydantic import Field
 
 from .base import JsonValue, Payload, WireEnum
@@ -88,6 +89,7 @@ class ErrorPayload(Payload):
     """Every ``_emit("error", …)`` site sets exactly ``message``."""
 
     message: str
+    turn_id: str | None = None
 
 
 event("error", ErrorPayload, doc="A session-level failure outside a turn (agent init, model switch, compression, resume).")
@@ -105,7 +107,11 @@ event("notice", NoticePayload, doc="Informational one-liner for the session (cap
 # ── turn stream ───────────────────────────────────────────────────────────────────────────────
 
 
-event("message.start", None, doc="A turn began streaming; no payload.")
+class MessageStartPayload(Payload):
+    turn_id: str | None = None
+
+
+event("message.start", MessageStartPayload, doc="A turn began streaming; native identity when available.")
 
 
 class StreamDeltaPayload(Payload):
@@ -116,6 +122,7 @@ class StreamDeltaPayload(Payload):
     text: str
     rendered: str | None = None
     verbose: bool | None = None
+    turn_id: str | None = None
 
 
 event("message.delta", StreamDeltaPayload, doc="One streamed chunk of the assistant reply.")
@@ -129,10 +136,31 @@ class MessageInterimPayload(Payload):
 
     text: str
     already_streamed: bool
+    turn_id: str | None = None
 
 
 event("message.interim", MessageInterimPayload,
       doc="Interim assistant commentary (text beside tool calls) sealed as its own segment.")
+
+
+class TurnProgressPayload(Payload):
+    """Observed native boundaries; elapsed time alone never manufactures progress."""
+    turn_id: str
+    task_id: str | None = None
+    stage: Literal["admission", "ready_wait", "context", "request_prepare", "backend_call",
+                   "output_observed", "visible_text", "tool", "observation"]
+    state: Literal["start", "end", "observed", "unavailable"]
+    elapsed_ms: float = Field(ge=0, allow_inf_nan=False)
+    duration_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    api_request_id: str | None = None
+    retry_count: int | None = Field(default=None, ge=0)
+    iteration: int | None = Field(default=None, ge=0)
+    tool_id: str | None = None
+    name: str | None = None
+    outcome: Literal["returned", "raised", "refused", "interrupted", "unknown"] | None = None
+
+
+event("turn.progress", TurnProgressPayload, doc="An observed native execution phase or tool boundary.")
 
 
 class TurnStatus(WireEnum):
@@ -201,6 +229,7 @@ class MessageCompletePayload(Payload):
     error_surface: ErrorSurface | None = None
     partial: bool | None = None
     persisted_turn: PersistedTurn | None = None
+    turn_id: str | None = None
 
 
 event("message.complete", MessageCompletePayload, doc="The turn ended: final text, usage and outcome.")
@@ -262,6 +291,7 @@ class ToolStartPayload(Payload):
     because tool.start rows may pass through connector redaction unchanged."""
 
     tool_id: str
+    turn_id: str | None = None
     name: str
     context: str | None = None
     args: dict[str, JsonValue] | None = None
@@ -277,6 +307,7 @@ class ToolCompletePayload(Payload):
     """``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools."""
 
     tool_id: str
+    turn_id: str | None = None
     name: str
     args: dict[str, JsonValue] | None = None  # mirrored child rows / room relays omit it
     duration_s: float | None = None
@@ -296,6 +327,7 @@ class ToolGeneratingPayload(Payload):
     """``agent_callbacks`` tool_gen_callback."""
 
     name: str
+    turn_id: str | None = None
 
 
 event("tool.generating", ToolGeneratingPayload, doc="The model is emitting a tool call's arguments.")
@@ -442,11 +474,26 @@ class SideAgentCompletePayload(Payload):
     """``methods_prompt._spawn_side_agent``: ``{task_id, **extra, text}``; btw adds ``question``."""
 
     task_id: str
+    turn_id: str | None = None
     text: str
     question: str | None = None
 
 
 event("background.complete", SideAgentCompletePayload, doc="A /background side agent finished.")
+
+
+class BackgroundDeltaPayload(Payload):
+    task_id: str
+    turn_id: str
+    text: str
+
+
+class BackgroundInterimPayload(BackgroundDeltaPayload):
+    already_streamed: bool = False
+
+
+event("background.delta", BackgroundDeltaPayload, doc="Provisional background answer text, outside the foreground stream.")
+event("background.interim", BackgroundInterimPayload, doc="Provisional background commentary; never completion or speech.")
 event("btw.complete", SideAgentCompletePayload, doc="A /btw side question was answered.")
 event("preview.restart.complete", SideAgentCompletePayload, doc="The hidden preview-restart agent finished.")
 

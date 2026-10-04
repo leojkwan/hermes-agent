@@ -36,6 +36,7 @@ from agent.surface_switch import (
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_facade import observe_turn_phase
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
 from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
@@ -1510,7 +1511,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         if _ng.action == "break":
             return None
         try:
-            _run_phase(build_api_request, agent, s)
+            with observe_turn_phase(agent, "request_prepare", retry_count=s.retry_count, iteration=s.api_call_count):
+                _run_phase(build_api_request, agent, s)
             if _run_phase(perform_api_call, agent, s).action == "break":
                 return None
             _rc = _run_phase(check_api_response, agent, s)
@@ -1575,25 +1577,26 @@ def _run_conversation_turn(
 
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
-        _ctx = build_turn_context(
-            agent, user_message, system_message, conversation_history, task_id,
-            stream_callback, persist_user_message, persist_user_timestamp,
-            persist_user_display_kind=persist_user_display_kind,
-            persist_user_display_metadata=persist_user_display_metadata,
-            persist_user_platform_id=persist_user_platform_id,
-            turn_author=turn_author,
-            restore_or_build_system_prompt=_restore_or_build_system_prompt,
-            install_safe_stdio=_install_safe_stdio,
-            sanitize_surrogates=_sanitize_surrogates,
-            summarize_user_message_for_log=_summarize_user_message_for_log,
-            set_session_context=set_session_context,
-            set_current_write_origin=set_current_write_origin,
-            ra=_ra,
-            # MoA turns append per-call aggregated context to the API copy of the
-            # user message, so no byte-stable api_content sidecar can be stamped.
-            moa_active=bool(moa_config),
-            title_user_message=title_user_message,
-        )
+        with observe_turn_phase(agent, "context"):
+            _ctx = build_turn_context(
+                agent, user_message, system_message, conversation_history, task_id,
+                stream_callback, persist_user_message, persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_id=persist_user_platform_id,
+                turn_author=turn_author,
+                restore_or_build_system_prompt=_restore_or_build_system_prompt,
+                install_safe_stdio=_install_safe_stdio,
+                sanitize_surrogates=_sanitize_surrogates,
+                summarize_user_message_for_log=_summarize_user_message_for_log,
+                set_session_context=set_session_context,
+                set_current_write_origin=set_current_write_origin,
+                ra=_ra,
+                # MoA turns append per-call aggregated context to the API copy of the
+                # user message, so no byte-stable api_content sidecar can be stamped.
+                moa_active=bool(moa_config),
+                title_user_message=title_user_message,
+            )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
 
@@ -1636,8 +1639,9 @@ def _run_conversation_turn(
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
-        _run_phase(prepare_iteration, agent, s)
-        _run_phase(assemble_api_request, agent, s)
+        with observe_turn_phase(agent, "request_prepare", iteration=s.api_call_count):
+            _run_phase(prepare_iteration, agent, s)
+            _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
             return _pg.result

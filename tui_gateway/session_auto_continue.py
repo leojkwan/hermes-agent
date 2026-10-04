@@ -124,7 +124,6 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with _session_profile_runtime_scope(session):
                 def announce():
                     _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
-                    _emit("message.start", sid)
                 render_notification(announce, platform="tui", diagnostic=diagnostic)
                 _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
@@ -169,6 +168,11 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
         return existing
+    if not _session_uses_compute_host(session):
+        from agent.turn_facade import allocate_turn_id
+        queued["turn_id"] = allocate_turn_id(
+            str(getattr(session.get("agent"), "session_id", "") or session.get("session_key") or ""),
+            str(session.get("session_key") or ""))
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
     else:
@@ -221,7 +225,7 @@ def _ac_set_queue(session: dict, entries: list) -> None:
         session.pop("queued_prompts", None)
 
 
-def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
+def _interrupt_busy_session(sid: str, session: dict, agent: Any, turn_id: str | None = None) -> None:
     """Interrupt a busy turn on a worker thread, never under ``history_lock`` (some providers can't apply ``interrupt()``
     until a blocking call returns; inline it stalled ``session.resume``). At most one interrupt worker per session so
     repeated steering can't leak threads."""
@@ -236,27 +240,48 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     def interrupt() -> None:
         try:
             with contextlib.suppress(Exception):
-                agent.interrupt() if use_agent else _get_compute_host_supervisor().interrupt(sid)
+                if use_agent:
+                    callback = agent.interrupt
+                    try:
+                        parameters = inspect.signature(callback).parameters
+                    except (TypeError, ValueError):
+                        parameters = {}
+                    if turn_id and "expected_turn_id" in parameters:
+                        callback(expected_turn_id=turn_id)
+                    else:
+                        callback()  # legacy/external producers retain their unqualified control
+                else:
+                    _get_compute_host_supervisor().interrupt(sid)
         finally:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
-def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str) -> dict | None:
+def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str,
+                       affected: dict | None, turn_id: str | None) -> dict | None:
     """Apply ``agent.<method>(plain_text)`` (steer/redirect); on acceptance record the correction, scrub stale
     self-duplicates so the live turn's original text is not re-fired after settle, and return the ``status`` reply.
     None → caller falls through to the queue path."""
+    with session["history_lock"]:
+        if (not session.get("running") or session.get("agent") is not agent
+                or session.get("inflight_turn") is not affected):
+            return _CORRECTION_TURN_CHANGED
     try:
-        if not getattr(agent, method)(plain_text):
+        receipt = _invoke_bound_correction(agent, method, plain_text, turn_id)
+        if receipt.changed:
+            return _CORRECTION_TURN_CHANGED
+        if not receipt.accepted:
             return None
     except Exception:
         return None
     with session["history_lock"]:
-        _record_inflight_correction(session, plain_text)
-        _drop_queued_duplicates_of_inflight_user(session)
+        if session.get("inflight_turn") is affected:
+            _record_inflight_correction(session, plain_text)
+            _drop_queued_duplicates_of_inflight_user(session)
         session["last_active"] = time.time()
-    return _ok(rid, {"status": status})
+    return _ok(rid, {"status": status, "turn_binding": "active" if receipt.turn_id else "none",
+                     **({"turn_id": receipt.turn_id} if receipt.turn_id else {})})
 
 
 def _session_compression_in_flight(session: dict) -> bool:
@@ -402,7 +427,12 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
     after" message must NEVER become a live correction."""
     mode = "queue" if queued else _load_busy_input_mode()
-    agent = session.get("agent")
+    with session["history_lock"]:
+        if not session.get("running"):
+            return None
+        agent = session.get("agent")
+        affected = session.get("inflight_turn")
+        producer_turn_id = (affected or {}).get("turn_id")
     # Compression in flight demotes steer/interrupt to queue: a correction delivered
     # mid-compression aborts the compression instead of waiting for it (#61042). The
     # follow-up drains when compression finishes — the Discord-gateway contract.
@@ -415,6 +445,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
         if image_paths:
             session["attached_images"] = []  # claim now so a later paste isn't consumed when the turn yields
     plain_text = _coerce_message_text(text).strip() if not image_paths and _is_text_only_busy_payload(text) else ""
+    stale_target = False
     # Text-only corrections steer/redirect in place when supported; media payloads and older agents fall through to
     # the proven interrupt + queue path.
     if plain_text and agent is not None:
@@ -422,9 +453,13 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             "steer": hasattr(agent, "steer"),
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
         method, status = {"steer": ("steer", "steered"), "interrupt": ("redirect", "redirected")}.get(mode, (None, None))
-        if (method and supported[mode]
-                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status)) is not None):
-            return resp
+        if method and supported[mode]:
+            resp = _ac_try_correction(rid, session, agent, method, plain_text, status,
+                                      affected, producer_turn_id)
+            if resp is _CORRECTION_TURN_CHANGED:
+                stale_target = True
+            elif resp is not None:
+                return resp
     # Queue before asking the live turn to stop. Never call a provider/compute-host method under history_lock: an
     # interrupt can wait behind the op it cancels.
     with session["history_lock"]:
@@ -432,7 +467,18 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
+        stale_target = (stale_target or session.get("agent") is not agent
+                        or session.get("inflight_turn") is not affected)
+        prior_turn_ids = {entry.get("turn_id") for entry in
+            ([session.get("queued_prompt")] + list(session.get("queued_prompts") or []))
+            if entry and entry.get("turn_id")}
         envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+        if envelope is None:
+            turn_id = (session.get("inflight_turn") or {}).get("turn_id")
+            binding = "active" if turn_id else "none"
+        else:
+            turn_id = envelope.get("turn_id")
+            binding = ("shared" if turn_id in prior_turn_ids else "reserved") if turn_id else "none"
         # Durable AT ACCEPT (not when the turn runs): a cold resume sees the queued message and a
         # backend restart cannot lose it. Lives on the envelope, never the shared session slot.
         if envelope is not None:
@@ -445,9 +491,10 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     # ``AIAgent._pending_steer``) and fall-through queue envelopes (payload not steerable, ``steer()``
     # rejected/raised). A hard interrupt here kills the live turn AND ``AIAgent.interrupt()`` drops the
     # pending steer buffer — silently destroying the earlier messages of the burst. See #86134.
-    if mode == "interrupt" and not image_paths:
-        _interrupt_busy_session(sid, session, agent)
-    return _ok(rid, {"status": "queued"})
+    if mode == "interrupt" and not image_paths and not stale_target:
+        _interrupt_busy_session(sid, session, agent, producer_turn_id)
+    return _ok(rid, {"status": "queued", "turn_binding": binding,
+                     **({"turn_id": turn_id} if turn_id else {})})
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -502,6 +549,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     dispatch_failed = False
     try:
         if not use_compute_host:
+            kwargs["turn_id"] = queued.get("turn_id")
             _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
         elif (resp := _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)).get("error"):
             with session["history_lock"]:
@@ -530,6 +578,11 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not (user or assistant or streaming or error):
         return None
     snapshot = {"assistant": assistant, "streaming": streaming, "user": user}
+    if turn.get("turn_id"):
+        snapshot["turn_id"] = turn["turn_id"]
+    if turn.get("progress"):
+        snapshot["progress"] = [dict(payload) for payload in turn["progress"][-32:]]
+        snapshot["progress_available"] = turn.get("available", True)
     if isinstance(display_kind := turn.get("display_kind"), str) and display_kind:
         snapshot["display_kind"] = display_kind
     if isinstance(display_metadata := turn.get("display_metadata"), dict):
@@ -576,6 +629,8 @@ def _emit_terminal_turn_error(
     payload = {"text": text, "usage": _get_usage(agent) if agent is not None else {}, "status": "error",
                "error": message, "recoverable": True, **({"error_surface": error_surface} if error_surface else {}),
                **({"partial": True} if partial else {}), **({"rendered": rendered} if rendered else {})}
+    if turn.get("turn_id"):
+        payload["turn_id"] = turn["turn_id"]
     if retire_marker:
         _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
@@ -598,7 +653,23 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
     reconnect while it is still queued)."""
     queued = session.get("queued_prompt")
     user = _inflight_text(queued.get("text")) if isinstance(queued, dict) else ""
-    return {"user": user} if user else None
+    return {"user": user, **({"turn_id": queued["turn_id"]} if queued.get("turn_id") else {})} if user else None
+
+
+def _turn_observation_snapshot(session: dict) -> dict:
+    """Bound only the projection, never the accepted queue or background work."""
+    entries = ([session["queued_prompt"]] if session.get("queued_prompt") else []) + list(session.get("queued_prompts") or [])
+    result = {}
+    if entries:
+        result["queued_turns"] = [{"user": _inflight_text(entry.get("text")),
+            **({"turn_id": entry["turn_id"]} if entry.get("turn_id") else {})} for entry in entries[:32]]
+        result["queued_turns_available"] = len(entries) <= 32 and all(entry.get("turn_id") for entry in entries)
+    backgrounds = session.get("background_turn_observations") or {}
+    if backgrounds or session.get("background_observations_unavailable"):
+        result["background_turns"] = [{key: value[key] for key in (
+            "task_id", "turn_id", "progress", "available") if key in value} for value in backgrounds.values()]
+        result["background_turns_available"] = not session.get("background_observations_unavailable", False)
+    return result
 
 
 def register(server) -> None:

@@ -580,14 +580,33 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 
 def _run_after_agent_ready(
-    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
+    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
+    turn_id=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
-    err = _wait_agent_for_prompt(session, rid, sid)
+    observer = _TurnObserver(sid, session, turn_id) if turn_id else None
+    from agent.turn_facade import native_turn_context
+    progress_token = native_turn_context.set((turn_id, observer.started_ns)) if observer else None
+    ready_started_ns = time.monotonic_ns()
+    if observer:
+        observer.emit("ready_wait", "start")
+    try:
+        err = _wait_agent_for_prompt(session, rid, sid)
+        if observer:
+            observer.emit("ready_wait", "end", outcome="refused" if err else "returned",
+                          duration_ms=max(0, time.monotonic_ns() - ready_started_ns) / 1_000_000)
+    except BaseException:
+        if observer:
+            observer.emit("ready_wait", "end", outcome="raised",
+                          duration_ms=max(0, time.monotonic_ns() - ready_started_ns) / 1_000_000)
+        raise
+    finally:
+        if progress_token is not None:
+            native_turn_context.reset(progress_token)
     if err:
         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
         # the only way resume shows this to a disconnected client.
@@ -607,11 +626,12 @@ def _run_after_agent_ready(
             _emit("error", sid, {"message": (
                 "Turn cancelled before the agent was ready"
                 if session.get("_turn_cancel_requested")
-                else "Session no longer running before the agent was ready")})
+                else "Session no longer running before the agent was ready"),
+                **({"turn_id": turn_id} if turn_id else {})})
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author, turn_id=turn_id)
 
 
 _TRUNCATION_PARAMS = (
@@ -647,6 +667,10 @@ def _lock_in_submit_turn(
         if hosted_task is not None:
             session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text, display_kind=display_kind)
+        turn_id = (session.get("inflight_turn") or {}).get("turn_id")
+        if turn_id:
+            fields["turn_binding"] = "reserved"
+            fields["turn_id"] = turn_id
     return None, fields
 
 
@@ -786,7 +810,8 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
+            survivor_fields.get("turn_id")),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
@@ -1005,22 +1030,66 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
 
+    from agent.turn_facade import allocate_turn_id
+    turn_id = allocate_turn_id(task_id, task_id)
+    session.setdefault("history_lock", threading.RLock())
+    with session["history_lock"]:
+        observations = session.setdefault("background_turn_observations", {})
+        if len(observations) >= 32:
+            observations.pop(next(iter(observations)))
+            session["background_observations_unavailable"] = int(session.get("background_observations_unavailable", 0)) + 1
+        observations[task_id] = {"task_id": task_id, "turn_id": turn_id, "progress": [], "available": True,
+                                 "observation_started_ns": time.monotonic_ns()}
+    agent = None
+    resources = contextlib.ExitStack()
+
     def body():
+        nonlocal agent
         from run_agent import AIAgent
         kwargs = _background_agent_kwargs(session["agent"], task_id)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
-            agent = AIAgent(**{**kwargs, "session_db": session_db})
+        # Keep the side store alive through close, even if its parent closes first.
+        session_db = resources.enter_context(_side_agent_session_db(kwargs.get("session_db")))
+        agent = AIAgent(**{**kwargs, "session_db": session_db})
+        with _observe_agent_turn(agent, parent, session, turn_id, task_id) as observer:
+            def preview(value, *, already_streamed=False, interim=False):
+                if not observer.owned() or not isinstance(value, str) or not value:
+                    return
+                try:
+                    from agent.redact import redact_sensitive_text
+                    scrubbed = redact_sensitive_text(value, force=True)
+                    payload = {"task_id": task_id, "turn_id": turn_id, "text": scrubbed}
+                    if interim:
+                        _emit("background.interim", parent, {**payload, "already_streamed": already_streamed})
+                    else:
+                        _emit("background.delta", parent, payload)
+                    observer.first_visible()
+                except Exception:
+                    logger.debug("background preview unavailable", exc_info=True)
+            old_interim = getattr(agent, "interim_assistant_callback", None)
+            agent.interim_assistant_callback = lambda value, *, already_streamed=False: preview(
+                value, already_streamed=already_streamed, interim=True)
+            run_kwargs = {"user_message": text, "task_id": task_id, "turn_id": turn_id, "stream_callback": preview}
+            parameters = inspect.signature(agent.run_conversation).parameters
+            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+                run_kwargs = {name: value for name, value in run_kwargs.items() if name in parameters}
             try:
-                result = agent.run_conversation(user_message=text, task_id=task_id)
+                result = agent.run_conversation(**run_kwargs)
             finally:
-                # AIAgent.close() is the owner boundary (memory shutdown, tool
-                # subprocesses, httpx clients); an unclosed side agent leaks
-                # all of them for the gateway's life (#50197).
-                with contextlib.suppress(Exception):
-                    agent.close()
+                agent.interim_assistant_callback = old_interim
         return _final_response_text(result)
 
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
+    def cleanup():
+        try:
+            # Emit the ready answer before memory shutdown, but retain #50197's
+            # close boundary under the same profile, secrets and terminal policy.
+            if agent is not None:
+                with contextlib.suppress(Exception):
+                    agent.close()
+        finally:
+            resources.close()
+
+    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body,
+                             cleanup=cleanup, turn_id=turn_id)
 
 
 @method("prompt.btw")
@@ -1243,11 +1312,20 @@ def _final_response_text(result) -> str:
 
 
 def _spawn_side_agent(
-    rid, session, task_id, parent, event, body, *, cwd="", extra=None, cleanup=None):
+    rid, session, task_id, parent, event, body, *, cwd="", extra=None, cleanup=None, turn_id=None):
     """Run ``body()`` on a daemon thread under the session's profile home (the ContextVar
     doesn't propagate across threads) and cwd; its text — or ``error: <exc>`` — lands on
     ``parent`` as ``event`` with ``task_id`` (+ ``extra``).  Replies ``{task_id}``."""
     extra = extra or {}
+    if turn_id:
+        extra = {**extra, "turn_id": turn_id}
+
+    def retire_observation():
+        if turn_id:
+            with session["history_lock"]:
+                if (session.get("background_turn_observations") or {}).pop(task_id, None) is None:
+                    session["background_observations_unavailable"] = max(
+                        0, int(session.get("background_observations_unavailable", 0)) - 1)
 
     def run():
         # ``parent`` is the caller's live sid (``_sess`` admitted it): bind it as the UI owner so
@@ -1263,19 +1341,29 @@ def _spawn_side_agent(
         # background server running under this task_id, and AIAgent.close() would kill every process for
         # the task_id and tear down the very server the restart just started.
         try:
-            with _session_profile_runtime_scope(session):
-                text = body()
-            _emit(event, parent, {"task_id": task_id, **extra, "text": text})
-        except Exception as e:
-            _emit(event, parent, {"task_id": task_id, **extra, "text": f"error: {e}"})
+            # Hold the original scope through cleanup: reacquiring it can fail
+            # after an agent has been constructed, skipping its owner shutdown.
+            with contextlib.ExitStack() as runtime_scope:
+                try:
+                    runtime_scope.enter_context(_session_profile_runtime_scope(session))
+                    text = body()
+                except Exception as e:
+                    text = f"error: {e}"
+                try:
+                    _emit(event, parent, {"task_id": task_id, **extra, "text": text})
+                except Exception:
+                    logger.debug("side-agent terminal publication failed", exc_info=True)
+                finally:
+                    retire_observation()
+                    if cleanup is not None:
+                        cleanup()
         finally:
-            if cleanup is not None:
-                cleanup()
             _clear_session_context(session_tokens)
 
     if _start_session_work(run, name=f"side-agent-{task_id}") is None:
+        retire_observation()
         return _err(rid, 5035, "backend is retiring; reconnect to continue")
-    return _ok(rid, {"task_id": task_id})
+    return _ok(rid, {"task_id": task_id, **({"turn_id": turn_id, "turn_binding": "reserved"} if turn_id else {})})
 
 
 def _side_agent_args(rid, params, prefix):

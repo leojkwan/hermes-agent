@@ -6,6 +6,7 @@ Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO
 import contextlib
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -22,6 +23,15 @@ _REASON_HARD_STOP = "explicit stop requested"
 _REASON_NEW_MESSAGE = "user sent a new message"
 _REASON_USER_INTERRUPT = "user interrupt"
 USER_INTERRUPT_REASONS = frozenset({_REASON_HARD_STOP, _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT})
+
+
+@dataclass(frozen=True)
+class CorrectionReceipt:
+    """The native mutation's immutable owner; external hooks leave ``turn_id`` unknown."""
+
+    accepted: bool
+    turn_id: str | None
+    changed: bool = False
 
 
 def interrupt_issuer(agent) -> Optional[str]:
@@ -80,9 +90,8 @@ def _ic_codex_method(agent, name: str):
     return method if callable(method) else None
 
 
-def _ic_abort_active_request(agent, reason: str, failure_log: str) -> None:
-    """Shut the registered in-flight request's sockets (cron turns register their client here)."""
-    abort = getattr(agent, "_active_request_abort", None)
+def _ic_abort_active_request(abort, reason: str, failure_log: str) -> None:
+    """Shut the captured in-flight request's sockets without consulting a later turn."""
     if callable(abort):
         try:
             abort(reason)
@@ -115,15 +124,17 @@ class InterruptControlMixin:
     def interrupt(
         self, message: Optional[str] = None, *, hard_cancel: bool = False,
         tool_reason: Optional[str] = None, require_generation: Optional[int] = None,
-    ) -> bool:
+        expected_turn_id: str | None = None,
+    ) -> bool | CorrectionReceipt:
         """Request the agent to interrupt its current tool-calling loop (call from another thread).
 
         ``hard_cancel``: explicit stop; compression may honor it even while ordinary interrupts are masked.
         ``tool_reason``: trusted fixed category safe for tool output. ``require_generation``: activity-
         generation claim — published only if the turn's generation still matches at the final mutation edge;
-        returns False if the turn resumed meanwhile.
+        returns False if the turn resumed meanwhile. Expected-ID callers receive the immutable
+        native owner and cannot interrupt a successor on this reused agent.
         """
-        if require_generation is not None:
+        if expected_turn_id is None and require_generation is not None:
             # RESERVE the claim under the SAME lock `_touch_activity` stamps with; real progress invalidates
             # it and it is CONSUMED at the final mutation edge, so a resumed turn abandons the abort.
             with self._liveness_activity_lock():
@@ -156,6 +167,16 @@ class InterruptControlMixin:
         # claim edge (redirect lock still held); the destructive pending-commit cancel runs AFTER the claim
         # survives (#99758 P1).
         with _ic_lock(self, "_pending_redirect_lock"):
+            if expected_turn_id is not None:
+                if (getattr(self, "_current_turn_id", None) != expected_turn_id
+                        or not getattr(self, "_native_correction_turn_active", False)):
+                    return CorrectionReceipt(False, None, changed=True)
+                if require_generation is not None:
+                    # A stale native target must not reserve a liveness claim on B.
+                    with self._liveness_activity_lock():
+                        if getattr(self, "_turn_liveness_activity_generation", 0) != require_generation:
+                            return CorrectionReceipt(False, None)
+                        self._turn_liveness_abort_claim = require_generation
             _fence_cancel_before_commit(
                 _fence(), when_in_flight=True, failure_log="Compression hard-cancel fence wait failed"
             )
@@ -169,37 +190,40 @@ class InterruptControlMixin:
                 # activity stamp, or the stamp landed first and the abort declines without publishing.
                 with self._liveness_activity_lock():
                     if getattr(self, "_turn_liveness_abort_claim", None) != require_generation:
-                        return False
+                        return False if expected_turn_id is None else CorrectionReceipt(False, None)
                     self._turn_liveness_abort_claim = None
                     _publish_interrupt_state()
             _fence_cancel_before_commit(
                 _fence(), when_in_flight=False, failure_log="Compression hard-cancel fence admission failed"
             )
             self._pending_redirect = None
+            # Fence primitive signals and capture provider/child targets before B can bind.
+            # Blocking provider methods remain outside this lock.
+            request_interrupt = _ic_codex_method(self, "request_interrupt")
+            abort = getattr(self, "_active_request_abort", None)
+            execution_thread_id = self._execution_thread_id
+            if execution_thread_id is not None:
+                _set_interrupt(True, execution_thread_id, reason=tool_interrupt_reason)
+                self._interrupt_thread_signal_pending = False
+            else:
+                self._interrupt_thread_signal_pending = True
+            _ic_signal_tool_workers(self, True, reason=tool_interrupt_reason)
+            with self._active_children_lock:
+                children_copy = list(self._active_children)
+            receipt = (True if expected_turn_id is None else CorrectionReceipt(
+                True, expected_turn_id if getattr(self, "api_mode", None) != "codex_app_server" else None))
 
         # Codex watches a private interrupt event rather than Hermes' per-thread flag.
-        _request_interrupt = _ic_codex_method(self, "request_interrupt")
-        if _request_interrupt is not None:
+        if request_interrupt is not None:
             try:
-                _request_interrupt()
+                request_interrupt()
             except Exception:
                 logger.debug("Failed to interrupt Codex app-server turn", exc_info=True)
 
         # Cron turns request on the conversation thread (no nested interrupt-worker deadlock); their client
         # is registered here so this cross-thread interrupt can still shut the sockets.
-        _ic_abort_active_request(self, "interrupt_abort", "Failed to abort active inline request")
-        # Scope the tool interrupt to this agent's execution thread so other in-process agents are unaffected.
-        if self._execution_thread_id is not None:
-            _set_interrupt(True, self._execution_thread_id, reason=tool_interrupt_reason)
-            self._interrupt_thread_signal_pending = False
-        else:
-            # Interrupt arrived before run_conversation bound the execution thread: defer the tool-level
-            # signal instead of targeting the caller thread.
-            self._interrupt_thread_signal_pending = True
-        _ic_signal_tool_workers(self, True, reason=tool_interrupt_reason)
+        _ic_abort_active_request(abort, "interrupt_abort", "Failed to abort active inline request")
         # Propagate interrupt to any running child agents (subagent delegation)
-        with self._active_children_lock:
-            children_copy = list(self._active_children)
         for child in children_copy:
             try:
                 if hard_cancel:
@@ -210,7 +234,7 @@ class InterruptControlMixin:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
-        return True
+        return receipt
 
     def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None) -> None:
         """Explicit stop preserving the ``interrupt()`` ABI (frontends feature-detect this and fall back to
@@ -247,75 +271,100 @@ class InterruptControlMixin:
                 self._pending_steer = None
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, expected_turn_id: str | None = None) -> bool | CorrectionReceipt:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        interrupt); multiple calls concatenate with newlines. Expected-ID callers receive a receipt
+        fenced against native turn rollover; ordinary callers retain the boolean result."""
         if not text or not text.strip():
-            return False
+            return False if expected_turn_id is None else CorrectionReceipt(False, None)
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
+            if expected_turn_id is not None and (
+                getattr(self, "_current_turn_id", None) != expected_turn_id
+                or not getattr(self, "_native_correction_turn_active", False)
+            ):
+                return CorrectionReceipt(False, None, changed=True)
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-        return True
+            return True if expected_turn_id is None else CorrectionReceipt(True, expected_turn_id)
 
-    def redirect(self, text: str) -> bool:
+    def redirect(self, text: str, *, expected_turn_id: str | None = None) -> bool | CorrectionReceipt:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
-        to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
+        to ``steer()``; Codex app-server uses native ``turn/steer``. Expected-ID callers receive a receipt;
+        external Codex hooks cannot establish Hermes-native ownership. Otherwise returns a boolean."""
         if not text or not text.strip():
-            return False
+            return False if expected_turn_id is None else CorrectionReceipt(False, None)
         cleaned = text.strip()
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:
             with _ic_lock(self, "_pending_redirect_lock"):
                 if self._interrupt_requested:
-                    return False
+                    return False if expected_turn_id is None else CorrectionReceipt(False, None)
             try:
-                return bool(_native_steer(cleaned))
+                accepted = bool(_native_steer(cleaned))
             except Exception:
                 logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                return False
+                accepted = False
+            return accepted if expected_turn_id is None else CorrectionReceipt(accepted, None)
 
         # Never kill a tool to deliver guidance; the steer drain puts it on the final tool result.
         # A foreground terminal command would park that delivery until it exits (a 5-minute
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = self.steer(cleaned)
+            receipt = (self.steer(cleaned) if expected_turn_id is None
+                       else self.steer(cleaned, expected_turn_id=expected_turn_id))
+            accepted = receipt if expected_turn_id is None else receipt.accepted
             if accepted:
-                tracker = getattr(self, "_tool_worker_threads", None)
-                tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
-                if tracker is not None and tracker_lock is not None:
-                    with tracker_lock:
-                        worker_tids = list(tracker)
-                    for tid in worker_tids:
-                        _request_yield(tid)
-            return accepted
+                with _ic_lock(self, "_pending_steer_lock"):
+                    # A's steer may have committed before B bound. Keep A's receipt, but never
+                    # ask B's tool workers to yield in order to deliver that earlier correction.
+                    if expected_turn_id is not None and (
+                        getattr(self, "_current_turn_id", None) != receipt.turn_id
+                        or not getattr(self, "_native_correction_turn_active", False)
+                    ):
+                        return receipt
+                    tracker = getattr(self, "_tool_worker_threads", None)
+                    tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
+                    if tracker is not None and tracker_lock is not None:
+                        with tracker_lock:
+                            worker_tids = list(tracker)
+                        for tid in worker_tids:
+                            _request_yield(tid)
+            return receipt
 
-        _model_active = getattr(self, "_model_request_active", None)
         with _ic_lock(self, "_pending_redirect_lock"):
+            if expected_turn_id is not None and (
+                getattr(self, "_current_turn_id", None) != expected_turn_id
+                or not getattr(self, "_native_correction_turn_active", False)
+            ):
+                return CorrectionReceipt(False, None, changed=True)
+            _model_active = getattr(self, "_model_request_active", None)
             if _model_active is None or not _model_active.is_set():
-                return False  # response completed before we got the lock: surface queues a new turn
+                return False if expected_turn_id is None else CorrectionReceipt(False, None)
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
-                return False
+                return False if expected_turn_id is None else CorrectionReceipt(False, None)
             self._pending_redirect = (
                 f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
             )
             self._interrupt_requested = True
             self._interrupt_message = None
-
-        # Interrupt only the model request — no fan-out to tool workers / child agents as interrupt() does.
-        _execution_thread_id = getattr(self, "_execution_thread_id", None)
-        if _execution_thread_id is not None:
-            _set_interrupt(True, _execution_thread_id)
-            self._interrupt_thread_signal_pending = False
-        else:
-            self._interrupt_thread_signal_pending = True
-        _ic_abort_active_request(self, "redirect_abort", "Failed to abort request for redirect")
-        return True
+            # Signal the admitted execution while its identity is fenced. Socket abort runs
+            # outside the lock using this request's callback, even if the agent binds B meanwhile.
+            execution_thread_id = getattr(self, "_execution_thread_id", None)
+            abort = getattr(self, "_active_request_abort", None)
+            if execution_thread_id is not None:
+                _set_interrupt(True, execution_thread_id)
+                self._interrupt_thread_signal_pending = False
+            else:
+                self._interrupt_thread_signal_pending = True
+            receipt = True if expected_turn_id is None else CorrectionReceipt(True, expected_turn_id)
+        _ic_abort_active_request(abort, "redirect_abort", "Failed to abort request for redirect")
+        return receipt
 
     def _has_pending_redirect(self) -> bool:
         """Return whether an active-turn redirect is waiting to be applied."""

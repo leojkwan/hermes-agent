@@ -577,11 +577,17 @@ def _bind_turn_identity(
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
     agent._process_owner_task_ids = {*getattr(agent, "_process_owner_task_ids", ()), effective_task_id}
-    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "") or (
-        f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-    )
-    agent._relay_pending_turn_id = None
-    agent._current_turn_id = turn_id
+    from agent.interrupt_control import _ic_lock
+    from agent.turn_facade import allocate_turn_id, native_turn_context
+    # Correction admission and turn rollover share these existing locks, always in this order.
+    with _ic_lock(agent, "_pending_steer_lock"):
+        with _ic_lock(agent, "_pending_redirect_lock"):
+            turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "") or allocate_turn_id(
+                agent.session_id, effective_task_id)
+            agent._relay_pending_turn_id = None
+            agent._current_turn_id = turn_id
+            context = native_turn_context.get()
+            agent._native_correction_turn_active = context is not None and context[0] == turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.

@@ -105,6 +105,72 @@ def test_busy_accept_writes_the_queued_user_row_immediately(monkeypatch, tmp_pat
         db.close()
 
 
+def test_queued_native_identity_survives_merge_snapshot_and_drain(monkeypatch, tmp_path):
+    """Acceptance and execution share one native ID, even when two inputs merge."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        _busy(session)
+        first = server.handle_request({"id": "q1", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "next request", "queued": True}})
+        second = server.handle_request({"id": "q2", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "additional detail", "queued": True}})
+        turn_id = first["result"]["turn_id"]
+        assert first["result"]["turn_binding"] == "reserved"
+        assert second["result"]["turn_binding"] == "shared"
+        assert second["result"]["turn_id"] == turn_id
+        assert server._queued_prompt_snapshot(session)["turn_id"] == turn_id
+        captured = []
+        monkeypatch.setattr(server, "_run_prompt_submit", lambda rid, s, sess, text, **kw:
+                            captured.append((text, kw["turn_id"])))
+        with session["history_lock"]:
+            session["running"] = False
+            server._clear_inflight_turn(session)
+        assert server._drain_queued_prompt("q1", sid, session) is True
+        assert captured == [("next request\n\nadditional detail", turn_id)]
+        assert any("additional detail" in str(row["content"]) for row in _active_rows(db, key))
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_duplicate_busy_input_discloses_active_identity(monkeypatch, tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, _key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        _busy(session)
+        active_id = session["inflight_turn"]["turn_id"]
+        response = server.handle_request({"id": "dup", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "prompt A", "queued": True}})
+        assert response["result"]["turn_id"] == active_id
+        assert response["result"]["turn_binding"] == "active"
+        assert session.get("queued_prompt") is None
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_live_reconnect_exposes_distinct_queued_reservations(monkeypatch, tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, _key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        _busy(session)
+        acknowledgments = [server.handle_request({"id": str(index), "method": "prompt.submit", "params": {
+            "session_id": sid, "text": text, "queued": True}})["result"] for index, text in enumerate([
+                "next ask", [{"type": "text", "text": "separate structured ask"}]])]
+        payload = server._live_session_payload(sid, session, omit_messages=True)
+        assert [queued["turn_id"] for queued in payload["queued_turns"]] == [
+            ack["turn_id"] for ack in acknowledgments]
+        assert payload["queued_turns_available"] is True
+        assert acknowledgments[0]["turn_id"] != acknowledgments[1]["turn_id"]
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_queued_turn_replays_as_its_own_turn_after_the_live_turn(monkeypatch, tmp_path):
     """The accept-time row lands BEFORE the in-flight turn's assistant rows (raw [uA, uB, aA]);
     the drain must re-place it at the transcript end, so the repaired projection keeps FOUR

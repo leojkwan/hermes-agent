@@ -19,6 +19,7 @@ from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
 from agent.message_metadata import append_message
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.turn_failure_copy import site_copy, stamp_failure
+from agent.turn_facade import emit_turn_progress, observe_turn_phase
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -87,14 +88,27 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        with observe_turn_phase(agent, "backend_call", api_request_id=api_request_id,
+                                retry_count=retry_count, iteration=api_call_count):
+            return _invoke_backend(next_api_kwargs)
+
+    def _invoke_backend(next_api_kwargs):
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
         if _use_streaming:
+            observed = False
+            def first_output():
+                nonlocal observed
+                if not observed:
+                    observed = True
+                    emit_turn_progress(agent, "output_observed", "observed", api_request_id=api_request_id,
+                                       retry_count=retry_count, iteration=api_call_count)
+                _stop_spinner()
             return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
+                next_api_kwargs, on_first_delta=first_output
             )
         from agent import relay_llm
 
