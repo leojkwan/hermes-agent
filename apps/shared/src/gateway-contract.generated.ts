@@ -2634,6 +2634,8 @@ export interface PromptSubmitResult {
   survivor_user_row_ids?: (number | null)[] | null
   survivor_row_id_map?: Record<string, number | null> | null
   turn_isolation?: boolean | null
+  turn_id?: string | null
+  turn_binding?: 'reserved' | 'shared' | 'active' | 'none' | null
 }
 export type PromptSubmitStatus = 'streaming' | 'queued' | 'steered' | 'redirected'
 export interface ClipboardPasteParams {
@@ -2745,6 +2747,8 @@ export interface SideAgentParams {
 /** The side agent runs detached; its answer lands on the parent session as an event carrying this ``task_id``. */
 export interface TaskIdResult {
   task_id: string
+  turn_id?: string | null
+  turn_binding?: 'reserved' | 'none' | null
 }
 export interface PreviewRestartParams {
   session_id: string
@@ -3041,6 +3045,10 @@ export interface SessionResumeResult {
   status?: string | null
   inflight?: InflightTurn | null
   queued?: QueuedPrompt | null
+  queued_turns?: QueuedPrompt[] | null
+  queued_turns_available?: boolean | null
+  background_turns?: BackgroundTurnObservation[] | null
+  background_turns_available?: boolean | null
   pending_approval?: PendingApproval | null
   open_requests?: OpenRequestEntry[] | null
   pending_connection?: ConnectionRequestPayload | null
@@ -3052,6 +3060,9 @@ export interface InflightTurn {
   assistant?: string
   streaming?: boolean
   user?: string
+  turn_id?: string | null
+  progress?: TurnProgressPayload[] | null
+  progress_available?: boolean | null
   display_kind?: string | null
   display_metadata?: Record<string, unknown> | null
   corrections?: string[] | null
@@ -3061,8 +3072,30 @@ export interface InflightTurn {
   recoverable?: boolean | null
   error_surface?: Record<string, unknown> | null
 }
+/** Observed native boundaries; elapsed time alone never manufactures progress. */
+export interface TurnProgressPayload {
+  turn_id: string
+  task_id?: string | null
+  stage: 'admission' | 'ready_wait' | 'context' | 'request_prepare' | 'backend_call' | 'output_observed' | 'visible_text' | 'tool' | 'observation'
+  state: 'start' | 'end' | 'observed' | 'unavailable'
+  elapsed_ms: number
+  duration_ms?: number | null
+  api_request_id?: string | null
+  retry_count?: number | null
+  iteration?: number | null
+  tool_id?: string | null
+  name?: string | null
+  outcome?: 'returned' | 'raised' | 'refused' | 'interrupted' | 'unknown' | null
+}
 export interface QueuedPrompt {
   user: string
+  turn_id?: string | null
+}
+export interface BackgroundTurnObservation {
+  task_id: string
+  turn_id: string
+  progress?: TurnProgressPayload[]
+  available?: boolean
 }
 /** One unanswered server→client request (``server_requests.Request.snapshot``); the reconnecting client re-delivers it to its request handlers. */
 export interface OpenRequestEntry {
@@ -3111,6 +3144,10 @@ export interface SessionActivateResult {
   status?: string | null
   inflight?: InflightTurn | null
   queued?: QueuedPrompt | null
+  queued_turns?: QueuedPrompt[] | null
+  queued_turns_available?: boolean | null
+  background_turns?: BackgroundTurnObservation[] | null
+  background_turns_available?: boolean | null
   pending_approval?: PendingApproval | null
   open_requests?: OpenRequestEntry[] | null
   pending_connection?: ConnectionRequestPayload | null
@@ -3440,6 +3477,8 @@ export interface SessionCorrectionParams {
   text: string
 }
 export interface SessionCorrectionResult {
+  turn_id?: string | null
+  turn_binding?: 'reserved' | 'shared' | 'active' | 'none' | null
   status: CorrectionStatus
   text: string
 }
@@ -4538,21 +4577,27 @@ export interface SetupReadyPayload {
 /** Every ``_emit("error", …)`` site sets exactly ``message``. */
 export interface ErrorPayload {
   message: string
+  turn_id?: string | null
 }
 /** ``tui_gateway/model_switch.py`` capability-refresh notice. */
 export interface NoticePayload {
   message: string
+}
+export interface MessageStartPayload {
+  turn_id?: string | null
 }
 /** ``prompt_turn._invoke_agent._stream`` (message.delta: ``text`` + optional ``rendered``), ``agent_callbacks._agent_cbs`` (reasoning.delta / thinking.delta), ``tool_progress._progress_reasoning`` (reasoning.available). ``verbose`` rides only when the session's verbose reasoning mode is on. */
 export interface StreamDeltaPayload {
   text: string
   rendered?: string | null
   verbose?: boolean | null
+  turn_id?: string | null
 }
 /** ``prompt_turn._interim_assistant_cb`` / ``agent_callbacks`` interim_assistant_callback. */
 export interface MessageInterimPayload {
   text: string
   already_streamed: boolean
+  turn_id?: string | null
 }
 /** ``prompt_turn._complete_turn_payload`` / ``session_auto_continue._emit_terminal_turn_error`` / ``agent_callbacks._mirror_subagent_to_child`` (child watch mirror: ``text`` only) / ``compute_host_bridge`` (``text`` + ``status``). */
 export interface MessageCompletePayload {
@@ -4571,6 +4616,7 @@ export interface MessageCompletePayload {
   error_surface?: ErrorSurface | null
   partial?: boolean | null
   persisted_turn?: PersistedTurn | null
+  turn_id?: string | null
 }
 /** ``prompt_turn._result_status``. */
 export type TurnStatus = 'complete' | 'error' | 'interrupted'
@@ -4626,6 +4672,7 @@ export interface ReviewSummaryPayload {
 /** ``tool_progress._on_tool_start`` (+ ``agent_callbacks._mirror_subagent_to_child`` rows with ``preview`` and empty ``args``). ``todos``/``revision`` are NOT set by the emitter; kept optional because tool.start rows may pass through connector redaction unchanged. */
 export interface ToolStartPayload {
   tool_id: string
+  turn_id?: string | null
   name: string
   context?: string | null
   args?: Record<string, unknown> | null
@@ -4636,6 +4683,7 @@ export interface ToolStartPayload {
 /** ``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools. */
 export interface ToolCompletePayload {
   tool_id: string
+  turn_id?: string | null
   name: string
   args?: Record<string, unknown> | null
   duration_s?: number | null
@@ -4650,6 +4698,7 @@ export interface ToolCompletePayload {
 /** ``agent_callbacks`` tool_gen_callback. */
 export interface ToolGeneratingPayload {
   name: string
+  turn_id?: string | null
 }
 /** ``tool_progress._progress_output_risk``. */
 export interface ToolOutputRiskPayload {
@@ -4716,8 +4765,20 @@ export interface BillingStepUpVerificationPayload {
 /** ``methods_prompt._spawn_side_agent``: ``{task_id, **extra, text}``; btw adds ``question``. */
 export interface SideAgentCompletePayload {
   task_id: string
+  turn_id?: string | null
   text: string
   question?: string | null
+}
+export interface BackgroundDeltaPayload {
+  task_id: string
+  turn_id: string
+  text: string
+}
+export interface BackgroundInterimPayload {
+  task_id: string
+  turn_id: string
+  text: string
+  already_streamed?: boolean
 }
 /** ``methods_prompt`` restart body + ``agent_callbacks._preview_restart_callbacks``. */
 export interface PreviewRestartProgressPayload {
@@ -5692,6 +5753,10 @@ export interface BackendGatewayEventMap {
   'approval.cancelled': ApprovalCancelledPayload
   /** A /background side agent finished. */
   'background.complete': SideAgentCompletePayload
+  /** Provisional background answer text, outside the foreground stream. */
+  'background.delta': BackgroundDeltaPayload
+  /** Provisional background commentary; never completion or speech. */
+  'background.interim': BackgroundInterimPayload
   /** Device-flow URL + code for the billing scope step-up; the client opens the browser. */
   'billing.step_up.verification': BillingStepUpVerificationPayload
   /** A bot-relay outbox envelope is queued; drain it. */
@@ -5732,8 +5797,8 @@ export interface BackendGatewayEventMap {
   'message.interim': MessageInterimPayload
   /** The agent reacted to a message; paint it live. */
   'message.reaction': MessageReactionPayload
-  /** A turn began streaming; no payload. */
-  'message.start': Record<string, never>
+  /** A turn began streaming; native identity when available. */
+  'message.start': MessageStartPayload
   /** The MoA aggregator started. */
   'moa.aggregating': MoaAggregatingPayload
   /** MoA phase transition (currently only ``aggregator``). */
@@ -5828,6 +5893,8 @@ export interface BackendGatewayEventMap {
   'tool.output_risk': ToolOutputRiskPayload
   /** A tool call began (stable id + full args). */
   'tool.start': ToolStartPayload
+  /** An observed native execution phase or tool boundary. */
+  'turn.progress': TurnProgressPayload
   /** Barge-in: the spoken interjection interrupted the turn; no payload. */
   'voice.interrupted': Record<string, never>
   /** Voice recorder state changed. */
@@ -5842,6 +5909,8 @@ export const GATEWAY_EVENT_TYPES = [
   'agent.terminal.output',
   'approval.cancelled',
   'background.complete',
+  'background.delta',
+  'background.interim',
   'billing.step_up.verification',
   'bot_relay.outbox.pending',
   'browser.controller.cancel',
@@ -5910,6 +5979,7 @@ export const GATEWAY_EVENT_TYPES = [
   'tool.generating',
   'tool.output_risk',
   'tool.start',
+  'turn.progress',
   'voice.interrupted',
   'voice.status',
   'voice.transcript',

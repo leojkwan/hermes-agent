@@ -6,14 +6,54 @@ balanced start/finish marks. Extracted from ``run_agent.py``; every method resol
 MRO unchanged.
 """
 import logging
+import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from agent.lazy_forward import forward as _forward
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
+native_turn_context: ContextVar[tuple[str, int] | None] = ContextVar("native_turn_context", default=None)
+
+
+def emit_turn_progress(agent, stage: str, state: str, **fields) -> None:
+    """Observer-only native facts. Copied worker context keeps its producing turn."""
+    context = native_turn_context.get()
+    callback = getattr(agent, "event_callback", None)
+    if context is None or not callable(callback):
+        return
+    turn_id, started_ns = context
+    payload = {"turn_id": turn_id, "stage": stage, "state": state,
+               "elapsed_ms": max(0, time.monotonic_ns() - started_ns) / 1_000_000}
+    payload.update({key: value for key, value in fields.items() if value is not None and key in {
+        "duration_ms", "api_request_id", "retry_count", "iteration", "outcome"}})
+    try:
+        callback("turn:progress", payload)
+    except Exception:
+        logger.debug("turn progress observer failed", exc_info=True)
+
+
+@contextmanager
+def observe_turn_phase(agent, stage: str, **fields):
+    started_ns = time.monotonic_ns()
+    emit_turn_progress(agent, stage, "start", **fields)
+    outcome = {"value": "returned"}
+    try:
+        yield outcome
+    except BaseException as exc:
+        outcome["value"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, InterruptedError)) else "raised"
+        raise
+    finally:
+        emit_turn_progress(agent, stage, "end", **fields, outcome=outcome["value"],
+                           duration_ms=max(0, time.monotonic_ns() - started_ns) / 1_000_000)
+
+
+def allocate_turn_id(session_id: str, task_id: str) -> str:
+    """Reserve the same native identity used by the durable lease and relay."""
+    return f"{session_id or 'session'}:{task_id}:{uuid.uuid4().hex[:8]}"
 
 
 class TurnFacadeMixin:
@@ -29,6 +69,7 @@ class TurnFacadeMixin:
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
         title_user_message: Optional[str]=None,
+        turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -62,14 +103,15 @@ class TurnFacadeMixin:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
-        relay_turn_id = f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        relay_turn_id = turn_id or allocate_turn_id(session_id, effective_task_id)
+        progress_token = native_turn_context.set((relay_turn_id, time.monotonic_ns()))
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
             if task_context["platform"] == "subagent"
             else ""
         )
-        relay_lease = relay_turn = lease = None
+        relay_lease = relay_turn = lease = admission = None
         # Scope tokens start None: early returns leave the try before the set_*() calls and
         # the finally resets each one unconditionally.
         token = affinity_token = acct_token = None
@@ -79,11 +121,15 @@ class TurnFacadeMixin:
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
             _review_queue.note_turn_started()
-            admission = admit_durable_turn_lease(
-                self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
-                conversation_history=conversation_history,
-            )
+            with observe_turn_phase(self, "admission") as admission_outcome:
+                admission = admit_durable_turn_lease(
+                    self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
+                    conversation_history=conversation_history,
+                )
+                if admission.early_result is not None:
+                    admission_outcome["value"] = "refused"
             if admission.early_result is not None:
+                admission.early_result["turn_id"] = relay_turn_id
                 carry_unadmitted_user_message(
                     admission.early_result, user_message, persist_user_message,
                     timestamp=persist_user_timestamp, display_kind=persist_user_display_kind,
@@ -160,6 +206,8 @@ class TurnFacadeMixin:
                     if lease is not None:
                         lease.stop_refresher()
             terminal = result if isinstance(result, dict) else {}
+            if isinstance(result, dict):
+                result["turn_id"] = relay_turn_id
             relay_outcome = (
                 "cancelled" if terminal.get("interrupted") is True
                 else "failed" if terminal.get("failed") is True
@@ -186,6 +234,13 @@ class TurnFacadeMixin:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            from agent.interrupt_control import _ic_lock
+            with _ic_lock(self, "_pending_steer_lock"):
+                with _ic_lock(self, "_pending_redirect_lock"):
+                    if (admission is not None and admission.early_result is None
+                            and getattr(self, "_current_turn_id", None) == relay_turn_id):
+                        self._native_correction_turn_active = False
+            native_turn_context.reset(progress_token)
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)

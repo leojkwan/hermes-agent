@@ -3183,6 +3183,8 @@ def _live_session_payload(
                        ("pending_connection", _pending_connection_request_payload(sid))):
         if value:
             payload[key] = value
+    with session["history_lock"]:
+        payload.update(_turn_observation_snapshot(session))
     return _attach_todo_state(payload, session)
 
 

@@ -351,3 +351,72 @@ def test_tool_result_needs_user_treats_nonzero_exit_code_as_failure():
     assert server._tool_result_needs_user(json.dumps({"ok": False, "output": "denied"})) is True
     assert server._tool_result_needs_user(json.dumps({"error": "disk full"})) is True
     assert server._tool_result_needs_user("not json") is False
+
+
+@pytest.mark.parametrize("callback_name", ["tool_start_callback", "tool_result_metadata_callback", "tool_complete_callback"])
+def test_tool_callbacks_cannot_commit_across_native_rollover(monkeypatch, callback_name):
+    import contextvars
+    import threading
+    from agent import display
+    from agent.turn_facade import native_turn_context
+
+    sid, tool_id = "native-tool-rollover", "reused-tool"
+    session = {"history_lock": threading.RLock(), "session_key": sid, "tool_progress_mode": "all",
+               "inflight_turn": {"turn_id": "turn-A"}, "tool_started_at": {}, "edit_snapshots": {}}
+    monkeypatch.setitem(server._sessions, sid, session)
+    entered, release = threading.Event(), threading.Event()
+    events, returned, errors = [], [], []
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+
+    def capture(name, args, **kwargs):
+        owner = native_turn_context.get()[0]
+        if owner == "turn-A" and callback_name == "tool_start_callback":
+            entered.set()
+            assert release.wait(10), "snapshot barrier timed out"
+        return {"owner": owner}
+
+    def render(name, result, *, print_fn, **kwargs):
+        owner = native_turn_context.get()[0]
+        if owner == "turn-A" and callback_name != "tool_start_callback":
+            entered.set()
+            assert release.wait(10), "render barrier timed out"
+        print_fn(owner + " diff")
+        return True
+
+    monkeypatch.setattr(display, "capture_local_edit_snapshot", capture)
+    monkeypatch.setattr(display, "render_edit_diff_with_delta", render)
+    callbacks = server._agent_cbs(sid)
+    token = native_turn_context.set(("turn-A", 1))
+    ctx = contextvars.copy_context()
+    native_turn_context.reset(token)
+
+    def run_A():
+        try:
+            args = (tool_id, "write_file", {"path": "fixture.txt"})
+            returned.append(callbacks[callback_name](*args, *(() if callback_name == "tool_start_callback" else ('{}',))))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=lambda: ctx.run(run_A))
+    thread.start()
+    try:
+        assert entered.wait(10), "A never reached the real rendering/capture seam"
+        with session["history_lock"]:
+            server._start_inflight_turn(session, "B", turn_id="turn-B")
+        token = native_turn_context.set(("turn-B", 2))
+        try:
+            callbacks["tool_start_callback"](tool_id, "write_file", {"path": "fixture.txt"})
+            callbacks["tool_result_metadata_callback"](tool_id, "write_file", {"path": "fixture.txt"}, '{}')
+        finally:
+            native_turn_context.reset(token)
+        expected = {name: dict(session[name]) for name in ("edit_snapshots", "tool_result_metadata", "tool_started_at")}
+        events.clear()
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert {name: session[name] for name in expected} == expected
+    assert events == []
+    if callback_name == "tool_result_metadata_callback":
+        assert returned == [{}]

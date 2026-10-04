@@ -5,12 +5,14 @@ listing/browsing stored rows, spawn-tree snapshots, event replay and the statele
 
 from __future__ import annotations
 
+from typing import Literal
 from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import (OpenModel, PendingApproval, ProfileParams, SessionLiveInfo, SessionParams, TranscriptMessage,
                      Usage)
 from .connectors_operation import ConnectionRequestPayload
+from .events import TurnProgressPayload
 from .registry import method
 
 
@@ -33,6 +35,9 @@ class InflightTurn(Result):
     assistant: str = ""
     streaming: bool = False
     user: str = ""
+    turn_id: str | None = None
+    progress: list[TurnProgressPayload] | None = None
+    progress_available: bool | None = None
     display_kind: str | None = None
     display_metadata: dict[str, JsonValue] | None = None
     corrections: list[str] | None = None
@@ -45,6 +50,14 @@ class InflightTurn(Result):
 
 class QueuedPrompt(Result):
     user: str
+    turn_id: str | None = None
+
+
+class BackgroundTurnObservation(Result):
+    task_id: str
+    turn_id: str
+    progress: list[TurnProgressPayload] = Field(default_factory=list)
+    available: bool = True
 
 
 class TodoState(Result):
@@ -89,6 +102,10 @@ class LiveSessionSnapshot(Result):
     status: str | None = None  # a LiveSessionStatus value
     inflight: InflightTurn | None = None
     queued: QueuedPrompt | None = None
+    queued_turns: list[QueuedPrompt] | None = None
+    queued_turns_available: bool | None = None
+    background_turns: list[BackgroundTurnObservation] | None = None
+    background_turns_available: bool | None = None
     pending_approval: PendingApproval | None = None
     open_requests: list[OpenRequestEntry] | None = None
     # The open connection operation (``tools/connectors/live.current``) as its ``connection.request``
@@ -625,6 +642,8 @@ class SessionCorrectionParams(SessionParams):
 
 
 class SessionCorrectionResult(Result):
+    turn_id: str | None = None
+    turn_binding: Literal["reserved", "shared", "active", "none"] | None = None
     status: CorrectionStatus
     text: str
 

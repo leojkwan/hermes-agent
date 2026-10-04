@@ -109,6 +109,8 @@ def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
 
 def _agent_status_update(sid: str, kind: str, text: str | None = None) -> None:
     from gateway.warning_notifications import is_warning_status
+    if _native_tool_owner(sid) is False:
+        return
     if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, text if text is not None else kind)):
         return
     _status_update(sid, str(kind), None if text is None else str(text))
@@ -116,11 +118,14 @@ def _agent_status_update(sid: str, kind: str, text: str | None = None) -> None:
 
 def _agent_thinking_update(sid: str, text: str) -> None:
     from gateway.warning_notifications import DiagnosticText
+    turn_id = _native_tool_owner(sid)
+    if turn_id is False:
+        return
     # Wait notices and the quiet spinner share this callback with diagnostics.
     # They are not reasoning blocks; display.show_reasoning must not swallow them.
     if not _agent_presentation_enabled(sid, diagnostic=isinstance(text, DiagnosticText)):
         return
-    _emit("thinking.delta", sid, {"text": text})
+    _emit("thinking.delta", sid, {"text": text, **({"turn_id": turn_id} if turn_id else {})})
 
 
 def _agent_notice_update(sid: str, notice) -> None:
@@ -133,9 +138,169 @@ def _agent_notice_update(sid: str, notice) -> None:
 
 
 def _emit_reasoning_delta(sid: str, text: str) -> None:
+    turn_id = _native_tool_owner(sid)
+    if turn_id is False:
+        return
     if not _session_show_reasoning(sid):
         return
-    _emit("reasoning.delta", sid, {"text": text, **({"verbose": True} if _session_verbose(sid) else {})})
+    _emit("reasoning.delta", sid, {"text": text, **({"turn_id": turn_id} if turn_id else {}),
+                                   **({"verbose": True} if _session_verbose(sid) else {})})
+
+
+def _native_tool_owner(sid: str):
+    """False rejects stale/missing ownership; None preserves idless legacy callbacks."""
+    from agent.turn_facade import native_turn_context
+    context = native_turn_context.get()
+    session = _sessions.get(sid) or {}
+    active_id = (session.get("inflight_turn") or {}).get("turn_id")
+    if context is None:
+        return False if active_id else None
+    return context[0] if active_id == context[0] else False
+
+
+class _TurnObserver:
+    """One captured execution's bounded observations, never a work queue."""
+    def __init__(self, sid, session, turn_id, task_id=None):
+        self.sid, self.session, self.turn_id, self.task_id = sid, session, turn_id, task_id
+        self.agent = session.get("agent")
+        record = ((session.get("background_turn_observations") or {}).get(task_id)
+                  if task_id else session.get("inflight_turn")) or {}
+        self.started_ns = record.get("observation_started_ns") or time.monotonic_ns()
+        self.lock, self.starts = threading.Lock(), {}
+        self.open, self.visible = True, False
+
+    def owned(self):
+        from agent.turn_facade import native_turn_context
+        context = native_turn_context.get()
+        if not self.open or context is None or context[0] != self.turn_id:
+            return False
+        if getattr(self.agent, "_mute_notification_reply", False):
+            return False
+        with _sessions_lock:
+            registered = _sessions.get(self.sid)
+        if registered is not None and registered is not self.session:
+            return False
+        if self.task_id:
+            return True
+        with self.session["history_lock"]:
+            return (self.session.get("inflight_turn") or {}).get("turn_id") == self.turn_id
+
+    def emit(self, stage, state, **fields):
+        if not self.owned():
+            return
+        from .contracts.events import TurnProgressPayload
+        try:
+            payload = TurnProgressPayload.model_validate({"turn_id": self.turn_id,
+                **({"task_id": self.task_id} if self.task_id else {}), "stage": stage, "state": state,
+                "elapsed_ms": max(0, time.monotonic_ns() - self.started_ns) / 1_000_000,
+                **fields}).model_dump(exclude_none=True)
+            with self.session["history_lock"]:
+                record = ((self.session.get("background_turn_observations") or {}).get(self.task_id)
+                          if self.task_id else self.session.get("inflight_turn"))
+                if record is not None and record.get("turn_id") == self.turn_id:
+                    progress = record.setdefault("progress", [])
+                    progress.append(payload)
+                    if len(progress) > 32:
+                        del progress[:-32]
+                        record["available"] = False
+            _emit("turn.progress", self.sid, payload)
+        except Exception:
+            logger.debug("gateway turn observation unavailable", exc_info=True)
+
+    def first_visible(self):
+        if not self.owned():
+            return
+        with self.lock:
+            if self.visible:
+                return
+            self.visible = True
+        self.emit("visible_text", "observed")
+
+    def tool_start(self, tool_id, name):
+        if not self.owned():
+            return
+        with self.lock:
+            if len(self.starts) >= 32 and tool_id not in self.starts:
+                bounded = False
+            else:
+                self.starts[tool_id] = time.monotonic_ns()
+                bounded = True
+        safe_name = name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) else None
+        self.emit("tool" if bounded else "observation", "start" if bounded else "unavailable",
+                  tool_id=str(tool_id)[:128], **({"name": safe_name} if safe_name else {}))
+
+    def tool_end(self, tool_id, name):
+        if not self.owned():
+            return
+        with self.lock:
+            started = self.starts.pop(tool_id, None)
+        safe_name = name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) else None
+        self.emit("tool", "end", tool_id=str(tool_id)[:128], outcome="unknown",
+            **({"duration_ms": max(0, time.monotonic_ns() - started) / 1_000_000} if started is not None else {}),
+            **({"name": safe_name} if safe_name else {}))
+
+
+@contextlib.contextmanager
+def _observe_agent_turn(agent, sid, session, turn_id, task_id=None):
+    from agent.turn_facade import native_turn_context
+    session.setdefault("history_lock", threading.RLock())
+    observer = _TurnObserver(sid, session, turn_id, task_id)
+    observer.agent = agent
+    previous = {name: getattr(agent, name, None) for name in (
+        "event_callback", "tool_start_callback", "tool_complete_callback")}
+    def event_callback(event, payload):
+        if callable(previous["event_callback"]):
+            with contextlib.suppress(Exception):
+                previous["event_callback"](event, payload)
+        if event == "turn:progress" and isinstance(payload, dict) and payload.get("turn_id") == turn_id:
+            allowed = {key: value for key, value in payload.items() if key in {
+                "duration_ms", "api_request_id", "retry_count", "iteration", "outcome"}}
+            observer.emit(payload.get("stage"), payload.get("state"), **allowed)
+    def start(tool_id, name, args):
+        if observer.owned():
+            observer.tool_start(tool_id, name)
+            if callable(previous["tool_start_callback"]):
+                previous["tool_start_callback"](tool_id, name, args)
+    def complete(tool_id, name, args, result):
+        if observer.owned():
+            observer.tool_end(tool_id, name)
+            if callable(previous["tool_complete_callback"]):
+                previous["tool_complete_callback"](tool_id, name, args, result)
+    installed = {"event_callback": event_callback, "tool_start_callback": start, "tool_complete_callback": complete}
+    for name, callback in installed.items():
+        setattr(agent, name, callback)
+    token = native_turn_context.set((turn_id, observer.started_ns))
+    try:
+        yield observer
+    finally:
+        observer.open = False
+        for name, callback in installed.items():
+            if getattr(agent, name, None) is callback:
+                setattr(agent, name, previous[name])
+        native_turn_context.reset(token)
+
+
+def _invoke_bound_correction(agent, method, text, turn_id):
+    """A legacy boolean proves input acceptance, never a particular native execution."""
+    from agent.interrupt_control import CorrectionReceipt
+    callback = getattr(agent, method)
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    result = (callback(text, expected_turn_id=turn_id)
+              if turn_id and "expected_turn_id" in parameters else callback(text))
+    return result if isinstance(result, CorrectionReceipt) else CorrectionReceipt(bool(result), None)
+
+
+_CORRECTION_TURN_CHANGED = object()
+
+
+def _emit_owned_tool_generating(sid, name):
+    turn_id = _native_tool_owner(sid)
+    if turn_id is False or not _tool_progress_enabled(sid):
+        return
+    _emit("tool.generating", sid, {"name": name, **({"turn_id": turn_id} if turn_id else {})})
 
 
 def _agent_cbs(sid: str) -> dict:
@@ -153,7 +318,7 @@ def _agent_cbs(sid: str) -> dict:
             sid, tc_id, name, args, result),
         "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
             sid, event_type, name, preview, args, **kwargs),
-        "tool_gen_callback": lambda name: _tool_progress_enabled(sid) and _emit("tool.generating", sid, {"name": name}),
+        "tool_gen_callback": lambda name: _emit_owned_tool_generating(sid, name),
         "thinking_callback": lambda text: _agent_thinking_update(sid, text),
         # Affection reaction (ily / <3 / good bot) → hearts; core-detected so TUI/desktop share it.
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),

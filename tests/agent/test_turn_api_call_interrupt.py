@@ -5,12 +5,70 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
+
+import pytest
 
 from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED
 from agent.turn_api_call import handle_api_interrupt
 from agent.turn_retry_state import TurnRetryState
 from run_agent import AIAgent
+
+
+@pytest.mark.parametrize("provider_raises,observer_raises", [(False, False), (True, False), (False, True)])
+def test_logical_backend_progress_preserves_first_output_and_failure(monkeypatch, provider_raises, observer_raises):
+    from agent import turn_api_call
+    from agent.turn_facade import native_turn_context
+    events, spinner_calls, requests = [], [], []
+    clock_ns = [0]
+    monkeypatch.setattr(turn_api_call.time, "monotonic_ns", lambda: clock_ns[0])
+    def observer(event, payload):
+        events.append(payload)
+        if observer_raises:
+            raise RuntimeError("observer failed")
+    def provider(request, on_first_delta):
+        requests.append(request)
+        clock_ns[0] = 5_000_000
+        on_first_delta()  # Could be reasoning or tool generation, not visible answer text.
+        clock_ns[0] = 10_000_000
+        if provider_raises:
+            raise InterruptedError("cancelled")
+        return "provider response"
+    agent = SimpleNamespace(
+        api_mode="chat_completions", session_id="s", provider="fixture", model="fixture",
+        platform="tui", base_url="https://fixture.invalid", thinking_callback=spinner_calls.append,
+        _interruptible_streaming_api_call=provider, _has_pending_redirect=lambda: False,
+        event_callback=observer)
+    monkeypatch.setattr(turn_api_call, "_should_stream", lambda agent: True)
+    monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware",
+                        lambda request, invoke, **kwargs: invoke(request))
+    request = {"messages": [{"role": "system", "content": "byte-stable system"},
+                             {"role": "user", "content": "ask"}]}
+    token = native_turn_context.set(("native-A", 0))
+    try:
+        kwargs = dict(api_kwargs=request, _original_api_kwargs=request, _llm_middleware_trace=[],
+            _moa_prepared_request=None, _retry=TurnRetryState(), thinking_spinner=None, retry_count=2,
+            api_call_count=3, api_request_id="logical-request", effective_task_id="task", turn_id="native-A",
+            interrupted=False)
+        if provider_raises:
+            with pytest.raises(InterruptedError, match="cancelled"):
+                turn_api_call.perform_api_call(agent, **kwargs)
+        else:
+            assert turn_api_call.perform_api_call(agent, **kwargs).response == "provider response"
+        assert [(payload["stage"], payload["state"]) for payload in events] == [
+            ("backend_call", "start"), ("output_observed", "observed"), ("backend_call", "end")]
+        assert all(payload["turn_id"] == "native-A" for payload in events)
+        assert events[-1]["outcome"] == ("interrupted" if provider_raises else "returned")
+        assert events[-1]["duration_ms"] == 10
+        assert events[1]["elapsed_ms"] == 5
+        assert "duration_ms" not in events[1]
+        assert spinner_calls == [""]
+        assert requests == [request]
+        assert request["messages"] == [{"role": "system", "content": "byte-stable system"},
+                                        {"role": "user", "content": "ask"}]
+    finally:
+        native_turn_context.reset(token)
 
 
 def _bare_agent(streamed: str) -> AIAgent:

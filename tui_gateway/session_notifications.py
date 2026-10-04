@@ -161,12 +161,8 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
 
 
 def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+    """Dispatch a claimed turn; central admission owns its single bound start."""
     try:
-        from gateway.warning_notifications import render_notification
-        with _session_profile_runtime_scope(session):
-            render_notification(lambda: _emit("message.start", sid), platform="tui",
-                                diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
         _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
@@ -293,7 +289,6 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if wakeup.lstrip().startswith("/"):
             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
         else:
-            _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, wakeup)
     except Exception as exc:
         _notif_log_failure("loop wakeup dispatch failed", exc)
