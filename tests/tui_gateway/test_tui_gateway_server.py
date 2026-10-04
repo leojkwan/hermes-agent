@@ -12791,7 +12791,17 @@ def test_snapshot_restore_is_blocked_from_tui_worker():
     )
 
 
-def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
+def test_command_dispatch_exec_nonzero_surfaces_error(tmp_path, monkeypatch):
+    import tools.environments.local as local
+
+    # Exercise real subprocess-env construction without discovering the live install.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "hermes"
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(local, "_HERMES_BIN_DIR", local._SENTINEL)
     monkeypatch.setattr(
         server,
         "_load_cfg",
@@ -14945,14 +14955,16 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
         assert session["running"] is True
-        assert len(threads) == 1
+        run_thread = session["_run_thread"]
+        assert run_thread in threads
+        assert callable(run_thread.target)
 
         stop = server.handle_request(
             {"id": "2", "method": "session.interrupt", "params": {"session_id": "sid"}}
         )
         assert stop.get("result"), f"got error: {stop.get('error')}"
 
-        threads[0].target()
+        run_thread.target()
 
         assert calls["run_prompt"] == 0
         assert session["running"] is False
@@ -15016,6 +15028,10 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
         assert submit.get("result"), f"got error: {submit.get('error')}"
         assert session["running"] is True
 
+        run_thread = session["_run_thread"]
+        assert run_thread in threads
+        assert callable(run_thread.target)
+
         # User hits Stop while the agent is still building.
         stop = server.handle_request(
             {"id": "2", "method": "session.interrupt", "params": {"session_id": "sid"}}
@@ -15025,7 +15041,7 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
 
         # The deferred run thread now wakes up; without the emit it would bail
         # silently and the Desktop would never learn the turn was dropped.
-        threads[0].target()
+        run_thread.target()
 
         assert calls["run_prompt"] == 0
         assert session["running"] is False
