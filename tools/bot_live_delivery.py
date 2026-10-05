@@ -245,9 +245,8 @@ def deliver_to_live_owner(
         return _admit_locked(root, pinned, message, key, author, notification_category)
 
 
-def _selected_desktop_owner(home: Path, session_id: str) -> dict[str, Any]:
-    """Resolve the selected canonical Desktop Bot Chat owner without UI-id fallback."""
-    from hermes_cli.active_sessions import active_session_registry_snapshot
+def _selected_session(home: Path, session_id: str) -> None:
+    """Validate the exact canonical Desktop Bot Chat in its native store."""
     from hermes_state import SessionDB
 
     db_path = home / "state.db"
@@ -263,6 +262,13 @@ def _selected_desktop_owner(home: Path, session_id: str) -> dict[str, Any]:
             raise ValueError("selected session is not the exact Bot Chat compression tip")
     finally:
         db.close()
+
+
+def _selected_desktop_owner(home: Path, session_id: str) -> dict[str, Any]:
+    """Resolve the selected canonical Desktop Bot Chat owner without UI-id fallback."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    _selected_session(home, session_id)
     entries = active_session_registry_snapshot(registry_home=home, strict=True)
     matches = [entry for entry in entries if entry.get("session_id") == session_id]
     if len(matches) != 1:
@@ -279,7 +285,7 @@ def _selected_desktop_owner(home: Path, session_id: str) -> dict[str, Any]:
 
 
 @contextmanager
-def _selected_owner_guard(home: Path, session_id: str):
+def _selected_owner_guard(home: Path, session_id: str, expected: dict | None = None):
     """Hold the native lease registry stable through one mailbox admission write."""
     from hermes_cli.active_sessions import _FileLock, _lease_paths, _prune_dead, _read_entries
 
@@ -297,8 +303,12 @@ def _selected_owner_guard(home: Path, session_id: str):
                 or not isinstance(metadata.get("live_session_id"), str)
                 or not metadata["live_session_id"]):
             raise ValueError("selected Desktop owner has no supported mailbox consumer")
-        yield {"profile_home": str(home), "session_id": session_id,
-               "lease_id": entry.get("lease_id"), "live_session_id": metadata["live_session_id"]}
+        owner = {"profile_home": str(home), "session_id": session_id,
+                 "lease_id": entry.get("lease_id"), "live_session_id": metadata["live_session_id"]}
+        if expected is not None and owner != expected:
+            raise ValueError("selected Desktop owner changed before admission")
+        _selected_session(home, session_id)
+        yield owner
 
 
 def deliver_to_selected_live_owner(
@@ -351,9 +361,7 @@ def deliver_to_selected_live_owner(
 
         # Recheck owner while serializing admission. If it was released/replaced after
         # lookup, no receipt is created and no alternate target is considered.
-        with _selected_owner_guard(home, session_id) as owner:
-            if preflight_owner is not None and _owner(home, preflight_owner) != _owner(home, owner):
-                raise ValueError("selected Desktop owner changed before admission")
+        with _selected_owner_guard(home, session_id, preflight_owner) as owner:
             pinned = _owner(home, owner)
             record = _admit_locked(root, pinned, message, key, author)
             record["delivery_unknown"] = False

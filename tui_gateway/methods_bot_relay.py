@@ -265,6 +265,10 @@ def _deliver_selected(rid: int, params: dict, root_for_relay) -> dict:
 
     try:
         resolved = "default" if profile.strip().lower() == "hermes" else profile.strip()
+        from tools.bot_live_delivery import selected_delivery_prefix
+        if delivery_id[:32] != selected_delivery_prefix(resolved, session_id):
+            return _err(rid, 4094, "selected delivery target conflicts with its request id",
+                        data={"reason": "immutable_conflict"})
         from tools.bot_mode_probe import _roster
         if resolved not in {name for name, _ in _roster(root_for_relay())}:
             return _err(rid, 4092, "selected profile is unavailable", data={"reason": "invalid_target"})
@@ -283,9 +287,10 @@ def _deliver_selected(rid: int, params: dict, root_for_relay) -> dict:
                 author = delivery_turn_author("server", "Hermes server", "local")
 
         from tools.bot_live_delivery import deliver_to_selected_live_owner
-        record = deliver_to_selected_live_owner(
-            owner_home, resolved, session_id, message, delivery_id=delivery_id, author=author,
-        )
+        with _session_profile_runtime_scope({"profile_home": str(owner_home)}):
+            record = deliver_to_selected_live_owner(
+                owner_home, resolved, session_id, message, delivery_id=delivery_id, author=author,
+            )
         status = record["status"]
         reply = ""
         error = str(record.get("error") or "")
@@ -304,17 +309,19 @@ def _deliver_selected(rid: int, params: dict, root_for_relay) -> dict:
     except ValueError as exc:
         detail = str(exc)
         if "different payload" in detail or "different target" in detail:
-            return _err(rid, 4094, detail, data={"reason": "immutable_conflict"})
+            return _err(rid, 4094, "selected delivery conflicts with its native receipt", data={"reason": "immutable_conflict"})
         if "receipt is invalid" in detail:
-            return _err(rid, 5094, detail, data={"reason": "receipt_uninspectable"})
+            logging.getLogger(__name__).debug("Selected delivery receipt inspection failed", exc_info=True)
+            return _err(rid, 5094, "native delivery receipt is unavailable", data={"reason": "receipt_uninspectable"})
         if any(term in detail for term in ("compression tip", "canonical Desktop", "different target")):
-            return _err(rid, 4092, detail, data={"reason": "invalid_target"})
+            return _err(rid, 4092, "selected Desktop Bot Chat is unavailable", data={"reason": "invalid_target"})
         if ("unavailable" in detail or "ambiguous" in detail or "consumer" in detail
                 or "changed before admission" in detail):
-            return _err(rid, 5096, detail, data={"reason": "stale_owner"})
-        return _err(rid, 4090, detail, data={"reason": "invalid_input"})
-    except (OSError, KeyError, TypeError) as exc:
-        return _err(rid, 5094, str(exc), data={"reason": "coordination_uninspectable"})
+            return _err(rid, 5096, "selected Desktop owner is unavailable", data={"reason": "stale_owner"})
+        return _err(rid, 4090, "invalid selected delivery input", data={"reason": "invalid_input"})
+    except (OSError, KeyError, TypeError):
+        logging.getLogger(__name__).debug("Selected delivery coordination failed", exc_info=True)
+        return _err(rid, 5094, "native delivery coordination is unavailable", data={"reason": "coordination_uninspectable"})
 
 
 @method("bot_relay.reply")

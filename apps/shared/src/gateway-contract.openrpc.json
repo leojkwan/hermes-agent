@@ -170,7 +170,7 @@
     },
     {
       "name": "bot_relay.deliver",
-      "summary": "Deliver a relayed DM into a Bot Chat on this gateway and return the one-turn reply (blocking).",
+      "summary": "Deliver a relayed DM into a Bot Chat. With delivery_id and session_id, immediately admit or replay one native selected-delivery receipt; retain the same full ID when polling. With neither field, preserve legacy blocking one-turn delivery.",
       "params": [
         {
           "name": "params",
@@ -6950,11 +6950,13 @@
           },
           "delivery_id": {
             "default": "",
+            "description": "Optional with session_id only. Retain this complete 64 lowercase hex ID before sending: first 32 chars are SHA256(normalized profile + NUL + exact session_id)[:32], last 32 chars are a stable caller nonce. Reuse the full ID unchanged after uncertainty.",
             "title": "Delivery Id",
             "type": "string"
           },
           "session_id": {
             "default": "",
+            "description": "Exact persistent canonical Desktop Bot Chat compression-tip ID; pair with delivery_id. Prefixes, UI session IDs and other sources are refused.",
             "title": "Session Id",
             "type": "string"
           }

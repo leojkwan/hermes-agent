@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OkResult, OpenModel, ProfileParams
@@ -554,8 +554,13 @@ class BotRelayDeliverParams(Params):
     from_profile: str | None = None
     from_handle: str | None = None
     from_connection: str | None = None
-    delivery_id: str = ""
-    session_id: str = ""
+    delivery_id: str = Field(default="", description=(
+        "Optional with session_id only. Retain this complete 64 lowercase hex ID before sending: "
+        "first 32 chars are SHA256(normalized profile + NUL + exact session_id)[:32], "
+        "last 32 chars are a stable caller nonce. Reuse the full ID unchanged after uncertainty."))
+    session_id: str = Field(default="", description=(
+        "Exact persistent canonical Desktop Bot Chat compression-tip ID; pair with delivery_id. "
+        "Prefixes, UI session IDs and other sources are refused."))
 
     @model_validator(mode="before")
     @classmethod
@@ -584,7 +589,9 @@ class BotRelayDeliverResult(Result):
 
 
 method("bot_relay.deliver", params=BotRelayDeliverParams, result=BotRelayDeliverResult,
-       doc="Deliver a relayed DM into a Bot Chat on this gateway and return the one-turn reply (blocking).")
+       doc="Deliver a relayed DM into a Bot Chat. With delivery_id and session_id, immediately admit "
+           "or replay one native selected-delivery receipt; retain the same full ID when polling. "
+           "With neither field, preserve legacy blocking one-turn delivery.")
 
 
 class BotRelayReplyParams(ProfileParams):

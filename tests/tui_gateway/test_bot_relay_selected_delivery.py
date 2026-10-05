@@ -11,6 +11,28 @@ def _delivery_id(profile, session_id, nonce="a" * 32):
     return bound + nonce
 
 
+def _seed_selected_owner(home, session_id, *, source="desktop", title="Bot Chat", live="desktop-live"):
+    from hermes_cli.active_sessions import try_acquire_active_session
+    from hermes_state import SessionDB
+
+    home.mkdir(parents=True, exist_ok=True)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(session_id=session_id, source=source)
+    db.set_session_title(session_id, title)
+    lease, refusal = try_acquire_active_session(
+        session_id=session_id, surface="desktop", config={}, registry_home=home,
+        metadata={"live_session_id": live, "bot_live_delivery_consumer": True},
+    )
+    assert refusal is None and lease is not None
+    return db, lease
+
+
+def _selected_rpc(server, profile, session_id, delivery_id, message="native regression"):
+    return server.handle_request({"jsonrpc": "2.0", "id": 29, "method": "bot_relay.deliver", "params": {
+        "profile": profile, "session_id": session_id, "delivery_id": delivery_id, "message": message,
+    }})
+
+
 def test_selected_mailbox_requires_canonical_desktop_owner_and_replays_exact_receipt(tmp_path):
     from hermes_cli.active_sessions import try_acquire_active_session
     from hermes_state import SessionDB
@@ -261,6 +283,179 @@ def test_selected_admission_refuses_owner_replaced_after_lookup(tmp_path, monkey
     finally:
         for replacement in replacements:
             replacement.release()
+        db.close()
+
+
+@pytest.mark.parametrize(("bad_source", "bad_title"), [
+    ("desktop", "Other Chat"),
+    ("cli", "Bot Chat"),
+])
+def test_existing_mailbox_revalidates_canonical_desktop_title_and_source(tmp_path, bad_source, bad_title):
+    """An unrelated earlier receipt must not bypass the canonical native target check."""
+    from tools import bot_live_delivery as mailbox
+
+    db, good_lease = _seed_selected_owner(tmp_path, "canonical")
+    try:
+        author = {"id": "bot:relay", "name": "G", "is_bot": True}
+        good_key = _delivery_id("ops", "canonical")
+        assert mailbox.deliver_to_selected_live_owner(
+            tmp_path, "ops", "canonical", "earlier admitted traffic", delivery_id=good_key, author=author,
+        )["sequence"] == 1
+
+        if bad_title != "Bot Chat":
+            db.set_session_title("canonical", bad_title)
+        else:
+            db._write_sql("UPDATE sessions SET source = ? WHERE id = ?", (bad_source, "canonical"))
+        key = _delivery_id("ops", "canonical", nonce="b" * 32)
+        with pytest.raises(ValueError, match="canonical Desktop"):
+            mailbox.deliver_to_selected_live_owner(
+                tmp_path, "ops", "canonical", "must refuse", delivery_id=key, author=author,
+            )
+        assert not (mailbox._root(tmp_path) / f"{key}.json").exists()
+        assert mailbox._read(mailbox._root(tmp_path) / f"{good_key}.json")["sequence"] == 1
+    finally:
+        good_lease.release()
+        db.close()
+
+
+def test_existing_mailbox_revalidates_current_compression_tip(tmp_path):
+    from tools import bot_live_delivery as mailbox
+    db, lease = _seed_selected_owner(tmp_path, "bot-root")
+    try:
+        author = {"id": "bot:relay", "name": "G", "is_bot": True}
+        first_key = _delivery_id("ops", "bot-root")
+        mailbox.deliver_to_selected_live_owner(
+            tmp_path, "ops", "bot-root", "earlier admitted traffic", delivery_id=first_key, author=author,
+        )
+        db.end_session("bot-root", "compression")
+        db.create_session(session_id="bot-tip", source="desktop", parent_session_id="bot-root")
+        wrong_key = _delivery_id("ops", "bot-root", nonce="b" * 32)
+        with pytest.raises(ValueError, match="compression tip"):
+            mailbox.deliver_to_selected_live_owner(
+                tmp_path, "ops", "bot-root", "must refuse", delivery_id=wrong_key, author=author,
+            )
+        assert not (mailbox._root(tmp_path) / f"{wrong_key}.json").exists()
+        assert db.get_compression_tip("bot-root") == "bot-tip"
+    finally:
+        lease.release()
+        db.close()
+
+
+def test_selected_rpc_binds_full_profile_runtime_for_a_b_a_and_preserves_environment(tmp_path, monkeypatch):
+    import os
+
+    from agent.secret_scope import current_secret_scope, current_secret_scope_home
+    from hermes_constants import get_hermes_home
+    from tools import bot_live_delivery as mailbox
+    from tools.terminal_scope import get_terminal_scope, terminal_env
+    from tui_gateway import server
+    from tui_gateway.transport import bind_transport
+
+    home_a, home_b = tmp_path / "default", tmp_path / "profiles" / "ops"
+    db_a, lease_a = _seed_selected_owner(home_a, "chat-a", live="live-a")
+    db_b, lease_b = _seed_selected_owner(home_b, "chat-b", live="live-b")
+    (home_a / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
+    (home_b / "config.yaml").write_text("terminal:\n  backend: docker\n", encoding="utf-8")
+    (home_a / ".env").write_text("REVIEW_SCOPE=profile-a\n", encoding="utf-8")
+    (home_b / ".env").write_text("REVIEW_SCOPE=profile-b\n", encoding="utf-8")
+    observations = []
+    native_deliver = mailbox.deliver_to_selected_live_owner
+
+    def observe(*args, **kwargs):
+        observations.append({
+            "target": str(args[0]), "home": str(get_hermes_home()),
+            "secret_bound": current_secret_scope() is not None,
+            "secret_home": current_secret_scope_home(),
+            "secret_marker": (current_secret_scope() or {}).get("REVIEW_SCOPE"),
+            "terminal_bound": get_terminal_scope() is not None,
+            "terminal_backend": terminal_env("TERMINAL_ENV"),
+        })
+        return native_deliver(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_hermes_home", home_a)
+    monkeypatch.setattr(server, "_profile_home", lambda profile: home_b if profile == "ops" else None)
+    monkeypatch.setattr("tools.bot_mode_probe._roster", lambda _root: [("default", home_a), ("ops", home_b)])
+    monkeypatch.setattr(mailbox, "deliver_to_selected_live_owner", observe)
+    monkeypatch.setattr(server, "_served_profile_homes", set())
+    transport_token = bind_transport(None)
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setenv("HERMES_HOME", str(home_a))
+            scoped.setenv("TERMINAL_ENV", "local")
+            before = dict(os.environ)
+            replies = [
+                _selected_rpc(server, profile, sid, _delivery_id(profile, sid, nonce=chr(97 + i) * 32))
+                for i, (profile, sid) in enumerate((("default", "chat-a"), ("ops", "chat-b"), ("default", "chat-a")))
+            ]
+            assert all(response.get("result", {}).get("status") == "queued" for response in replies)
+            assert [(row["home"], row["secret_home"], row["secret_marker"], row["terminal_backend"])
+                    for row in observations] == [
+                (str(home_a), str(home_a), "profile-a", "local"),
+                (str(home_b), str(home_b), "profile-b", "docker"),
+                (str(home_a), str(home_a), "profile-a", "local"),
+            ]
+            assert all(row["secret_bound"] and row["terminal_bound"] for row in observations)
+            assert dict(os.environ) == before
+    finally:
+        from tui_gateway.transport import reset_transport
+        reset_transport(transport_token)
+        lease_a.release()
+        lease_b.release()
+        db_a.close()
+        db_b.close()
+
+
+def test_selected_rpc_rejects_wrong_full_target_hash_before_profile_registration(tmp_path, monkeypatch):
+    from tui_gateway import server
+
+    home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "ops"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_hermes_home", home)
+    monkeypatch.setattr(server, "_served_profile_homes", set())
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: profile_home)
+    monkeypatch.setattr("tools.bot_mode_probe._roster", lambda _root: [("ops", profile_home)])
+    wrong_target = _delivery_id("other-profile", "chat", nonce="c" * 32)
+
+    response = _selected_rpc(server, "ops", "chat", wrong_target)
+
+    assert response["error"]["data"]["reason"] == "immutable_conflict"
+    assert profile_home not in server._served_profile_homes
+
+
+def test_selected_rpc_sanitizes_unreadable_native_receipt_error(tmp_path, monkeypatch):
+    import os
+    from tools import bot_live_delivery as mailbox
+    from tui_gateway import server
+
+    if os.name == "nt" or os.geteuid() == 0:
+        pytest.skip("native unreadable-file probe requires POSIX permissions and a non-root user")
+
+    db, lease = _seed_selected_owner(tmp_path, "canonical")
+    try:
+        key = _delivery_id("ops", "canonical")
+        author = {"id": "server", "name": "Hermes server", "is_bot": True}
+        mailbox.deliver_to_selected_live_owner(
+            tmp_path, "ops", "canonical", "seed receipt", delivery_id=key, author=author,
+        )
+        receipt = mailbox._root(tmp_path) / f"{key}.json"
+        monkeypatch.setattr(server, "_hermes_home", tmp_path)
+        monkeypatch.setattr(server, "_profile_home", lambda _profile: tmp_path)
+        monkeypatch.setattr("tools.bot_mode_probe._roster", lambda _root: [("ops", tmp_path)])
+        mode = receipt.stat().st_mode & 0o777
+        receipt.chmod(0)
+        try:
+            response = _selected_rpc(server, "ops", "canonical", key, "seed receipt")
+        finally:
+            receipt.chmod(mode)
+        public = response["error"]["message"]
+        assert response["error"]["data"]["reason"] == "receipt_uninspectable"
+        assert "unavailable" in public
+        assert str(tmp_path) not in public
+        assert receipt.name not in public
+    finally:
+        lease.release()
         db.close()
 
 
