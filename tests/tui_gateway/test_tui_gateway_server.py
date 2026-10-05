@@ -15109,7 +15109,9 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
         with session["history_lock"]:
             session["running"] = False
 
-        threads[0].target()
+        run_thread = session["_run_thread"]
+        assert run_thread in threads
+        run_thread.target()
 
         assert calls["run_prompt"] == 0
         assert session.get("inflight_turn") is None
@@ -15188,7 +15190,9 @@ def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
 
-        threads[0].target()
+        run_thread = session["_run_thread"]
+        assert run_thread in threads
+        run_thread.target()
 
         # The message was DELIVERED, not dropped, and no error event fired.
         assert calls["run_prompt"] == 1
@@ -15263,7 +15267,9 @@ def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
 
-        threads[0].target()
+        run_thread = session["_run_thread"]
+        assert run_thread in threads
+        run_thread.target()
 
         assert calls["run_prompt"] == 1
         shows = [e for e in emitted if e and e[0] == "notification.show" and e[1] == "sid"]
@@ -15335,7 +15341,9 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
 
-        threads[0].target()
+        run_thread = session["_run_thread"]
+        assert run_thread in threads
+        run_thread.target()
 
         assert calls["run_prompt"] == 0
         assert session["running"] is False
