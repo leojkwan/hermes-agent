@@ -287,7 +287,7 @@ def _deliver_selected(rid: int, params: dict, root_for_relay) -> dict:
                 author = delivery_turn_author("server", "Hermes server", "local")
 
         from tools.bot_live_delivery import deliver_to_selected_live_owner
-        with _session_profile_runtime_scope({"profile_home": str(owner_home)}):
+        with _session_profile_runtime_scope({"profile_home": str(owner_home)}, hydrate_secrets=False):
             record = deliver_to_selected_live_owner(
                 owner_home, resolved, session_id, message, delivery_id=delivery_id, author=author,
             )

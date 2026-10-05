@@ -554,6 +554,36 @@ def test_valid_selected_receipt_replays_unknown_through_corrupt_native_registry(
         db.close()
 
 
+@pytest.mark.parametrize("pair", [
+    {"delivery_id": "a" * 64}, {"session_id": "chat"},
+    {"delivery_id": None, "session_id": "chat"},
+    {"delivery_id": "bad", "session_id": "chat"},
+])
+def test_actual_dispatcher_keeps_selected_input_faults_typed(pair):
+    from tui_gateway import server
+    response = server.handle_request({"jsonrpc": "2.0", "id": 29, "method": "bot_relay.deliver",
+        "params": {"profile": "ops", "message": "fixture", **pair}})
+    assert response["error"]["code"] == 4090
+    assert response["error"]["data"]["reason"] == "invalid_input"
+
+
+def test_selected_admission_and_replay_do_not_hydrate_external_credentials(tmp_path, monkeypatch):
+    from tui_gateway import server
+    db, held = _seed_selected_owner(tmp_path, "canonical")
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: tmp_path)
+    monkeypatch.setattr("tools.bot_mode_probe._roster", lambda _root: [("ops", tmp_path)])
+    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources",
+                        lambda *_: pytest.fail("receipt operation hydrated external credentials"))
+    key = _delivery_id("ops", "canonical")
+    try:
+        assert _selected_rpc(server, "ops", "canonical", key)["result"]["status"] == "queued"
+        assert _selected_rpc(server, "ops", "canonical", key)["result"]["status"] == "queued"
+    finally:
+        held.release()
+        db.close()
+
+
 def test_selected_handler_returns_immediate_receipt_without_legacy_dispatch(tmp_path, monkeypatch):
     from tools import bot_live_delivery
     from tui_gateway import methods_bot_relay

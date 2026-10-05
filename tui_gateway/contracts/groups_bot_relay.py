@@ -9,7 +9,7 @@ Handlers: ``tui_gateway/methods_groups.py``, ``tui_gateway/methods_bot_relay.py`
 
 from __future__ import annotations
 
-from pydantic import Field, RootModel
+from pydantic import Field, RootModel, model_validator
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OkResult, OpenModel, ProfileParams
@@ -572,6 +572,15 @@ class BotRelaySelectedDeliverParams(BotRelayLegacyDeliverParams):
 
 class BotRelayDeliverParams(RootModel[BotRelayLegacyDeliverParams | BotRelaySelectedDeliverParams]):
     """Legacy fields only, or both selected fields with their native constraints."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_variant(cls, value):
+        if not isinstance(value, dict):
+            return value
+        selected = "delivery_id" in value or "session_id" in value
+        variant = BotRelaySelectedDeliverParams if selected else BotRelayLegacyDeliverParams
+        return variant.model_validate(value)
 
 
 class BotRelayDeliverResult(Result):
