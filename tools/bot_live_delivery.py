@@ -260,6 +260,9 @@ def _selected_session(home: Path, session_id: str) -> None:
         tip = db.get_compression_tip(row["id"])
         if tip != session_id:
             raise ValueError("selected session is not the exact Bot Chat compression tip")
+        selected = db.get_session(session_id)
+        if not selected or selected.get("source") != "desktop":
+            raise ValueError("selected Bot Chat is not a canonical Desktop session")
     finally:
         db.close()
 

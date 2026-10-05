@@ -4907,7 +4907,7 @@ export interface RpcMethods {
   'billing.state': { params: ProfileParams; result: BillingStateResult }
   /** Run the billing:manage device flow; the URL/code arrive via billing.step_up.verification. */
   'billing.step_up': { params: BillingStepUpParams; result: BillingStepUpResult }
-  /** Deliver a relayed DM into a Bot Chat. With delivery_id and session_id, immediately admit or replay one native selected-delivery receipt; retain the same full ID when polling. With neither field, preserve legacy blocking one-turn delivery. */
+  /** Deliver a relayed DM into a Bot Chat. With delivery_id and session_id, immediately admit or replay one native selected-delivery receipt, preserving trimmed message text without sender-stamp rewriting; retain the same full ID when polling the reply. With neither field, preserve legacy blocking one-turn delivery. */
   'bot_relay.deliver': { params: BotRelayDeliverParams; result: BotRelayDeliverResult }
   /** Atomically claim every pending cross-connection envelope queued on this gateway. */
   'bot_relay.outbox.drain': { params: BotRelayOutboxDrainParams; result: BotRelayOutboxDrainResult }

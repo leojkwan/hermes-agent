@@ -341,6 +341,35 @@ def test_existing_mailbox_revalidates_current_compression_tip(tmp_path):
         db.close()
 
 
+@pytest.mark.parametrize("tip_source", ["desktop", "cli", "gateway"])
+def test_selected_compression_tip_has_its_own_desktop_source(tmp_path, tip_source):
+    from hermes_cli.active_sessions import try_acquire_active_session
+    from tools import bot_live_delivery as mailbox
+    db, original = _seed_selected_owner(tmp_path, "bot-root")
+    original.release()
+    db.end_session("bot-root", "compression")
+    db.create_session(session_id="bot-tip", source=tip_source, parent_session_id="bot-root")
+    held, refusal = try_acquire_active_session(
+        session_id="bot-tip", surface="desktop", config={}, registry_home=tmp_path,
+        metadata={"live_session_id": "tip-live", "bot_live_delivery_consumer": True})
+    assert held is not None and refusal is None
+    key = _delivery_id("default", "bot-tip")
+    try:
+        def admit():
+            return mailbox.deliver_to_selected_live_owner(
+                tmp_path, "default", "bot-tip", "compressed selection", delivery_id=key,
+                author={"id": "bot:proof", "name": "Proof", "is_bot": True})
+        if tip_source == "desktop":
+            assert admit()["status"] == "queued"
+        else:
+            with pytest.raises(ValueError, match="canonical Desktop"):
+                admit()
+            assert not (mailbox._root(tmp_path) / f"{key}.json").exists()
+    finally:
+        held.release()
+        db.close()
+
+
 def test_selected_rpc_binds_full_profile_runtime_for_a_b_a_and_preserves_environment(tmp_path, monkeypatch):
     import os
 

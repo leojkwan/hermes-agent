@@ -590,7 +590,8 @@ class BotRelayDeliverResult(Result):
 
 method("bot_relay.deliver", params=BotRelayDeliverParams, result=BotRelayDeliverResult,
        doc="Deliver a relayed DM into a Bot Chat. With delivery_id and session_id, immediately admit "
-           "or replay one native selected-delivery receipt; retain the same full ID when polling. "
+           "or replay one native selected-delivery receipt, preserving trimmed message text without "
+           "sender-stamp rewriting; retain the same full ID when polling the reply. "
            "With neither field, preserve legacy blocking one-turn delivery.")
 
 
