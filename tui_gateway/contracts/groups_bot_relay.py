@@ -9,6 +9,10 @@ Handlers: ``tui_gateway/methods_groups.py``, ``tui_gateway/methods_bot_relay.py`
 
 from __future__ import annotations
 
+import re
+
+from pydantic import model_validator
+
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OkResult, OpenModel, ProfileParams
 from .registry import method
@@ -550,10 +554,33 @@ class BotRelayDeliverParams(Params):
     from_profile: str | None = None
     from_handle: str | None = None
     from_connection: str | None = None
+    delivery_id: str = ""
+    session_id: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_selected_delivery_pair(cls, value):
+        if not isinstance(value, dict):
+            return value
+        has_delivery, has_session = "delivery_id" in value, "session_id" in value
+        if not has_delivery and not has_session:
+            return value
+        delivery_id, session_id = value.get("delivery_id"), value.get("session_id")
+        if (not has_delivery or not has_session or not isinstance(delivery_id, str)
+                or not isinstance(session_id, str) or not session_id
+                or re.fullmatch(r"[0-9a-f]{64}", delivery_id) is None):
+            raise ValueError("delivery_id and session_id must be supplied as a valid selected pair")
+        return value
 
 
 class BotRelayDeliverResult(Result):
     reply: str
+    delivery_id: str = ""
+    session_id: str = ""
+    status: str = ""
+    delivery_unknown: bool = False
+    error: str = ""
+    reason: str = ""
 
 
 method("bot_relay.deliver", params=BotRelayDeliverParams, result=BotRelayDeliverResult,

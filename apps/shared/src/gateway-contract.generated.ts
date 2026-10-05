@@ -1751,9 +1751,17 @@ export interface BotRelayDeliverParams {
   from_profile?: string | null
   from_handle?: string | null
   from_connection?: string | null
+  delivery_id?: string
+  session_id?: string
 }
 export interface BotRelayDeliverResult {
   reply: string
+  delivery_id?: string
+  session_id?: string
+  status?: string
+  delivery_unknown?: boolean
+  error?: string
+  reason?: string
 }
 export interface BotRelayReplyParams {
   profile?: string | null

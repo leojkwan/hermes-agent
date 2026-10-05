@@ -8,6 +8,7 @@ not permission to execute the same input again. Receipts are permanent.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -74,6 +75,13 @@ def _delivery_id(value: str) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32,64}", value) is None:
         raise ValueError("delivery id must be 32 to 64 lowercase hex characters")
     return value
+
+
+def selected_delivery_prefix(profile: str, session_id: str) -> str:
+    """Bind a selected-request ID to one normalized profile and persistent session."""
+    if not isinstance(profile, str) or not profile or not isinstance(session_id, str) or not session_id:
+        raise ValueError("selected delivery target is incomplete")
+    return hashlib.sha256(f"{profile}\0{session_id}".encode("utf-8")).hexdigest()[:32]
 
 
 def _root(home: Path | str) -> Path:
@@ -194,6 +202,31 @@ def _write(path: Path, record: dict[str, Any]) -> None:
     atomic_json_write(path, record, indent=None, sort_keys=True, fsync_dir=True, mode=0o600)
 
 
+def _admit_locked(
+    root: Path, pinned: dict[str, str], message: str, key: str,
+    author: dict[str, Any] | None, notification_category: str = "result",
+) -> dict[str, Any]:
+    """Read or create one ticket while the caller holds the mailbox lock."""
+    path = root / f"{key}.json"
+    existing = _read(path)
+    if existing is not None:
+        problem = _ticket_shape_error(path, existing)
+        if problem:
+            raise ValueError(f"delivery receipt is invalid: {problem}")
+        if (existing.get("owner") != pinned or existing.get("message") != message
+                or existing.get("author") != author
+                or existing.get("notification_category", "result") != notification_category):
+            raise ValueError("delivery id already belongs to a different payload")
+        return existing
+    record = dict(delivery_id=key, id=key, owner=pinned, **pinned,
+                  message=message, status="queued", created_at=time.time_ns(),
+                  sequence=_next_sequence(root), **({"author": dict(author)} if author else {}))
+    if notification_category == "diagnostic":
+        record["notification_category"] = notification_category
+    _write(path, record)
+    return record
+
+
 def deliver_to_live_owner(
     profile_home: Path | str, owner: dict[str, Any], message: str,
     *, delivery_id: str | None = None, author: dict[str, Any] | None = None,
@@ -209,20 +242,122 @@ def deliver_to_live_owner(
         raise ValueError("message must be a string")
     key = _delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex)
     with _locked(profile_home) as root:
+        return _admit_locked(root, pinned, message, key, author, notification_category)
+
+
+def _selected_desktop_owner(home: Path, session_id: str) -> dict[str, Any]:
+    """Resolve the selected canonical Desktop Bot Chat owner without UI-id fallback."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+    from hermes_state import SessionDB
+
+    db_path = home / "state.db"
+    if not db_path.is_file():
+        raise ValueError("selected Bot Chat database is unavailable")
+    db = SessionDB(db_path=db_path, read_only=True)
+    try:
+        row = db.get_session_by_title("Bot Chat")
+        if not row or row.get("source") != "desktop":
+            raise ValueError("selected Bot Chat is not a canonical Desktop session")
+        tip = db.get_compression_tip(row["id"])
+        if tip != session_id:
+            raise ValueError("selected session is not the exact Bot Chat compression tip")
+    finally:
+        db.close()
+    entries = active_session_registry_snapshot(registry_home=home, strict=True)
+    matches = [entry for entry in entries if entry.get("session_id") == session_id]
+    if len(matches) != 1:
+        raise ValueError("selected Desktop owner is unavailable or ambiguous")
+    entry = matches[0]
+    metadata = entry.get("metadata")
+    if (entry.get("surface") != "desktop" or not isinstance(metadata, dict)
+            or metadata.get("bot_live_delivery_consumer") is not True
+            or not isinstance(metadata.get("live_session_id"), str)
+            or not metadata["live_session_id"]):
+        raise ValueError("selected Desktop owner has no supported mailbox consumer")
+    return {"profile_home": str(home), "session_id": session_id,
+            "lease_id": entry.get("lease_id"), "live_session_id": metadata["live_session_id"]}
+
+
+@contextmanager
+def _selected_owner_guard(home: Path, session_id: str):
+    """Hold the native lease registry stable through one mailbox admission write."""
+    from hermes_cli.active_sessions import _FileLock, _lease_paths, _prune_dead, _read_entries
+
+    state_path, lock_path = _lease_paths(registry_home=home)
+    with _FileLock(lock_path):
+        entries = _prune_dead(_read_entries(state_path, strict=True), strict=True,
+                              target_session_id=session_id)
+        matches = [entry for entry in entries if entry.get("session_id") == session_id]
+        if len(matches) != 1:
+            raise ValueError("selected Desktop owner is unavailable or ambiguous")
+        entry = matches[0]
+        metadata = entry.get("metadata")
+        if (entry.get("surface") != "desktop" or not isinstance(metadata, dict)
+                or metadata.get("bot_live_delivery_consumer") is not True
+                or not isinstance(metadata.get("live_session_id"), str)
+                or not metadata["live_session_id"]):
+            raise ValueError("selected Desktop owner has no supported mailbox consumer")
+        yield {"profile_home": str(home), "session_id": session_id,
+               "lease_id": entry.get("lease_id"), "live_session_id": metadata["live_session_id"]}
+
+
+def deliver_to_selected_live_owner(
+    profile_home: Path | str, profile: str, session_id: str, message: str, *,
+    delivery_id: str, author: dict[str, Any],
+) -> dict[str, Any]:
+    """Admit/replay one target-bound request without selecting or waiting on another owner."""
+    home = Path(profile_home).resolve()
+    key = _delivery_id(delivery_id)
+    if len(key) != 64 or key[:32] != selected_delivery_prefix(profile, session_id):
+        raise ValueError("delivery id is bound to a different target")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message must be a nonempty string")
+    if not isinstance(author, dict) or author.get("is_bot") is not True:
+        raise ValueError("selected delivery requires bot author attribution")
+
+    # Avoid creating a mailbox for a target which cannot pass canonical native
+    # selection. An existing mailbox is inspected first so idempotent replay does
+    # not depend on a still-live lease.
+    preflight_owner = None
+    if not has_mailbox(home):
+        preflight_owner = _selected_desktop_owner(home, session_id)
+
+    with _locked(home) as root:
         path = root / f"{key}.json"
-        existing = _read(path)
+        try:
+            existing = _read(path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"delivery receipt is invalid: {exc}") from exc
         if existing is not None:
-            if (existing["owner"] != pinned or existing["message"] != message or existing.get("author") != author
-                    or existing.get("notification_category", "result") != notification_category):
+            problem = _ticket_shape_error(path, existing)
+            if problem:
+                raise ValueError(f"delivery receipt is invalid: {problem}")
+            pinned = existing.get("owner")
+            if (not isinstance(pinned, dict) or pinned.get("profile_home") != str(home)
+                    or pinned.get("session_id") != session_id
+                    or existing.get("message") != message or existing.get("author") != author
+                    or existing.get("notification_category", "result") != "result"):
                 raise ValueError("delivery id already belongs to a different payload")
-            return existing
-        record = dict(delivery_id=key, id=key, owner=pinned, **pinned,
-                      message=message, status="queued", created_at=time.time_ns(),
-                      sequence=_next_sequence(root), **({"author": dict(author)} if author else {}))
-        if notification_category == "diagnostic":
-            record["notification_category"] = notification_category
-        _write(path, record)
-        return record
+            result = dict(existing)
+            if existing["status"] in {"queued", "claimed"}:
+                try:
+                    current = _selected_desktop_owner(home, session_id)
+                    result["delivery_unknown"] = not _matches(home, existing, current)
+                except (OSError, ValueError, KeyError, TypeError):
+                    result["delivery_unknown"] = True
+            else:
+                result["delivery_unknown"] = False
+            return result
+
+        # Recheck owner while serializing admission. If it was released/replaced after
+        # lookup, no receipt is created and no alternate target is considered.
+        with _selected_owner_guard(home, session_id) as owner:
+            if preflight_owner is not None and _owner(home, preflight_owner) != _owner(home, owner):
+                raise ValueError("selected Desktop owner changed before admission")
+            pinned = _owner(home, owner)
+            record = _admit_locked(root, pinned, message, key, author)
+            record["delivery_unknown"] = False
+            return record
 
 
 def _matches(home: Path | str, record: dict, owner: dict) -> bool:

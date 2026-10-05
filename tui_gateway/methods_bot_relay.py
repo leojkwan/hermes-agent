@@ -93,6 +93,8 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
     """Deliver a relayed DM (``profile``, attribution-prefixed ``message``) into a Bot Chat ON THIS
     GATEWAY via the one-turn ``hermes -p <profile> chat -c "Bot Chat"`` transport local DMs use →
     ``{reply}``. Blocking by design (Desktop relay worker; the RPC pool keeps it off the reader)."""
+    if "delivery_id" in params or "session_id" in params:
+        return _deliver_selected(rid, params, _root)
     import tempfile
     profile = str(params.get("profile") or "").strip()
     message = str(params.get("message") or "").strip()
@@ -245,6 +247,76 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
         return _err(rid, 5096 if reason == "target_busy" else 5094, str(e), data={"reason": reason})
 
 
+def _deliver_selected(rid: int, params: dict, root_for_relay) -> dict:
+    """Selected Bot Chat dispatch is an immediate native receipt, never a turn transport."""
+    delivery_id, session_id = params.get("delivery_id"), params.get("session_id")
+    profile, message = params.get("profile"), params.get("message")
+    if (not isinstance(delivery_id, str) or not isinstance(session_id, str) or not session_id
+            or not isinstance(profile, str) or not profile.strip()
+            or not isinstance(message, str) or not message.strip()):
+        return _err(rid, 4090, "invalid selected delivery input", data={"reason": "invalid_input"})
+    import re
+    if re.fullmatch(r"[0-9a-f]{64}", delivery_id) is None:
+        return _err(rid, 4090, "invalid selected delivery id", data={"reason": "invalid_input"})
+    message = message.strip()
+    from tools.bot_mode_dm import MESSAGE_MAX_CHARS
+    if len(message) > MESSAGE_MAX_CHARS:
+        return _err(rid, 4091, "message too long", data={"reason": "message_too_long"})
+
+    try:
+        resolved = "default" if profile.strip().lower() == "hermes" else profile.strip()
+        from tools.bot_mode_probe import _roster
+        if resolved not in {name for name, _ in _roster(root_for_relay())}:
+            return _err(rid, 4092, "selected profile is unavailable", data={"reason": "invalid_target"})
+        live_home = _profile_home(resolved)
+        owner_home = live_home if live_home is not None else Path(_hermes_home)
+
+        from tools.bot_relay import delivery_turn_author, relaying_principal_author
+        from tui_gateway.methods_browser_control import _is_authenticated_identity, _principal_digest
+        identity = getattr(current_transport(), "auth_identity", None)
+        if _is_authenticated_identity(identity):
+            author = relaying_principal_author(_principal_digest(identity))
+        else:
+            author = delivery_turn_author(params.get("from_profile"), params.get("from_handle"),
+                                          params.get("from_connection"))
+            if author is None:
+                author = delivery_turn_author("server", "Hermes server", "local")
+
+        from tools.bot_live_delivery import deliver_to_selected_live_owner
+        record = deliver_to_selected_live_owner(
+            owner_home, resolved, session_id, message, delivery_id=delivery_id, author=author,
+        )
+        status = record["status"]
+        reply = ""
+        error = str(record.get("error") or "")
+        reason = str(record.get("reason") or "")
+        if status == "settled":
+            from tui_gateway.prompt_turn import _bot_mode_delivery_text
+            reply = _bot_mode_delivery_text((record.get("reply") or "").strip(), successful=True)
+        elif status in {"failed", "cancelled", "ambiguous"}:
+            if not error:
+                error = f"Bot Chat delivery {status}"
+            if not reason:
+                reason = status
+        return _ok(rid, {"reply": reply, "delivery_id": delivery_id, "session_id": session_id,
+                         "status": status, "delivery_unknown": bool(record.get("delivery_unknown")),
+                         "error": error, "reason": reason})
+    except ValueError as exc:
+        detail = str(exc)
+        if "different payload" in detail or "different target" in detail:
+            return _err(rid, 4094, detail, data={"reason": "immutable_conflict"})
+        if "receipt is invalid" in detail:
+            return _err(rid, 5094, detail, data={"reason": "receipt_uninspectable"})
+        if any(term in detail for term in ("compression tip", "canonical Desktop", "different target")):
+            return _err(rid, 4092, detail, data={"reason": "invalid_target"})
+        if ("unavailable" in detail or "ambiguous" in detail or "consumer" in detail
+                or "changed before admission" in detail):
+            return _err(rid, 5096, detail, data={"reason": "stale_owner"})
+        return _err(rid, 4090, detail, data={"reason": "invalid_input"})
+    except (OSError, KeyError, TypeError) as exc:
+        return _err(rid, 5094, str(exc), data={"reason": "coordination_uninspectable"})
+
+
 @method("bot_relay.reply")
 def _(rid, params: dict, _root=_relay_root) -> dict:
     """Write a relayed ``reply`` and/or ``error`` (+ optional typed ``reason``, see
@@ -264,6 +336,8 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
 
 
 def register(server) -> None:
+    from .method_ctx import rebind
+    server._deliver_selected = rebind(_deliver_selected, vars(server))
     _registry.install(server)
     from . import methods_groups
     server._LONG_HANDLERS = server._LONG_HANDLERS | methods_groups.LONG_HANDLERS

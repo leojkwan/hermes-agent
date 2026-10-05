@@ -6947,6 +6947,16 @@
             ],
             "default": null,
             "title": "From Connection"
+          },
+          "delivery_id": {
+            "default": "",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "session_id": {
+            "default": "",
+            "title": "Session Id",
+            "type": "string"
           }
         },
         "required": [
@@ -6961,6 +6971,36 @@
         "properties": {
           "reply": {
             "title": "Reply",
+            "type": "string"
+          },
+          "delivery_id": {
+            "default": "",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "session_id": {
+            "default": "",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "delivery_unknown": {
+            "default": false,
+            "title": "Delivery Unknown",
+            "type": "boolean"
+          },
+          "error": {
+            "default": "",
+            "title": "Error",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
             "type": "string"
           }
         },
