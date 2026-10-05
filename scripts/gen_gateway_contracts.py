@@ -86,7 +86,11 @@ class Renderer:
         assert ref.startswith("#/$defs/"), ref
         return ref[len("#/$defs/"):]
 
-    def type_of(self, schema: dict, *, inline_depth: int = 0) -> str:
+    def type_of(self, schema: dict | bool, *, inline_depth: int = 0) -> str:
+        if schema is False:
+            return "never"
+        if schema is True:
+            return "unknown"
         if "$ref" in schema:
             name = self.ref_name(schema["$ref"])
             self.ensure(name)

@@ -6901,6 +6901,62 @@
         "type": "object"
       },
       "BotRelayDeliverParams": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/BotRelayLegacyDeliverParams"
+          },
+          {
+            "$ref": "#/components/schemas/BotRelaySelectedDeliverParams"
+          }
+        ],
+        "description": "Legacy fields only, or both selected fields with their native constraints.",
+        "title": "BotRelayDeliverParams"
+      },
+      "BotRelayDeliverResult": {
+        "additionalProperties": false,
+        "properties": {
+          "reply": {
+            "title": "Reply",
+            "type": "string"
+          },
+          "delivery_id": {
+            "default": "",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "session_id": {
+            "default": "",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "delivery_unknown": {
+            "default": false,
+            "title": "Delivery Unknown",
+            "type": "boolean"
+          },
+          "error": {
+            "default": "",
+            "title": "Error",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reply"
+        ],
+        "title": "BotRelayDeliverResult",
+        "type": "object"
+      },
+      "BotRelayLegacyDeliverParams": {
         "additionalProperties": false,
         "description": "``profile`` here is the TARGET profile on this gateway (also what the desktop route wrapper adds).",
         "properties": {
@@ -6948,68 +7004,14 @@
             "default": null,
             "title": "From Connection"
           },
-          "delivery_id": {
-            "default": "",
-            "description": "Optional with session_id only. Retain this complete 64 lowercase hex ID before sending: first 32 chars are SHA256(normalized profile + NUL + exact session_id)[:32], last 32 chars are a stable caller nonce. Reuse the full ID unchanged after uncertainty.",
-            "title": "Delivery Id",
-            "type": "string"
-          },
-          "session_id": {
-            "default": "",
-            "description": "Exact persistent canonical Desktop Bot Chat compression-tip ID; pair with delivery_id. Prefixes, UI session IDs and other sources are refused.",
-            "title": "Session Id",
-            "type": "string"
-          }
+          "delivery_id": false,
+          "session_id": false
         },
         "required": [
           "profile",
           "message"
         ],
-        "title": "BotRelayDeliverParams",
-        "type": "object"
-      },
-      "BotRelayDeliverResult": {
-        "additionalProperties": false,
-        "properties": {
-          "reply": {
-            "title": "Reply",
-            "type": "string"
-          },
-          "delivery_id": {
-            "default": "",
-            "title": "Delivery Id",
-            "type": "string"
-          },
-          "session_id": {
-            "default": "",
-            "title": "Session Id",
-            "type": "string"
-          },
-          "status": {
-            "default": "",
-            "title": "Status",
-            "type": "string"
-          },
-          "delivery_unknown": {
-            "default": false,
-            "title": "Delivery Unknown",
-            "type": "boolean"
-          },
-          "error": {
-            "default": "",
-            "title": "Error",
-            "type": "string"
-          },
-          "reason": {
-            "default": "",
-            "title": "Reason",
-            "type": "string"
-          }
-        },
-        "required": [
-          "reply"
-        ],
-        "title": "BotRelayDeliverResult",
+        "title": "BotRelayLegacyDeliverParams",
         "type": "object"
       },
       "BotRelayOutboxDrainParams": {
@@ -7156,6 +7158,77 @@
           "count"
         ],
         "title": "BotRelayRosterSyncResult",
+        "type": "object"
+      },
+      "BotRelaySelectedDeliverParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "title": "Profile",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "from_profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Profile"
+          },
+          "from_handle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Handle"
+          },
+          "from_connection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Connection"
+          },
+          "delivery_id": {
+            "description": "Optional with session_id only. Retain this complete 64 lowercase hex ID before sending: first 32 chars are SHA256(normalized profile + NUL + exact session_id)[:32], last 32 chars are a stable caller nonce. Reuse the full ID unchanged after uncertainty.",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Exact persistent canonical Desktop Bot Chat compression-tip ID; pair with delivery_id. Prefixes, UI session IDs and other sources are refused.",
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile",
+          "message",
+          "delivery_id",
+          "session_id"
+        ],
+        "title": "BotRelaySelectedDeliverParams",
         "type": "object"
       },
       "BrowserAction": {

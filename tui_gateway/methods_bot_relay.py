@@ -319,7 +319,7 @@ def _deliver_selected(rid: int, params: dict, root_for_relay) -> dict:
                 or "changed before admission" in detail):
             return _err(rid, 5096, "selected Desktop owner is unavailable", data={"reason": "stale_owner"})
         return _err(rid, 4090, "invalid selected delivery input", data={"reason": "invalid_input"})
-    except (OSError, KeyError, TypeError):
+    except Exception:
         logging.getLogger(__name__).debug("Selected delivery coordination failed", exc_info=True)
         return _err(rid, 5094, "native delivery coordination is unavailable", data={"reason": "coordination_uninspectable"})
 

@@ -31,3 +31,19 @@ def test_selected_delivery_rejects_partial_null_empty_and_malformed_pair(patch):
     params = {"profile": "ops", "message": "hi", **patch}
     with pytest.raises(ValidationError):
         BotRelayDeliverParams.model_validate(params)
+
+
+def test_published_json_schema_enforces_the_same_pair_and_id_constraints():
+    from jsonschema import Draft202012Validator
+    validator = Draft202012Validator(BotRelayDeliverParams.model_json_schema())
+    legacy = {"profile": "ops", "message": "hi"}
+    selected = {**legacy, "session_id": "persistent-chat", "delivery_id": "a" * 64}
+    assert validator.is_valid(legacy)
+    assert validator.is_valid(selected)
+    for invalid in (
+        {**legacy, "delivery_id": "a" * 64}, {**legacy, "session_id": "persistent-chat"},
+        {**selected, "delivery_id": None}, {**selected, "session_id": None},
+        {**selected, "delivery_id": "a" * 32}, {**selected, "delivery_id": "A" * 64},
+        {**selected, "delivery_id": "a" * 64 + "\n"}, {**selected, "session_id": ""},
+    ):
+        assert not validator.is_valid(invalid), invalid

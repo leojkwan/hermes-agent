@@ -1744,15 +1744,26 @@ export interface RelayEnvelope {
   message: string
   [key: string]: unknown
 }
+/** Legacy fields only, or both selected fields with their native constraints. */
+export type BotRelayDeliverParams = BotRelayLegacyDeliverParams | BotRelaySelectedDeliverParams
 /** ``profile`` here is the TARGET profile on this gateway (also what the desktop route wrapper adds). */
-export interface BotRelayDeliverParams {
+export interface BotRelayLegacyDeliverParams {
   profile: string
   message: string
   from_profile?: string | null
   from_handle?: string | null
   from_connection?: string | null
-  delivery_id?: string
-  session_id?: string
+  delivery_id?: never
+  session_id?: never
+}
+export interface BotRelaySelectedDeliverParams {
+  profile: string
+  message: string
+  from_profile?: string | null
+  from_handle?: string | null
+  from_connection?: string | null
+  delivery_id: string
+  session_id: string
 }
 export interface BotRelayDeliverResult {
   reply: string

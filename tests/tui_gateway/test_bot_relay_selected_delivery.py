@@ -488,6 +488,72 @@ def test_selected_rpc_sanitizes_unreadable_native_receipt_error(tmp_path, monkey
         db.close()
 
 
+def test_native_poller_does_not_claim_after_reconnect_transfers_its_snapshot(tmp_path, monkeypatch):
+    import threading
+    from hermes_cli.active_sessions import transfer_active_session
+    from tools import bot_live_delivery as mailbox
+    from tui_gateway import server
+    db, held = _seed_selected_owner(tmp_path, "canonical", live="old-live")
+    author = {"id": "bot:proof", "name": "Proof", "is_bot": True}
+    key = _delivery_id("default", "canonical")
+    try:
+        queued = mailbox.deliver_to_selected_live_owner(
+            tmp_path, "default", "canonical", "must stay queued", delivery_id=key, author=author)
+        path = mailbox._root(tmp_path) / f"{key}.json"
+        before = path.read_bytes()
+        native_matches = mailbox._matches
+        transfers = []
+        def reconnect_after_snapshot(home, record, owner):
+            matched = native_matches(home, record, owner)
+            if matched and not transfers:
+                assert transfer_active_session(held, session_id="canonical", metadata={
+                    "live_session_id": "new-live", "bot_live_delivery_consumer": True})
+                transfers.append(True)
+            return matched
+        monkeypatch.setattr(mailbox, "_matches", reconnect_after_snapshot)
+        monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: pytest.fail("stale runtime started a turn"))
+        session = {"profile_home": str(tmp_path), "session_key": "canonical", "agent": object(),
+                   "history_lock": threading.RLock(), "active_session_lease": held, "running": False}
+        assert server._poll_bot_live_delivery_once("old-live", session) is False
+        assert transfers == [True]
+        assert path.read_bytes() == before
+        assert mailbox.read_delivery_result(tmp_path, queued["id"])["status"] == "queued"
+    finally:
+        held.release()
+        db.close()
+
+
+def test_valid_selected_receipt_replays_unknown_through_corrupt_native_registry(tmp_path, monkeypatch):
+    from tools import bot_live_delivery as mailbox
+    from tui_gateway import server
+    db, held = _seed_selected_owner(tmp_path, "canonical")
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: tmp_path)
+    monkeypatch.setattr("tools.bot_mode_probe._roster", lambda _root: [("ops", tmp_path)])
+    key = _delivery_id("ops", "canonical")
+    try:
+        assert _selected_rpc(server, "ops", "canonical", key)["result"]["status"] == "queued"
+        path = mailbox._root(tmp_path) / f"{key}.json"
+        before = path.read_bytes()
+        registry = tmp_path / "runtime" / "active_sessions.json"
+        native_bytes = registry.read_bytes()
+        registry.write_text("{")
+        try:
+            replay = _selected_rpc(server, "ops", "canonical", key)
+            assert replay["result"]["status"] == "queued"
+            assert replay["result"]["delivery_unknown"] is True
+            assert path.read_bytes() == before
+            fresh = _selected_rpc(server, "ops", "canonical", _delivery_id("ops", "canonical", "b" * 32))
+            assert fresh["error"]["data"]["reason"] == "coordination_uninspectable"
+            assert str(tmp_path) not in fresh["error"]["message"]
+            assert not (mailbox._root(tmp_path) / f"{_delivery_id('ops', 'canonical', 'b' * 32)}.json").exists()
+        finally:
+            registry.write_bytes(native_bytes)
+    finally:
+        held.release()
+        db.close()
+
+
 def test_selected_handler_returns_immediate_receipt_without_legacy_dispatch(tmp_path, monkeypatch):
     from tools import bot_live_delivery
     from tui_gateway import methods_bot_relay

@@ -14,7 +14,7 @@ import os
 import re
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from utils import atomic_json_write, atomic_write_text, fsync_directory
 from pathlib import Path
@@ -150,6 +150,11 @@ def _ticket_shape_error(path: Path, record: dict[str, Any]) -> str | None:
         return "created_at/sequence are not integers"
     if not isinstance(owner, dict) or not all(isinstance(owner.get(k), str) and owner[k] for k in _OWNER_KEYS):
         return "owner pin is incomplete"
+    if "selected_profile" in record:
+        profile = record["selected_profile"]
+        if (not isinstance(profile, str) or not profile or len(path.stem) != 64
+                or path.stem[:32] != selected_delivery_prefix(profile, owner["session_id"])):
+            return "selected target binding is invalid"
     return None
 
 
@@ -204,7 +209,7 @@ def _write(path: Path, record: dict[str, Any]) -> None:
 
 def _admit_locked(
     root: Path, pinned: dict[str, str], message: str, key: str,
-    author: dict[str, Any] | None, notification_category: str = "result",
+    author: dict[str, Any] | None, notification_category: str = "result", *, selected_profile: str | None = None,
 ) -> dict[str, Any]:
     """Read or create one ticket while the caller holds the mailbox lock."""
     path = root / f"{key}.json"
@@ -223,6 +228,8 @@ def _admit_locked(
                   sequence=_next_sequence(root), **({"author": dict(author)} if author else {}))
     if notification_category == "diagnostic":
         record["notification_category"] = notification_category
+    if selected_profile is not None:
+        record["selected_profile"] = selected_profile
     _write(path, record)
     return record
 
@@ -347,7 +354,8 @@ def deliver_to_selected_live_owner(
                 raise ValueError(f"delivery receipt is invalid: {problem}")
             pinned = existing.get("owner")
             if (not isinstance(pinned, dict) or pinned.get("profile_home") != str(home)
-                    or pinned.get("session_id") != session_id
+                        or pinned.get("session_id") != session_id
+                        or existing.get("selected_profile") != profile
                     or existing.get("message") != message or existing.get("author") != author
                     or existing.get("notification_category", "result") != "result"):
                 raise ValueError("delivery id already belongs to a different payload")
@@ -356,7 +364,8 @@ def deliver_to_selected_live_owner(
                 try:
                     current = _selected_desktop_owner(home, session_id)
                     result["delivery_unknown"] = not _matches(home, existing, current)
-                except (OSError, ValueError, KeyError, TypeError):
+                except Exception:
+                    log.debug("Selected receipt owner is uninspectable", exc_info=True)
                     result["delivery_unknown"] = True
             else:
                 result["delivery_unknown"] = False
@@ -366,7 +375,7 @@ def deliver_to_selected_live_owner(
         # lookup, no receipt is created and no alternate target is considered.
         with _selected_owner_guard(home, session_id, preflight_owner) as owner:
             pinned = _owner(home, owner)
-            record = _admit_locked(root, pinned, message, key, author)
+            record = _admit_locked(root, pinned, message, key, author, selected_profile=profile)
             record["delivery_unknown"] = False
             return record
 
@@ -414,8 +423,16 @@ def claim_pending_delivery(
             return None
         record = min(pending, key=lambda item: (
             item.get("sequence", item["created_at"]), item["delivery_id"]))
-        record.update(status="claimed", claimed_at=time.time_ns())
-        _write(root / f"{record['delivery_id']}.json", record)
+        guard = (_selected_owner_guard(Path(profile_home).resolve(), current["session_id"], current)
+                 if "selected_profile" in record else nullcontext())
+        try:
+            with guard:
+                record.update(status="claimed", claimed_at=time.time_ns())
+                _write(root / f"{record['delivery_id']}.json", record)
+        except ValueError:
+            if record["status"] != "queued":
+                raise
+            return None
         return record
 
 

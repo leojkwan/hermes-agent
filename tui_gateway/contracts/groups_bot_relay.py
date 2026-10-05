@@ -9,9 +9,7 @@ Handlers: ``tui_gateway/methods_groups.py``, ``tui_gateway/methods_bot_relay.py`
 
 from __future__ import annotations
 
-import re
-
-from pydantic import Field, model_validator
+from pydantic import Field, RootModel
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OkResult, OpenModel, ProfileParams
@@ -546,7 +544,11 @@ method("bot_relay.outbox.drain", params=BotRelayOutboxDrainParams, result=BotRel
        doc="Atomically claim every pending cross-connection envelope queued on this gateway.")
 
 
-class BotRelayDeliverParams(Params):
+def _legacy_relay_schema(schema: dict) -> None:
+    schema["properties"].update(delivery_id=False, session_id=False)
+
+
+class BotRelayLegacyDeliverParams(Params):
     """``profile`` here is the TARGET profile on this gateway (also what the desktop route wrapper adds)."""
 
     profile: str
@@ -554,28 +556,22 @@ class BotRelayDeliverParams(Params):
     from_profile: str | None = None
     from_handle: str | None = None
     from_connection: str | None = None
-    delivery_id: str = Field(default="", description=(
+    model_config = Params.model_config | {"json_schema_extra": _legacy_relay_schema}
+
+
+class BotRelaySelectedDeliverParams(BotRelayLegacyDeliverParams):
+    model_config = Params.model_config | {"json_schema_extra": None}
+    delivery_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$", description=(
         "Optional with session_id only. Retain this complete 64 lowercase hex ID before sending: "
         "first 32 chars are SHA256(normalized profile + NUL + exact session_id)[:32], "
         "last 32 chars are a stable caller nonce. Reuse the full ID unchanged after uncertainty."))
-    session_id: str = Field(default="", description=(
+    session_id: str = Field(min_length=1, description=(
         "Exact persistent canonical Desktop Bot Chat compression-tip ID; pair with delivery_id. "
         "Prefixes, UI session IDs and other sources are refused."))
 
-    @model_validator(mode="before")
-    @classmethod
-    def validate_selected_delivery_pair(cls, value):
-        if not isinstance(value, dict):
-            return value
-        has_delivery, has_session = "delivery_id" in value, "session_id" in value
-        if not has_delivery and not has_session:
-            return value
-        delivery_id, session_id = value.get("delivery_id"), value.get("session_id")
-        if (not has_delivery or not has_session or not isinstance(delivery_id, str)
-                or not isinstance(session_id, str) or not session_id
-                or re.fullmatch(r"[0-9a-f]{64}", delivery_id) is None):
-            raise ValueError("delivery_id and session_id must be supplied as a valid selected pair")
-        return value
+
+class BotRelayDeliverParams(RootModel[BotRelayLegacyDeliverParams | BotRelaySelectedDeliverParams]):
+    """Legacy fields only, or both selected fields with their native constraints."""
 
 
 class BotRelayDeliverResult(Result):
