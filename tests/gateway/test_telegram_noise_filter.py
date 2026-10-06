@@ -277,7 +277,14 @@ def test_local_surface_keeps_terminal_eos_control_token():
 
 
 def test_telegram_status_sanitizes_raw_provider_security_errors():
-    """Provider policy/security bodies should be replaced before chat delivery."""
+    """Terminal failure statuses are suppressed on chat surfaces — security bodies never render.
+
+    E0919 duplicate-failure render: this status (the generic terminal branch of
+    ``max_retries_exhausted_result``) used to convert through the provider-error
+    reply table, rendering a SECOND failure bubble beside the turn's authoritative
+    ``exhausted_copy`` final. Suppression satisfies the original security feature
+    (raw policy text, HTTP codes, request IDs never reach the chat) with zero
+    bubbles; the final copy is the one user-facing failure message."""
     raw = (
         "❌ API failed after 3 retries — HTTP 400: request blocked because "
         "Operation contains cybersecurity risk. request_id=req_123"
@@ -285,11 +292,7 @@ def test_telegram_status_sanitizes_raw_provider_security_errors():
 
     sanitized = _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", raw)
 
-    assert sanitized is not None
-    assert "rejected this request" in sanitized.lower()
-    assert "cybersecurity risk" not in sanitized.lower()
-    assert "HTTP 400" not in sanitized
-    assert "req_123" not in sanitized
+    assert sanitized is None
 
 
 def test_telegram_final_response_sanitizes_raw_provider_errors():
