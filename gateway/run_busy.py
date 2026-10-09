@@ -996,6 +996,7 @@ class GatewayBusySessionMixin:
         args = (event.get_command_args() or "").strip()
         if args.lower() in {"off", "resume", "stop", "disengage"}:
             if estop.disengage():
+                self._resume_after_pause_release()
                 return t("gateway.pause.resumed")
             return t("gateway.pause.not_paused")
         state = estop.get_state()

@@ -1222,6 +1222,259 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
 
 
 # ---------------------------------------------------------------------------
+# Global emergency stop: a paused boot starts no replacement agent
+# ---------------------------------------------------------------------------
+#
+# Internal resume events bypass the inbound ESTOP gate, so the scheduler is the only gate: while
+# paused it must touch nothing (no slot claim, no restart-loop budget), and lifting the pause
+# (``/pause off`` or ``hermes resume``) must continue each interrupted session exactly once.
+
+
+def _pending_session(runner, chat_id):
+    """A restart-interrupted session awaiting auto-resume; returns ``(session_key, entry)``."""
+    source = make_restart_source(chat_id=chat_id)
+    session_key = runner._session_key_for_source(source)
+    entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: entry}
+    return session_key, entry
+
+
+def _wire_resume_pipeline(runner, adapter):
+    """Wire the real dispatch chain the scheduler feeds (as the full-path test above does) and the
+    real restart-loop recorder; returns the list that gets one session key per agent run started."""
+    from gateway.run import GatewayRunner
+
+    # A bare runner has no config to read the breaker's limits from; without this the recorder is skipped.
+    runner._restart_loop_guard_config = lambda: (3, 60, 300)
+    runner._handle_message = GatewayRunner._handle_message.__get__(runner, GatewayRunner)
+    runner._release_running_agent_state = GatewayRunner._release_running_agent_state.__get__(
+        runner, GatewayRunner
+    )
+    runner._check_slash_access = lambda *a, **k: None
+    runner._begin_session_run_generation = lambda session_key: 1
+    runner._is_session_run_current = lambda session_key, generation: True
+    runner._invalidate_session_run_generation = lambda *a, **k: 0
+    runner._claim_active_session_slot = lambda session_key, source: (object(), None)
+    runner._active_session_leases = {}
+    runner._busy_ack_ts = {}
+    runner._post_turn_goal_continuation = AsyncMock()
+    runner.session_store.get_or_create_session.return_value = None
+
+    agent_runs: list[str] = []
+
+    async def _fake_run(event, source, _quick_key, run_generation):
+        agent_runs.append(_quick_key)
+        return "RESUMED OK"
+
+    runner._handle_message_with_agent = _fake_run
+    adapter.set_message_handler(runner._handle_message)
+    adapter.send = AsyncMock()
+    adapter._keep_typing = AsyncMock()
+    adapter._stop_typing_refresh = AsyncMock()
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True, message_id="1"))
+    adapter._run_processing_hook = AsyncMock()
+    return agent_runs
+
+
+def _pause_command(source, args):
+    return MessageEvent(text=f"/pause {args}", message_type=MessageType.COMMAND, source=source)
+
+
+async def _settle():
+    # Let the guarded task, the background task and the late-arrival drain task all finish.
+    for _ in range(20):
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_paused_boot_starts_no_agent_and_keeps_restart_budget_until_release():
+    """Under the global emergency stop a restart-interrupted session starts no replacement agent and
+    spends no restart-loop budget (the recorder is real here); lifting the pause continues the same
+    session exactly once, and the budget is spent then, as at an unpaused boot."""
+    from agent import estop
+    from gateway import restart_loop_guard
+
+    runner, adapter = make_restart_runner()
+    session_key, entry = _pending_session(runner, "paused-boot-chat")
+    marker = entry.last_resume_marked_at
+    agent_runs = _wire_resume_pipeline(runner, adapter)
+
+    estop.engage(reason="synthetic pause")
+    assert runner._schedule_resume_pending_sessions() == 0
+    await _settle()
+
+    assert agent_runs == []
+    assert session_key not in runner._running_agents
+    assert restart_loop_guard._load_boots() == []
+    assert (entry.resume_pending, entry.resume_reason, entry.last_resume_marked_at) == (
+        True, "restart_interrupted", marker)
+
+    reply = await runner._handle_pause_command(_pause_command(entry.origin, "off"))
+    await _settle()
+
+    assert "resumed" in reply.lower()
+    assert agent_runs == [session_key]
+    assert len(restart_loop_guard._load_boots()) == 1
+    assert session_key not in runner._running_agents
+
+    # Nothing is paused any more: a second release has nothing to lift and continues nothing.
+    await runner._handle_pause_command(_pause_command(entry.origin, "off"))
+    await _settle()
+    assert agent_runs == [session_key]
+
+
+@pytest.mark.asyncio
+async def test_pause_release_does_not_bypass_the_restart_loop_breaker():
+    """The release spends the restart-loop budget like a boot: a chain already at the limit still skips
+    the continuation, and the session stays pending for its next real message."""
+    from agent import estop
+    from gateway import restart_loop_guard
+
+    runner, adapter = make_restart_runner()
+    _, entry = _pending_session(runner, "breaker-chat")
+    agent_runs = _wire_resume_pipeline(runner, adapter)
+    now = time.time()
+    restart_loop_guard.record_restart_interrupted_boot(60, now=now - 20)
+    restart_loop_guard.record_restart_interrupted_boot(60, now=now - 10)
+
+    estop.engage(reason="synthetic pause")
+    await runner._handle_pause_command(_pause_command(entry.origin, "off"))
+    await _settle()
+
+    assert agent_runs == []
+    assert len(restart_loop_guard._load_boots()) == 3
+    assert (entry.resume_pending, entry.resume_reason) == (True, "restart_interrupted")
+
+
+@pytest.mark.asyncio
+async def test_paused_boot_still_delivers_an_owed_reply_without_regenerating_it(monkeypatch, tmp_path):
+    """A session whose answer finished before the restart only owes delivery: a paused boot still claims
+    and sends it once, and neither the paused scheduler nor the release re-runs the turn."""
+    from types import SimpleNamespace
+
+    from agent import estop
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "state.db")
+    runner, adapter = make_restart_runner()
+    session_key, entry = _pending_session(runner, "owed-chat")
+    agent_runs = _wire_resume_pipeline(runner, adapter)
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "default"
+
+    async def _clear_resume_pending(key):
+        runner.session_store._entries[key].resume_pending = False
+
+    # ``_store`` keeps the ``async_session_store`` property from rebuilding this stand-in.
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, clear_resume_pending=AsyncMock(side_effect=_clear_resume_pending)
+    )
+    dl.record_obligation(
+        obligation_id="owed-1", session_key=session_key, platform="telegram",
+        chat_id="owed-chat", thread_id=None, content="the finished answer",
+    )
+    with dl._connect() as conn:  # owned by the process that died
+        conn.execute(
+            "UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1 "
+            "WHERE obligation_id='owed-1'"
+        )
+
+    estop.engage(reason="synthetic pause")
+    claimed = await runner._claim_pending_obligations()
+    assert await runner._redeliver_claimed_obligations(claimed) == 1
+    assert runner._schedule_resume_pending_sessions() == 0
+    await runner._handle_pause_command(_pause_command(entry.origin, "off"))
+    await _settle()
+
+    assert [call.kwargs["content"] for call in adapter.send.await_args_list] == ["the finished answer"]
+    assert entry.resume_pending is False
+    assert agent_runs == []
+
+
+@pytest.mark.asyncio
+async def test_pause_off_typed_in_the_paused_chat_continues_that_chat_once():
+    """``/pause off`` is the in-band release for messaging-only operators. Sent from the very chat a
+    paused boot left pending, its own turn is still delivering the reply when the continuation is
+    scheduled, so the resume queues behind it and then runs once."""
+    from agent import estop
+
+    runner, adapter = make_restart_runner()
+    session_key, entry = _pending_session(runner, "same-chat")
+    agent_runs = _wire_resume_pipeline(runner, adapter)
+    handle_message = runner._handle_message
+
+    async def _route(event):
+        if event.get_command() == "pause":
+            return await runner._handle_pause_command(event)
+        return await handle_message(event)
+
+    async def _slow_send(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return SendResult(success=True, message_id="1")
+
+    adapter.set_message_handler(_route)
+    adapter._send_with_retry = AsyncMock(side_effect=_slow_send)
+
+    estop.engage(reason="synthetic pause")
+    assert runner._schedule_resume_pending_sessions() == 0
+    await adapter.handle_message(_pause_command(entry.origin, "off"))
+    await _settle()
+
+    assert estop.is_engaged() is False
+    assert agent_runs == [session_key]
+    assert session_key not in runner._running_agents
+    assert session_key not in adapter._active_sessions
+    assert session_key not in getattr(adapter, "_pending_messages", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.platforms("posix")  # unix socket transport
+async def test_hermes_resume_continues_the_pending_session_through_the_gateway(capsys):
+    """``hermes resume`` runs in another process: it lifts the pause, then asks the gateway over its
+    control socket to continue what the paused boot left pending (a boot has no tick to pick it up)."""
+    import argparse
+
+    from agent import estop
+    from gateway.control_socket import GatewayControlServer
+    from gateway.run import _resume_pending_verb
+    from hermes_cli.subcommands.pause import cmd_resume
+    from hermes_constants import get_hermes_home
+
+    runner, adapter = make_restart_runner()
+    session_key, _ = _pending_session(runner, "cli-resume-chat")
+    agent_runs = _wire_resume_pipeline(runner, adapter)
+    estop.engage(reason="synthetic pause")
+    assert runner._schedule_resume_pending_sessions() == 0
+
+    loop = asyncio.get_running_loop()
+    server = GatewayControlServer(
+        home=get_hermes_home(), verb_handlers={"resume-pending": _resume_pending_verb(runner, loop)}
+    )
+    assert await server.start()
+    try:
+        exit_code = await loop.run_in_executor(None, cmd_resume, argparse.Namespace())
+    finally:
+        await server.stop()
+    await _settle()
+
+    assert exit_code == 0
+    assert estop.is_engaged() is False
+    assert "Continuing 1 restart-interrupted session" in capsys.readouterr().out
+    assert agent_runs == [session_key]
+
+
+# ---------------------------------------------------------------------------
 # Startup-restore inbound gate must be BOUNDED
 # ---------------------------------------------------------------------------
 

@@ -34,9 +34,21 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     if disengage():
         print("▶️  Hermes resumed — dispatch picks up on the next tick.")
+        _continue_paused_sessions()
     else:
         print(f"Hermes is not paused (no sentinel at {sentinel_path()}).")
     return 0
+
+
+def _continue_paused_sessions() -> None:
+    """Ask the running gateway to continue the restart-interrupted sessions its paused boot left pending
+    (a boot has no tick to pick them up); no gateway answering is fine, they wait for their next message."""
+    from gateway.control_socket import resume_gateway_pending
+    from hermes_constants import get_hermes_home
+
+    scheduled = (resume_gateway_pending(get_hermes_home()) or {}).get("scheduled")
+    if scheduled:
+        print(f"    Continuing {scheduled} restart-interrupted session(s).")
 
 
 def build_pause_parser(subparsers) -> None:

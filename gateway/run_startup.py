@@ -599,10 +599,16 @@ class GatewayStartupMixin:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
-        sessions with a running agent are skipped so none is resumed twice."""
+        sessions with a running agent are skipped so none is resumed twice. Under the global emergency
+        stop nothing is touched: internal events bypass the inbound gate, so this is the only gate. The
+        sessions stay ``resume_pending`` and the restart-loop budget unspent until
+        ``_resume_after_pause_release`` runs this again."""
+        from agent.estop import check_paused
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
+        if check_paused("restart-resume", logger):
+            return 0
         window = _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
@@ -647,6 +653,16 @@ class GatewayStartupMixin:
         if scheduled:
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
+
+    def _resume_after_pause_release(self) -> int:
+        """Run the auto-resume scheduler once a pause lifts (``/pause off``, ``hermes resume``) so what a
+        paused boot or reconnect left ``resume_pending`` continues exactly once: freshness, owner
+        authorization and the restart-loop budget apply as at boot. A failure never undoes the release."""
+        try:
+            return self._schedule_resume_pending_sessions()
+        except Exception:
+            logger.warning("Auto-resume after pause release failed", exc_info=True)
+            return 0
 
     def _startup_should_abort(self) -> bool:
         return self._restart_requested or self._draining or self._shutdown_event.is_set()

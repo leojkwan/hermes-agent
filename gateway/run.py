@@ -5539,6 +5539,20 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
     return None
 
 
+def _resume_pending_verb(runner, loop):
+    """``resume-pending`` control verb: ``hermes resume`` (another process) lifted the pause, so continue
+    what a paused boot or reconnect left ``resume_pending``. Runs on the socket executor; the scheduler
+    claims slots and creates tasks, so marshal it onto the gateway loop."""
+    def _handler() -> dict:
+        async def _release() -> int:
+            return runner._resume_after_pause_release()
+        try:
+            return {"scheduled": asyncio.run_coroutine_threadsafe(_release(), loop).result(timeout=5.0)}
+        except concurrent.futures.TimeoutError:
+            return {"pending": True}
+    return _handler
+
+
 async def _start_gateway_start_control_socket(runner):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
     import atexit
@@ -5609,7 +5623,8 @@ async def _start_gateway_start_control_socket(runner):
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           "resume-pending": _resume_pending_verb(runner, _main_loop)})
         if not await _control_server.start():
             _control_server = None
         else:

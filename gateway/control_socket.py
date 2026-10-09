@@ -370,6 +370,14 @@ def rescan_gateway_profiles(home: Path, *, timeout: float = 8.0) -> Optional[dic
     return query_gateway_control(home, "rescan-profiles", timeout=timeout)
 
 
+def resume_gateway_pending(home: Path, *, timeout: float = 8.0) -> Optional[dict[str, Any]]:
+    """Ask the gateway serving ``home`` to continue the restart-interrupted sessions a paused boot left
+    ``resume_pending``, after ``hermes resume`` lifted the pause. Returns ``{"scheduled": N}``, or None
+    when no gateway answers / it predates the verb — those sessions then continue on their next real
+    message or the next boot."""
+    return query_gateway_control(home, "resume-pending", timeout=timeout)
+
+
 def request_unserve_profile(home: Path, name: str) -> Optional[dict[str, Any]]:
     return query_gateway_control(home, "unserve-profile", params={"name": name}, timeout=8.0)
 
