@@ -165,3 +165,61 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+def _zai_coding_base() -> str:
+    return "https://api.z.ai/api/coding/paas/v4"
+
+
+def test_zai_overload_classifier_covers_glm_5_3_flash_family():
+    err = _zai_overload_error()
+    for model in ("glm-5.2", "glm-5.3-flash", "glm-5.3-flashx"):
+        assert retry_utils.is_zai_coding_overload_error(base_url=_zai_coding_base(), model=model, error=err)
+
+
+def test_zai_overload_classifier_matches_structured_code_not_bare_text():
+    # Structured 1305 classifies as overload even without the message phrase.
+    assert retry_utils.is_zai_coding_overload_error(
+        base_url=_zai_coding_base(),
+        model="glm-5.3-flash",
+        error=SimpleNamespace(status_code=429, body={"error": {"code": "1305", "message": "please try again later"}}),
+    )
+    # A quota 1302 whose text merely mentions "1305" is quota, not overload: it
+    # must keep failing fast instead of entering the long-backoff schedule.
+    assert not retry_utils.is_zai_coding_overload_error(
+        base_url=_zai_coding_base(),
+        model="glm-5.3-flash",
+        error=SimpleNamespace(
+            status_code=429,
+            body={"error": {"code": "1302", "message": "Rate limit reached for requests (ref 1305)"}},
+        ),
+    )
+    # Unparsed error shapes keep the phrase-based path.
+    assert retry_utils.is_zai_coding_overload_error(
+        base_url=_zai_coding_base(),
+        model="glm-5.3-flash",
+        error=SimpleNamespace(
+            status_code=429,
+            body=None,
+            message="The service may be temporarily overloaded, please try again later",
+        ),
+    )
+    # 429 + overload shape on a model outside the covered families stays out of scope.
+    assert not retry_utils.is_zai_coding_overload_error(
+        base_url=_zai_coding_base(),
+        model="glm-5.3",
+        error=_zai_overload_error(),
+    )
+
+
+def test_zai_overload_adaptive_long_waits_cover_flash():
+    for attempt, low, high in ((4, 30.0, 36.0), (5, 60.0, 72.0)):
+        wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url=_zai_coding_base(),
+            model="glm-5.3-flash",
+            error=_zai_overload_error(),
+            default_wait=10.0,
+        )
+        assert policy == "zai_coding_overload_long"
+        assert low <= wait <= high  # schedule base plus <=20% jitter

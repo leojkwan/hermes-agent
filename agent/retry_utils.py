@@ -17,14 +17,19 @@ from typing import Any, Optional
 _jitter_counter = 0
 _jitter_lock = threading.Lock()
 
-# Z.AI Coding Plan's GLM-5.2 endpoint often returns 429 code 1305 ("service may be
-# temporarily overloaded"). Short retries hammer the same window, so after
+# Z.AI Coding Plan endpoints return 429 code 1305 ("service may be
+# temporarily overloaded") for the GLM-5.2 and GLM-5.3 Flash family under load.
+# Short retries hammer the same window, so after
 # ``_ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS`` normal retries the wait widens progressively;
 # the cap stays interactive-friendly (a TUI message should fail visibly in minutes).
 # The short count is shared by ``adaptive_rate_limit_backoff`` and
 # ``zai_coding_overload_retry_ceiling`` so the two cannot silently desync.
 _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
+# Model families served by the coding endpoint whose 1305 overloads take the
+# adaptive schedule. ``startswith`` keeps this exact: plain GLM-5.3 stays
+# outside until its overload behavior is characterized.
+_ZAI_CODING_OVERLOAD_MODEL_PREFIXES = ("glm-5.2", "glm-5.3-flash")
 
 
 def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
@@ -140,15 +145,30 @@ def _error_text(error: Any) -> str:
     return " ".join(str(part) for part in parts if part is not None).lower()
 
 
+def _zai_body_error_code(error: Any) -> Optional[str]:
+    """Structured ``error.code`` from a parsed JSON error body, else None."""
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return None
+    nested = body.get("error")
+    data = nested if isinstance(nested, dict) else body
+    code = data.get("code")
+    return None if code is None else str(code)
+
+
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
     """True only for the narrow Z.AI Coding Plan overload shape (429 + code
-    1305 / "temporarily overloaded"), so ordinary quota 429s still fail fast."""
+    1305 / "temporarily overloaded") on the GLM-5.2 and GLM-5.3 Flash family,
+    so ordinary quota 429s still fail fast. The code is matched structurally
+    from the parsed body first; the message phrase only backs unparsed error
+    shapes, so a stray "1305" inside quota text can no longer misclassify."""
     text = _error_text(error)
+    model_name = (model or "").lower()
     return (
         getattr(error, "status_code", None) == 429
         and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
-        and "glm-5.2" in (model or "").lower()
-        and ("1305" in text or "temporarily overloaded" in text)
+        and model_name.startswith(_ZAI_CODING_OVERLOAD_MODEL_PREFIXES)
+        and (_zai_body_error_code(error) == "1305" or "temporarily overloaded" in text)
     )
 
 
