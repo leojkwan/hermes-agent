@@ -8,7 +8,7 @@ import pytest
 from tests.waiting import wait_until
 
 
-def test_aborts_when_source_remains_busy_past_deadline(tmp_path, monkeypatch):
+def test_aborts_when_source_remains_busy_past_deadline(tmp_path, monkeypatch, caplog):
     from hermes_cli import backup as backup_mod
 
     src = tmp_path / "locked.db"
@@ -17,19 +17,23 @@ def test_aborts_when_source_remains_busy_past_deadline(tmp_path, monkeypatch):
     dst.write_bytes(b"partial")
 
     clock = iter((100.0, 100.5, 101.1))
+    progress_calls = []
 
     class FakeSourceConnection:
         in_transaction = False
 
-        def execute(sql):
+        def execute(self, sql):
             assert sql == "PRAGMA journal_mode"  # a rollback-journal source is not pinned
             return type("Cursor", (), {"fetchone": lambda _self: ("delete",)})()
 
-        def backup(_destination, *, pages, progress, sleep):
+        def backup(self, _destination, *, pages, progress, sleep):
             assert pages > 0
             assert sleep > 0
+            progress_calls.append("busy")
             progress(sqlite3.SQLITE_BUSY, 0, 1)
+            progress_calls.append("busy")
             progress(sqlite3.SQLITE_BUSY, 0, 1)
+            progress_calls.append("not stopped")
 
         def close(self):
             pass
@@ -57,7 +61,11 @@ def test_aborts_when_source_remains_busy_past_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(Path, "unlink", assert_closed_before_unlink)
 
-    assert backup_mod._safe_copy_db(src, dst, timeout_seconds=1.0) is False
+    with caplog.at_level("WARNING"):
+        assert backup_mod._safe_copy_db(src, dst, timeout_seconds=1.0) is False
+    # The second busy step passes the deadline; any other failure is swallowed into False too.
+    assert progress_calls == ["busy", "busy"]
+    assert "database remained locked for 1 seconds" in caplog.text
     assert connect_calls[0][1]["timeout"] == 0.0
     assert not dst.exists()
 
@@ -120,13 +128,15 @@ def test_copy_finishes_while_another_connection_keeps_committing(tmp_path):
         conn.close()
 
 
-def test_copy_stops_at_its_total_deadline(tmp_path):
+def test_copy_stops_at_its_total_deadline(tmp_path, caplog):
     from hermes_cli.backup import _safe_copy_db
 
     src = tmp_path / "state.db"
     dst = tmp_path / "copy.db"
     _wal_db(src, 40_000)
-    assert _safe_copy_db(src, dst, deadline_seconds=0.0) is False
+    with caplog.at_level("WARNING"):
+        assert _safe_copy_db(src, dst, deadline_seconds=0.0) is False
+    assert "copy did not finish within 0 seconds" in caplog.text
     assert not dst.exists()
 
 
