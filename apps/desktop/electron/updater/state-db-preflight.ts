@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 
 import { hiddenWindowsChildOptions } from '../windows-child-options'
 
@@ -14,10 +14,23 @@ interface StateDbPreflight {
    * it exactly like the update check does (`readSourceUpdate`).
    */
   launcher?: string | null
+  /** Above the module's own 120 s copy-and-check budget (PREFLIGHT_BUDGET_SECONDS), so a slow
+   *  snapshot fails with its own message; this limit only catches a hung interpreter. */
+  timeoutMs?: number
 }
 
-// Synchronous by design: the caller must not stop the backend before the snapshot.
-export function preflightStateDb({ python, script, home, log, launcher = null }: StateDbPreflight): void {
+export const STATE_DB_PREFLIGHT_TIMEOUT_MS = 150_000
+
+// The caller awaits this before it stops the backend. It runs the snapshot in an asynchronous
+// child process, so the main process keeps serving the window while the copy runs.
+export async function preflightStateDb({
+  python,
+  script,
+  home,
+  log,
+  launcher = null,
+  timeoutMs = STATE_DB_PREFLIGHT_TIMEOUT_MS
+}: StateDbPreflight): Promise<void> {
   try {
     const command: string | null = launcher ?? python
 
@@ -37,20 +50,37 @@ export function preflightStateDb({ python, script, home, log, launcher = null }:
       throw new Error('The pre-flight snapshot contains an unsafe Windows command argument.')
     }
 
-    const result: string = execFileSync(
-      viaCmd ? (process.env.ComSpec ?? 'cmd.exe') : command,
-      viaCmd
-        ? ['/d', '/v:off', '/s', '/c', `""${command}" ${args.map((arg: string): string => `"${arg}"`).join(' ')}"`]
-        : args,
-      hiddenWindowsChildOptions({
-        encoding: 'utf8',
-        // Above the module's own 120 s copy-and-check budget (PREFLIGHT_BUDGET_SECONDS), so a slow
-        // snapshot fails with its own message; this limit only catches a hung interpreter.
-        timeout: 150_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsVerbatimArguments: viaCmd
-      })
-    )
+    const file: string = viaCmd ? (process.env.ComSpec ?? 'cmd.exe') : command
+
+    const result: string = await new Promise<string>((resolve, reject) => {
+      const child = execFile(
+        file,
+        viaCmd
+          ? ['/d', '/v:off', '/s', '/c', `""${command}" ${args.map((arg: string): string => `"${arg}"`).join(' ')}"`]
+          : args,
+        hiddenWindowsChildOptions({ encoding: 'utf8', timeout: timeoutMs, windowsVerbatimArguments: viaCmd }),
+        (error, stdout, stderr) => {
+          if (child.killed) {
+            // execFile's timeout killed the child; a SIGTERM handler can still exit zero. Keep the
+            // message and code the earlier execFileSync call produced, so logs and support read alike.
+            reject(Object.assign(new Error(`spawnSync ${file} ETIMEDOUT`), { code: 'ETIMEDOUT', cause: error }))
+          } else if (error) {
+            // execFile ends "Command failed: …" with a newline even when stderr is empty;
+            // execFileSync did not. Keep the earlier message.
+            if (!stderr) {
+              error.message = error.message.replace(/\n$/, '')
+            }
+
+            reject(error)
+          } else {
+            resolve(String(stdout))
+          }
+        }
+      )
+
+      // The snapshot reads no input.
+      child.stdin?.end()
+    })
 
     log(`[updates] state.db pre-flight: ${result.trim()}`)
   } catch (error: unknown) {
