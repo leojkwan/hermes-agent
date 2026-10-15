@@ -1,6 +1,10 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# Inherit the personal-account policy from leojkwan/coderabbit.
+# Re-enabled 2026-10-15 per the fleet CodeRabbit rollout (Leo's renewed go).
+# This file previously disabled auto-review repo-wide (2026-08-14: comment
+# noise — reviews carried no merge weight, bot stayed summonable on demand).
+# It now inherits the personal central policy (leojkwan/coderabbit) with no
+# local overrides: automatic reviews on, drafts on, all target branches,
+# assertive profile, hosted source-writing off, security tools on. On-demand
+# reviews (`@coderabbitai review`) and per-PR muting (`@coderabbitai ignore`)
+# still work unchanged.
 inheritance: true
-reviews:
-  auto_review:
-    enabled: true
