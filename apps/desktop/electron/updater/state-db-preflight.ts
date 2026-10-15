@@ -44,7 +44,9 @@ export function preflightStateDb({ python, script, home, log, launcher = null }:
         : args,
       hiddenWindowsChildOptions({
         encoding: 'utf8',
-        timeout: 30_000,
+        // Above the module's own 120 s copy-and-check budget (PREFLIGHT_BUDGET_SECONDS), so a slow
+        // snapshot fails with its own message; this limit only catches a hung interpreter.
+        timeout: 150_000,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsVerbatimArguments: viaCmd
       })

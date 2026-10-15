@@ -61,3 +61,10 @@ def test_tmpdir_that_fits_the_socket_budget_is_passed_through(monkeypatch, tmp_p
 
         assert env["TMPDIR"] == tmpdir
         assert "HERMES_DESKTOP_TMPDIR" not in env
+
+
+def test_launch_env_drops_electron_run_as_node(tmp_path, monkeypatch) -> None:
+    """With it set, Electron runs as plain Node and exits 0 without a window."""
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
+    assert "ELECTRON_RUN_AS_NODE" not in _launch_env(tmp_path)
+    assert os.environ["ELECTRON_RUN_AS_NODE"] == "1"

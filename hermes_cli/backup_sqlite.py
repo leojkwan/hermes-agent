@@ -28,10 +28,48 @@ def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
             conn.close()
 
 
-def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> bool:
+# Desktop runs the update preflight synchronously before it stops the backend.
+# A 4.4 GB state.db took about 38 s to copy and quick_check; this budget covers
+# that with headroom and stays under the Desktop process limit, so a slow copy
+# ends with this module's own error instead of a bare ETIMEDOUT.
+PREFLIGHT_BUDGET_SECONDS = 120.0
+
+
+def _pin_read_snapshot(conn: sqlite3.Connection, busy_deadline: float, timeout_seconds: float) -> None:
+    """Open one read transaction on a WAL source and keep it for the whole copy.
+
+    Without it each backup step reads the newest snapshot, and every commit by another
+    connection restarts the copy from page 1, so a steady writer keeps it from finishing.
+    A WAL reader does not block ordinary commits. It does keep checkpoints from passing
+    its snapshot, so the -wal file grows until the copy ends, and a TRUNCATE checkpoint
+    (run after VACUUM) waits out the caller's busy timeout and then gives up.
+    Rollback-journal sources are left as before, because a held shared lock there would
+    block the writer for the whole copy.
+    """
+    while True:
+        try:
+            if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                return
+            conn.execute("BEGIN")
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return
+        except sqlite3.OperationalError as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            if time.monotonic() >= busy_deadline:
+                raise _SQLiteBackupTimeout(f"database remained locked for {timeout_seconds:g} seconds") from exc
+            time.sleep(0.1)
+
+
+def _safe_copy_db(
+    src: Path, dst: Path, *, timeout_seconds: float = 10.0, deadline_seconds: Optional[float] = None
+) -> bool:
     """Copy a SQLite database with the backup() API (WAL-safe consistent snapshot).
 
     Fails closed when no consistent snapshot can be made: copying only the main file loses WAL data.
+    ``deadline_seconds`` bounds the whole copy; ``timeout_seconds`` bounds one locked wait.
     """
     conn = backup_conn = None
     try:
@@ -52,13 +90,19 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
                 os.close(secure_fd)
         # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
         # full locked-source deadline instead of adding the default timeout before each callback.
-        conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
+        # isolation_level=None leaves BEGIN to _pin_read_snapshot.
+        conn = sqlite3.connect(
+            f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0, isolation_level=None)
         backup_conn = sqlite3.connect(str(dst))
-        busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
+        started = time.monotonic()
+        busy_deadline = started + max(0.0, timeout_seconds)
+        _pin_read_snapshot(conn, busy_deadline, timeout_seconds)
 
         def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
             nonlocal busy_deadline
             now = time.monotonic()
+            if deadline_seconds is not None and now - started >= deadline_seconds:
+                raise _SQLiteBackupTimeout(f"copy did not finish within {deadline_seconds:g} seconds")
             if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                 if now >= busy_deadline:
                     raise _SQLiteBackupTimeout(f"database remained locked for {timeout_seconds:g} seconds")
@@ -80,8 +124,11 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         _close_quietly(conn)
 
 
-def preflight_state_db(home: Path) -> dict:
-    """Publish an emergency snapshot; do not prune recovery files on failure."""
+def preflight_state_db(home: Path, *, budget_seconds: float = PREFLIGHT_BUDGET_SECONDS) -> dict:
+    """Publish an emergency snapshot; do not prune recovery files on failure.
+
+    The copy and its quick_check share one ``budget_seconds`` limit.
+    """
     source = home / "state.db"
     if not source.exists():
         return {"path": None, "message": "state.db not found (fresh install?)"}
@@ -91,12 +138,22 @@ def preflight_state_db(home: Path) -> dict:
     fd, name = tempfile.mkstemp(prefix=prefix, suffix=".partial", dir=home)
     os.close(fd)
     staged = Path(name)
+    deadline = time.monotonic() + budget_seconds
     try:
-        if not _safe_copy_db(source, staged):
+        if not _safe_copy_db(source, staged, deadline_seconds=budget_seconds):
             raise RuntimeError("SQLite safe copy failed; previous emergency snapshots were retained")
         connection = sqlite3.connect(str(staged))
+        # A nonzero return interrupts quick_check once the shared budget is spent.
+        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10_000)
         try:
-            result = connection.execute("PRAGMA quick_check").fetchall()
+            try:
+                result = connection.execute("PRAGMA quick_check").fetchall()
+            except sqlite3.OperationalError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"SQLite snapshot check did not finish within {budget_seconds:g} seconds; "
+                        "previous emergency snapshots were retained") from exc
+                raise
             if result != [("ok",)]:
                 raise RuntimeError(f"SQLite snapshot integrity check failed: {result}")
         finally:
