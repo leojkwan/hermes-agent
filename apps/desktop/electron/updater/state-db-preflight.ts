@@ -60,10 +60,20 @@ export async function preflightStateDb({
           : args,
         hiddenWindowsChildOptions({ encoding: 'utf8', timeout: timeoutMs, windowsVerbatimArguments: viaCmd }),
         (error, stdout, stderr) => {
-          if (child.killed) {
-            // execFile's timeout killed the child; a SIGTERM handler can still exit zero. Keep the
-            // message and code the earlier execFileSync call produced, so logs and support read alike.
-            reject(Object.assign(new Error(`spawnSync ${file} ETIMEDOUT`), { code: 'ETIMEDOUT', cause: error }))
+          // Keep the message and code the earlier execFileSync call produced for the same failure,
+          // so logs and support read alike.
+          const predecessorError = (code: string): Error =>
+            Object.assign(new Error(`spawnSync ${file} ${code}`), { code, cause: error })
+
+          if (error?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+            // execFile also kills a child whose output passes maxBuffer; that is not a timeout.
+            reject(predecessorError('ENOBUFS'))
+          } else if (child.killed) {
+            // execFile's timeout killed the child; a SIGTERM handler can still exit zero.
+            reject(predecessorError('ETIMEDOUT'))
+          } else if (error && 'syscall' in error && error.syscall === `spawn ${file}`) {
+            // The child never started (ENOENT, EACCES, ...).
+            reject(predecessorError(String(error.code)))
           } else if (error) {
             // execFile ends "Command failed: …" with a newline even when stderr is empty;
             // execFileSync did not. Keep the earlier message.

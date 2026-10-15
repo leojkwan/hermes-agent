@@ -3962,6 +3962,7 @@ function resolveCheckoutUpdateStrategy(): CheckoutStrategy {
       })
     },
     runningAppBundle,
+    quitAccepted: () => appQuitting,
     markQuittingForHandoff: () => {
       isQuittingForHandoff = true
     },

@@ -42,6 +42,7 @@ it('moves a checkout without a source probe to main, but surfaces a broken probe
     repairMacUpdaterHelper: vi.fn(),
     preflightStateDb: vi.fn(),
     runningAppBundle: (): null => null,
+    quitAccepted: (): boolean => false,
     markQuittingForHandoff: vi.fn(),
     quit: vi.fn()
   }

@@ -237,3 +237,76 @@ test('a snapshot past its limit fails with the same message and leaves no child 
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('output past the buffer limit fails as ENOBUFS, not as a timeout, and leaves no child running', async (): Promise<void> => {
+  const python: string = process.env.HERMES_PYTHON || 'python3'
+  const dir: string = fs.mkdtempSync(path.join(os.tmpdir(), 'noisy-preflight-'))
+  const pidFile: string = path.join(dir, 'pid')
+  const script: string = path.join(dir, 'noisy_snapshot.py')
+  // Floods stdout past the 1 MiB default limit, then stays alive well inside its time limit.
+  fs.writeFileSync(
+    script,
+    'import os, sys, time\nopen(sys.argv[1], "w").write(str(os.getpid()))\n' +
+      'sys.stdout.write("x" * (2 * 1024 * 1024))\nsys.stdout.flush()\ntime.sleep(30)\n'
+  )
+
+  const message: string =
+    `state.db pre-flight failed: spawnSync ${python} ENOBUFS. ` +
+    'Update cancelled before backend shutdown. Update the selected installation with its hermes update command, then retry.'
+
+  try {
+    await assert.rejects(
+      preflightStateDb({ python, script, home: pidFile, timeoutMs: 20_000, log: (): void => {} }),
+      (error: Error): boolean => {
+        assert.equal(error.message, message)
+        assert.equal((error.cause as NodeJS.ErrnoException).code, 'ENOBUFS')
+
+        return true
+      }
+    )
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'))
+    assert.throws((): boolean => process.kill(pid, 0), { code: 'ESRCH' })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test.each([
+  ['a missing interpreter', 'ENOENT'],
+  ...(process.platform === 'win32' ? [] : [['an interpreter without execute permission', 'EACCES']])
+])('%s keeps the earlier spawn failure message', async (_name: string, code: string): Promise<void> => {
+  const dir: string = fs.mkdtempSync(path.join(os.tmpdir(), 'unspawnable-preflight-'))
+  const python: string = path.join(dir, 'python3')
+
+  if (code === 'EACCES') {
+    fs.writeFileSync(python, '#!/bin/sh\n', { mode: 0o644 })
+  }
+
+  const message: string =
+    `state.db pre-flight failed: spawnSync ${python} ${code}. ` +
+    'Update cancelled before backend shutdown. Update the selected installation with its hermes update command, then retry.'
+
+  const logs: string[] = []
+
+  try {
+    await assert.rejects(
+      preflightStateDb({
+        python,
+        script: path.join(dir, 'backup_sqlite.py'),
+        home: dir,
+        log: (message: string): void => {
+          logs.push(message)
+        }
+      }),
+      (error: Error): boolean => {
+        assert.equal(error.message, message)
+        assert.equal((error.cause as NodeJS.ErrnoException).code, code)
+
+        return true
+      }
+    )
+    assert.deepEqual(logs, [`[updates] ${message}`])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

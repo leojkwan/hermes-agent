@@ -26,6 +26,7 @@ it.each(['not-a-git-checkout', 'update-root-steward-owned-git-tree', 'fetch-fail
       repairMacUpdaterHelper: vi.fn(),
       preflightStateDb: vi.fn(),
       runningAppBundle: (): null => null,
+      quitAccepted: (): boolean => false,
       markQuittingForHandoff: vi.fn(),
       quit: vi.fn()
     }

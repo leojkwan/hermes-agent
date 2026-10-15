@@ -54,6 +54,7 @@ function handoffFixture(remote: boolean, scriptText: string = ''): { root: strin
     repairMacUpdaterHelper: (): void => {},
     preflightStateDb: (): void => {},
     runningAppBundle: (): null => null,
+    quitAccepted: (): boolean => false,
     markQuittingForHandoff: vi.fn(),
     quit: vi.fn()
   }
@@ -542,3 +543,66 @@ it('the Windows protocol-2 hand-off passes -HandoffRun with the bridged run id',
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+// The snapshot no longer blocks the main process, so an ordinary quit can be accepted while it
+// runs. That quit cancels the update: no backend stop, updater or relaunch after it.
+it.each(['hand-off script', 'staged updater'])(
+  'an ordinary quit accepted during the state.db snapshot cancels the %s',
+  async (route: string): Promise<void> => {
+    const { root, deps } = handoffFixture(false)
+    const events: string[] = []
+    let quitAccepted: boolean = false
+    let release!: () => void
+
+    const held: Promise<void> = new Promise((resolve: () => void): void => {
+      release = resolve
+    })
+
+    let started!: () => void
+
+    const snapshotStarted: Promise<void> = new Promise((resolve: () => void): void => {
+      started = resolve
+    })
+
+    if (route === 'staged updater') {
+      const updater: string = path.join(root, 'hermes-setup')
+      fs.writeFileSync(updater, '')
+      deps.resolveUpdaterBinary = (): string => updater
+    }
+
+    deps.quitAccepted = (): boolean => quitAccepted
+
+    deps.preflightStateDb = async (): Promise<void> => {
+      events.push('snapshot started')
+      started()
+      await held
+      events.push('snapshot settled')
+    }
+
+    deps.stopBackendsForUpdate = async (): Promise<void> => {
+      events.push('backends stopped')
+    }
+
+    vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation((): updaterProcess.UpdaterChild => {
+      events.push('updater spawned')
+
+      return { unref: (): void => {} }
+    })
+
+    try {
+      const applying: Promise<unknown> = createCheckoutStrategy(deps).apply()
+      await snapshotStarted
+      quitAccepted = true
+      events.push('ordinary quit accepted')
+      release()
+
+      await expect(applying).rejects.toThrow('Update cancelled because Hermes is quitting.')
+      expect(deps.rememberLog).toHaveBeenCalledWith('[updates] Update cancelled because Hermes is quitting.')
+      expect(events).toEqual(['snapshot started', 'ordinary quit accepted', 'snapshot settled'])
+      expect(deps.markQuittingForHandoff).not.toHaveBeenCalled()
+      expect(deps.quit).not.toHaveBeenCalled()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }
+)
