@@ -486,7 +486,7 @@ class PluginLoaderMixin:
             # Declared language packs register before any plugin code runs, inside the same ledger slice
             # so a failing register() unwinds them too.
             self._register_declared_locales(manifest, ctx)
-            if in_host and not self._is_manifest_only_language_pack(manifest):
+            if in_host and not self._is_python_free_plugin(manifest):
                 self._plugin_host().load(manifest, ctx, module_name=module_name,
                                          entrypoint=manifest.source not in {"user", "project"})
                 return True
@@ -494,8 +494,8 @@ class PluginLoaderMixin:
             # See #78050.
             module = self._predeclared_modules.pop(plugin_key, None)
             if module is None and manifest.source in {"user", "project", "bundled"}:
-                if self._is_manifest_only_language_pack(manifest):
-                    return True  # pure pack: locales/ is the whole plugin, no register() to run
+                if self._is_python_free_plugin(manifest):
+                    return True  # pure pack or dashboard tab: its files are the whole plugin, no register()
                 module = self._load_directory_module(manifest, module_name=module_name)
             elif module is None:
                 module = self._load_entrypoint_module(manifest)
@@ -550,6 +550,18 @@ class PluginLoaderMixin:
         manifest-only desktop plugin, it loads from its declared files alone."""
         return bool(manifest.provides_locales and manifest.path
                     and not (Path(manifest.path) / "__init__.py").is_file())
+
+    @classmethod
+    def _is_python_free_plugin(cls, manifest: PluginManifest) -> bool:
+        """A manifest-only language pack, or a dashboard-only plugin (``dashboard/manifest.json`` and no
+        ``__init__.py``): the dashboard server loads its tab, so the agent loader has nothing to import."""
+        if cls._is_manifest_only_language_pack(manifest):
+            return True
+        if not manifest.path:
+            return False
+        plugin_dir = Path(manifest.path)
+        return (not (plugin_dir / "__init__.py").is_file()
+                and (plugin_dir / "dashboard" / "manifest.json").is_file())
 
     def _register_declared_locales(self, manifest: PluginManifest, ctx) -> None:
         """``provides_locales`` -> ``ctx.register_locale_dir(<plugin>/locales)``; a declared id with no file

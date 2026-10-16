@@ -354,6 +354,27 @@ def _git_env(
     return env
 
 
+def _clear_stale_index_lock(index_file: Path, timeout: int) -> None:
+    """Remove ``<index>.lock`` left by a crashed or killed git.
+
+    Every git call here is killed at ``timeout``, so a lock older than several timeouts has no live owner.
+    Without this, one crash makes every later ``git add -A`` fail with "File exists" until someone deletes
+    the file by hand. A fresh lock is left alone: another snapshot may hold it.
+    """
+    lock = Path(str(index_file) + ".lock")
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return
+    if age < max(timeout * 10, 300):
+        return
+    try:
+        lock.unlink()
+        logger.warning("Removed stale checkpoint index lock %s (%.0fs old)", lock, age)
+    except OSError as exc:
+        logger.debug("Could not remove stale checkpoint index lock %s: %s", lock, exc)
+
+
 def _run_git(
     args: list[str],
     store: Path,
@@ -379,6 +400,8 @@ def _run_git(
         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
 
+    if index_file is not None:
+        _clear_stale_index_lock(index_file, timeout)
     env = _git_env(store, str(normalized_working_dir), index_file=index_file)
     if extra_env:
         env.update(extra_env)

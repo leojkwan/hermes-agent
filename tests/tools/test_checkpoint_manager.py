@@ -1386,3 +1386,34 @@ class TestSessionDiff:
         assert result["success"] is True
         assert "feature.py" in result["diff"]
         assert "+x = 1" in result["diff"]
+
+
+class TestStaleIndexLock:
+    """A crashed git leaves ``indexes/<hash>.lock`` behind. Seen live: a 0-byte lock from Oct 7 made every
+    ``git add -A`` fail with rc=128 "File exists" for eight days. A lock older than any git run can live
+    (several times the git timeout) is removed before the next run; a fresh lock is left alone."""
+
+    def _lock(self, checkpoint_base, work_dir):
+        store = _store_path()
+        index = store / "indexes" / _project_hash(str(work_dir))
+        return Path(str(index) + ".lock")
+
+    def test_old_lock_is_cleared_and_checkpoint_succeeds(self, mgr, work_dir, checkpoint_base):
+        assert mgr.ensure_checkpoint(str(work_dir), "first") is True
+        lock = self._lock(checkpoint_base, work_dir)
+        lock.write_text("")
+        old = time.time() - 3600
+        os.utime(lock, (old, old))
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('changed')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "after crash") is True
+        assert not lock.exists()
+
+    def test_fresh_lock_is_left_alone(self, mgr, work_dir, checkpoint_base):
+        assert mgr.ensure_checkpoint(str(work_dir), "first") is True
+        lock = self._lock(checkpoint_base, work_dir)
+        lock.write_text("")
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('changed')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "concurrent") is False
+        assert lock.exists()
