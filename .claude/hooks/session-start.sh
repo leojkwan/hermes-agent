@@ -10,6 +10,11 @@ fi
 
 cd "${CLAUDE_PROJECT_DIR:-.}"
 
+# Put the locked environment first on PATH for later commands (ruff, pytest).
+if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
+  printf 'export PATH=%q:"$PATH"\n' "$PWD/.venv/bin" >> "$CLAUDE_ENV_FILE"
+fi
+
 # `uv sync --locked` is idempotent: it fails if uv.lock is stale instead of
 # rewriting it, and does nothing when .venv already matches.
 uv sync --locked --extra dev
