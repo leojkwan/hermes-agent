@@ -130,6 +130,8 @@ export async function preflightStateDb({
   // error detail, so they are filtered out of the failure message.
   let timer: NodeJS.Timeout | undefined = undefined
   let progressed = false
+  // A SIGTERM handler can still exit zero (or non-zero) after the watchdog fires; the kill decides.
+  let watchdogFired = false
 
   const arm = (ms: number): void => {
     if (timer !== undefined) {
@@ -137,6 +139,7 @@ export async function preflightStateDb({
     }
 
     timer = setTimeout((): void => {
+      watchdogFired = true
       terminate(child)
     }, ms)
     timer.unref?.()
@@ -176,7 +179,7 @@ export async function preflightStateDb({
       clearTimeout(timer)
     }
 
-    if (child.exitCode !== null && child.exitCode !== 0) {
+    if (!watchdogFired && child.exitCode !== null && child.exitCode !== 0) {
       const detail: string = stderr
         .split('\n')
         .filter((line: string): boolean => line !== '' && !line.trimStart().startsWith(PROGRESS_PREFIX.trim()))
@@ -189,7 +192,7 @@ export async function preflightStateDb({
       )
     }
 
-    if (outcome !== 0) {
+    if (watchdogFired || outcome !== 0) {
       const message: string =
         progressed
           ? `state.db pre-flight made no progress for ${Math.round(stallMs / 1000)} s and was cancelled`

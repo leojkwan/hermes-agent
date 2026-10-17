@@ -332,3 +332,40 @@ test('a snapshot that heartbeats once and then goes silent is cancelled as wedge
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
+
+test.skipIf(process.platform === 'win32')(
+  'a snapshot killed at its deadline is a timeout even when its SIGTERM handler exits zero',
+  async (): Promise<void> => {
+    const home: string = fs.mkdtempSync(path.join(os.tmpdir(), 'killed-preflight-'))
+    const python: string = process.env.HERMES_PYTHON || 'python3'
+    const logs: string[] = []
+
+    // The watchdog's SIGTERM lands in a handler that exits 0, so only the kill marks the failure.
+    const probe: string = path.join(home, 'trapped-backup.py')
+    fs.writeFileSync(probe, 'import signal, sys, time\nsignal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\ntime.sleep(30)\n')
+
+    try {
+      await assert.rejects(
+        async (): Promise<void> => {
+          await preflightStateDb({
+            python,
+            script: probe,
+            home,
+            timeoutMs: 1_000,
+            log: (message: string): void => {
+              logs.push(message)
+            }
+          })
+        },
+        (error: unknown): boolean => error instanceof Error && /timed out after 1 s and was cancelled/.test(error.message)
+      )
+      assert.equal(
+        logs.some((message: string): boolean => message.startsWith('[updates] state.db pre-flight: ')),
+        false,
+        logs.join('\n')
+      )
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+)

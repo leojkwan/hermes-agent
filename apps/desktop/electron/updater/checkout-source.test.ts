@@ -386,6 +386,7 @@ urllib.request.build_opener = local_build
       repairMacUpdaterHelper: (): void => {},
       preflightStateDb: (): void => {},
       runningAppBundle: (): null => null,
+      quitAccepted: (): boolean => false,
       markQuittingForHandoff: (): void => {},
       quit: (): void => {}
     }
