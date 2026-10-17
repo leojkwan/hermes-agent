@@ -1514,6 +1514,9 @@ def _desktop_launch_env(args: argparse.Namespace) -> tuple[dict, list[str]]:
     from hermes_constants import socket_safe_tmpdir, with_hermes_node_path
     # with_hermes_node_path() copies os.environ when called with no arg.
     env = with_hermes_node_path()
+    # A shell started by an Electron host (an IDE or agent app) can carry this; it makes the
+    # app run as plain Node and exit 0 without a window.
+    env.pop("ELECTRON_RUN_AS_NODE", None)
     tmpdir = env.get("TMPDIR", "")
     if sys.platform == "linux" and len(os.fsencode(tmpdir)) > _ELECTRON_TMPDIR_MAX_BYTES:
         # A longer TMPDIR hangs requestSingleInstanceLock(). Only Chromium's socket dir moves:
@@ -1622,7 +1625,8 @@ def _launch_installed_macos_desktop_app() -> bool:
         return False
     from hermes_cli.bundled_app import launch_detached
 
-    pid = launch_detached([str(executable)], cwd=executable.parent)
+    env = {key: value for key, value in os.environ.items() if key != "ELECTRON_RUN_AS_NODE"}
+    pid = launch_detached([str(executable)], env=env, cwd=executable.parent)
     print(f"→ Launched the installed Hermes Desktop app: {executable} (pid {pid})")
     return True
 

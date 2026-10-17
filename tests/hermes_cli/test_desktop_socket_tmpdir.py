@@ -61,3 +61,30 @@ def test_tmpdir_that_fits_the_socket_budget_is_passed_through(monkeypatch, tmp_p
 
         assert env["TMPDIR"] == tmpdir
         assert "HERMES_DESKTOP_TMPDIR" not in env
+
+
+def test_launch_env_drops_electron_run_as_node(tmp_path, monkeypatch) -> None:
+    """With it set, Electron runs as plain Node and exits 0 without a window."""
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
+    assert "ELECTRON_RUN_AS_NODE" not in _launch_env(tmp_path)
+    assert os.environ["ELECTRON_RUN_AS_NODE"] == "1"
+
+
+@pytest.mark.platforms("macos")
+def test_installed_macos_app_launch_drops_electron_run_as_node(monkeypatch) -> None:
+    """The /Applications/Hermes.app launch must not inherit it either."""
+    from hermes_cli import bundled_app
+
+    class _InstalledApp(type(Path())):
+        def is_file(self) -> bool:
+            return True
+
+    launched: dict = {}
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
+    monkeypatch.setattr(main_desktop, "Path", _InstalledApp)
+    monkeypatch.setattr(bundled_app, "launch_detached", lambda argv, **kwargs: launched.update(kwargs) or 4242)
+
+    assert main_desktop._launch_installed_macos_desktop_app() is True
+    # No env= means the child inherits os.environ, which still carries it.
+    assert "ELECTRON_RUN_AS_NODE" not in (launched.get("env") or os.environ)
+    assert os.environ["ELECTRON_RUN_AS_NODE"] == "1"
