@@ -912,6 +912,15 @@ class TestBlockedVerdict:
         assert reason == "the repo was deleted"
         assert parse_failed is False
 
+    def test_judge_prompt_keeps_partial_user_block_as_continue(self):
+        # A ten-part goal paused because one part needed the user. Replayed
+        # live, the old wording judged it BLOCKED 2 of 3 times; this wording
+        # judged it CONTINUE 5 of 5, while a total block stayed BLOCKED 5 of 5.
+        from hermes_cli.goals import JUDGE_SYSTEM_PROMPT
+
+        assert "EVERY remaining part of the goal needs user input" in JUDGE_SYSTEM_PROMPT
+        assert "one blocked part never stops the whole goal" in JUDGE_SYSTEM_PROMPT
+
     def test_blocked_verdict_pauses_goal_instead_of_done(self, hermes_home):
         from unittest.mock import patch
         from hermes_cli.goals import GoalManager
