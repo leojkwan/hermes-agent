@@ -145,42 +145,47 @@ def _error_text(error: Any) -> str:
     return " ".join(str(part) for part in parts if part is not None).lower()
 
 
-def _zai_body_error_code(error: Any) -> Optional[str]:
-    """Structured ``error.code`` from a parsed JSON error body, else None."""
-    body = getattr(error, "body", None)
+def zai_error_code(body: Any) -> Optional[str]:
+    """Z.AI business code (1305 overload, 1302 quota) from a parsed error body: ``error.code``, else a
+    top-level ``code``. A string is stripped and a JSON number counts (Z.AI sends both); a number in the
+    HTTP status range is the status, not a code, and a blank is no code. None when no code was parsed.
+    The classifier and the retry policy both read the code here, so they cannot disagree on a body shape."""
     if not isinstance(body, dict):
         return None
-    nested = body.get("error")
-    data = nested if isinstance(nested, dict) else body
-    code = data.get("code")
-    return None if code is None else str(code)
+    for data in (body.get("error"), body):
+        code = data.get("code") if isinstance(data, dict) else None
+        if isinstance(code, str):
+            code = code.strip()
+        elif isinstance(code, int) and not 100 <= code < 600:
+            code = str(code)
+        else:
+            continue
+        if code:
+            return code
+    return None
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
     """True only for the narrow Z.AI Coding Plan overload shape (429 + code
     1305 / "temporarily overloaded") on the GLM-5.2 and GLM-5.3 Flash family,
     so ordinary quota 429s still fail fast. A parsed body code is authoritative:
-    when the body parses, only code "1305" classifies as overload, and the
-    "temporarily overloaded" phrase never rescues a different code (a 1302
-    quota body that merely mentions overload wording stays quota). The phrase
-    only backs unparsed error shapes, so a stray "1305" inside quota text can
-    no longer misclassify either."""
-    text = _error_text(error)
-    model_name = (model or "").lower()
-    code = _zai_body_error_code(error)
-    if code is not None:
-        return (
-            getattr(error, "status_code", None) == 429
-            and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
-            and model_name.startswith(_ZAI_CODING_OVERLOAD_MODEL_PREFIXES)
-            and code == "1305"
-        )
-    return (
-        getattr(error, "status_code", None) == 429
-        and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
-        and model_name.startswith(_ZAI_CODING_OVERLOAD_MODEL_PREFIXES)
-        and "temporarily overloaded" in text
-    )
+    only code "1305" classifies as overload, and the "temporarily overloaded"
+    phrase never rescues a different code (a 1302 quota body that merely
+    mentions overload wording stays quota). The phrase only backs bodies with no
+    parsed code, so a stray "1305" inside quota text cannot misclassify either.
+    Status and body are read as the classifier reads them, so an error whose
+    status arrives only in its body is the same overload here as in its verdict."""
+    if not (
+        "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
+        and (model or "").lower().startswith(_ZAI_CODING_OVERLOAD_MODEL_PREFIXES)
+    ):
+        return False
+    # Imported here: the classifier imports this module lazily too, so neither direction is a cycle.
+    from agent.error_classifier import _extract_error_body, _extract_status_code
+    if _extract_status_code(error) != 429:
+        return False
+    code = zai_error_code(_extract_error_body(error))
+    return code == "1305" if code is not None else "temporarily overloaded" in _error_text(error)
 
 
 def adaptive_rate_limit_backoff(

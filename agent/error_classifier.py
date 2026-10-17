@@ -1065,16 +1065,14 @@ def _status_429(c: _Ctx) -> Verdict:
     # key instead of burning the pool (#14038). On the coding endpoint the
     # body's parsed code is authoritative: "1305" is overload, and a parsed
     # different code (a 1302 quota wall) cannot be talked into the overload
-    # path by prose. The phrase check below only covers unparsed shapes and
-    # non-coding-endpoint routes.
-    _zai_coding_route = "api.z.ai/api/coding/paas/v4" in c.base_url
-    if _zai_coding_route and c.code == "1305":
-        return _V_OVERLOADED
-    if _zai_coding_route:
-        # Parsed non-1305 code on the coding route: the code is authoritative
-        # (a 1302 quota wall stays quota); only unparsed bodies ("" code) may
-        # use prose.
-        if not c.code and any(p in c.msg for p in _OVERLOADED_PATTERNS):
+    # path by prose; only a body with no parsed code may use it. The code is
+    # read as the retry policy reads it (``zai_error_code``), so the verdict and
+    # the long backoff agree: a JSON-number 1305 counts, which the generic
+    # parser drops. Other routes use the phrase alone.
+    if "api.z.ai/api/coding/paas/v4" in c.base_url:
+        from agent.retry_utils import zai_error_code
+        zai_code = zai_error_code(c.body)
+        if zai_code == "1305" or (zai_code is None and any(p in c.msg for p in _OVERLOADED_PATTERNS)):
             return _V_OVERLOADED
     elif any(p in c.msg for p in _OVERLOADED_PATTERNS):
         return _V_OVERLOADED
