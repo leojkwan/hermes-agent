@@ -1062,8 +1062,19 @@ def _status_429(c: _Ctx) -> Verdict:
     if c.code in _BILLING_ERROR_CODES:
         return _V_BILLING
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
-    # key instead of burning the pool (#14038).
-    if any(p in c.msg for p in _OVERLOADED_PATTERNS):
+    # key instead of burning the pool (#14038). On the coding endpoint the
+    # body's parsed code is authoritative: "1305" is overload, and a parsed
+    # different code (a 1302 quota wall) cannot be talked into the overload
+    # path by prose; only a body with no parsed code may use it. The code is
+    # read as the retry policy reads it (``zai_error_code``), so the verdict and
+    # the long backoff agree: a JSON-number 1305 counts, which the generic
+    # parser drops. Other routes use the phrase alone.
+    if "api.z.ai/api/coding/paas/v4" in c.base_url:
+        from agent.retry_utils import zai_error_code
+        zai_code = zai_error_code(c.body)
+        if zai_code == "1305" or (zai_code is None and any(p in c.msg for p in _OVERLOADED_PATTERNS)):
+            return _V_OVERLOADED
+    elif any(p in c.msg for p in _OVERLOADED_PATTERNS):
         return _V_OVERLOADED
     # OpenRouter-wrapped upstream 429: the key is healthy — fall back, don't bench.
     if _is_openrouter_upstream_error(c.body, c.provider_slug):
