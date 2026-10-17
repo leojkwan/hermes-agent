@@ -132,7 +132,12 @@ import {
 import { CHALLENGE_PARTITION } from './challenge-window'
 import { registerChallengeWindowIpc } from './challenge-window-ipc'
 import { provisionCliLinks } from './cli-provision'
-import { closeStopFailureMessage, finishWindowsCloseStop, type RuntimeLock } from './close-stop-kill'
+import {
+  closeStopFailureMessage,
+  finishWindowsCloseStop,
+  holderPidsFromLockFile,
+  type RuntimeLock
+} from './close-stop-kill'
 import { shouldAttemptCloudBootCascade } from './cloud-boot-cascade'
 import { discoverWithTeamFallback } from './cloud-discovery'
 import { createCloudSessionRecovery } from './cloud-session-recovery'
@@ -3751,7 +3756,7 @@ function resolveCheckoutUpdateStrategy(): CheckoutStrategy {
         throw new Error(message)
       }
 
-      preflightStateDb({
+      await preflightStateDb({
         python: managed ? null : await findPythonForRoot(root),
         launcher,
         script: path.join(root, 'hermes_cli', 'backup_sqlite.py'),
@@ -3760,6 +3765,7 @@ function resolveCheckoutUpdateStrategy(): CheckoutStrategy {
       })
     },
     runningAppBundle,
+    quitAccepted: () => quitInProgress,
     markQuittingForHandoff: () => {
       isQuittingForHandoff = true
     },
@@ -4003,34 +4009,6 @@ function forceKillProcessTree(pid) {
   }
 
   execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
-}
-
-function holderPidsFromLockFile(lockPath: string): Pick<RuntimeLock, 'holderPids' | 'held'> {
-  try {
-    const raw = fs.readFileSync(lockPath, 'utf8').trim()
-
-    if (!raw) {
-      return { holderPids: [] }
-    }
-
-    let pid = Number(raw)
-
-    if (!Number.isInteger(pid)) {
-      const parsed = JSON.parse(raw) as { pid?: unknown }
-      pid = Number(typeof parsed === 'object' && parsed ? parsed.pid : parsed)
-    }
-
-    return Number.isInteger(pid) && pid > 0 ? { holderPids: [pid] } : { holderPids: [] }
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code
-
-    // Can't read the file: a live holder may be why. Do not clear it.
-    if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
-      return { holderPids: [], held: true }
-    }
-
-    return { holderPids: [] }
-  }
 }
 
 function collectCloseStopLocks(): RuntimeLock[] {

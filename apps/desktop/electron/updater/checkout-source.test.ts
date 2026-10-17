@@ -384,6 +384,7 @@ if not getattr(urllib.request, '_hermes_loopback', False):
       repairMacUpdaterHelper: (): void => {},
       preflightStateDb: (): void => {},
       runningAppBundle: (): null => null,
+      quitAccepted: (): boolean => false,
       markQuittingForHandoff: (): void => {},
       quit: (): void => {}
     }
