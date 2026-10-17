@@ -99,6 +99,7 @@ import {
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap } from './bundle-swap'
+import { createCallAuditBridge } from './call-audit'
 import { registerChatOnboardingWindow } from './chat-onboarding-window'
 import { discoverWithTeamFallback } from './cloud-discovery'
 import { installCommandScreenshot } from './command-screenshot'
@@ -17345,6 +17346,28 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   return handleHermesApiRequest(request).finally(releaseProfileDeletion)
 })
 
+// GPT-Live call recording (~va01). The relay checks the credential of the
+// backend the call is placed on, resolved exactly as hermes:api routes the
+// voice-live status read; main keeps it and never hands it to the renderer.
+const callAudit = createCallAuditBridge({
+  backend: scope => {
+    const request = { ...scope, path: '/api/audio/voice-live/status' }
+    const registryConnectionId = apiRequestRegistryConnectionId(request)
+
+    if (registryConnectionId) {
+      return backendDialClaims.run(backendScopeKey(registryConnectionId, scope.profile), () =>
+        ensureRegistryBackend(registryConnectionId, scope.profile)
+      )
+    }
+
+    const apiRoute = resolveProfileApiRequest(scope.profile, request.path, profileRouteOptions(scope.profile, request))
+
+    return ensureBackend(apiRoute.backendProfile, { request })
+  }
+})
+
+ipcMain.handle('hermes:call-audit', (_event, request) => callAudit(request))
+
 // Main serializes cross-window ambient claims (see event-dedupe.ts for why a
 // spoken reply holds its claim far longer than a beep).
 const ownsAmbientCue = createAmbientClaimArbiter()
@@ -18920,7 +18943,13 @@ app.on('before-quit', event => {
   const sshNeedsWait =
     sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0 || sshTeardowns.hasPending()
 
-  const teardownTasks = [{ run: () => backendShutdown.run(), waitForCompletion: backendNeedsWait }]
+  const auditNeedsWait = callAudit.hasOpenCalls()
+  const teardownTasks = [{
+    // Preserve an honest incomplete audit before stopping the backend that
+    // authenticates the relay. No renderer stop receipt exists on app quit.
+    run: () => auditNeedsWait ? callAudit.abortOpenCalls().then(() => backendShutdown.run()) : backendShutdown.run(),
+    waitForCompletion: backendNeedsWait || auditNeedsWait
+  }]
 
   if (sshNeedsWait) {
     teardownTasks.push({ run: teardownSshForQuit, waitForCompletion: true })
