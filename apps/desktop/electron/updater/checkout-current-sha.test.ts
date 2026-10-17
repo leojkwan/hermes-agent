@@ -32,6 +32,7 @@ function deps(root: string, status: SourceUpdate | null, isWindows: boolean): Ch
     repairMacUpdaterHelper: vi.fn(),
     preflightStateDb: vi.fn(),
     runningAppBundle: (): null => null,
+    quitAccepted: (): boolean => false,
     markQuittingForHandoff: vi.fn(),
     quit: vi.fn()
   }

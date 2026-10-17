@@ -65,6 +65,11 @@ export interface CheckoutStrategyDeps {
   repairMacUpdaterHelper: (updater: string) => void | Promise<void>
   preflightStateDb: (hermesHome: string, rememberLog: (chunk: string) => void) => void | Promise<void>
   runningAppBundle: () => string | null
+  /**
+   * True once an ordinary quit is accepted (the shell's quit latch). The state.db snapshot no
+   * longer blocks the main process, so a quit can land while it runs.
+   */
+  quitAccepted: () => boolean
   markQuittingForHandoff: () => void
   quit: () => void
   /** The checkout script's marker helper (A7 rule 3); injectable for tests. */
@@ -335,6 +340,19 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
    * Staged (Tauri) updater path: spawn it detached and pre-write its marker
    * when it is new enough to adopt it.
    */
+  // The state.db snapshot, then the quit latch. An ordinary quit accepted while the snapshot ran
+  // cancels the update the same way a failed snapshot does: no backend stop, updater or relaunch
+  // after the user chose to quit. The hand-off's own quit comes later and is unaffected.
+  async function preflightStateDb(): Promise<void> {
+    await deps.preflightStateDb(deps.hermesHome, deps.rememberLog)
+
+    if (deps.quitAccepted()) {
+      const message: string = 'Update cancelled because Hermes is quitting.'
+      deps.rememberLog(`[updates] ${message}`)
+      throw new Error(message)
+    }
+  }
+
   async function spawnStagedUpdater(updater, updaterArgs: string[], updateRoot: string) {
     const child = spawnUpdaterProcess(updater, updaterArgs, {
       cwd: deps.hermesHome,
@@ -512,7 +530,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
     // ── Pre-flight state.db integrity guard (#68474) ─────────────────
     // Emergency backup and header verification before the update touches
     // anything.  Runs while the backend is still alive.
-    await deps.preflightStateDb(deps.hermesHome, deps.rememberLog)
+    await preflightStateDb()
 
     if (deps.isWindows && resolveUpdateScriptHandoff(updateRoot)) {
       const message = windowsUpdatePrerequisiteError(updateRoot, deps.hermesHome)
@@ -665,7 +683,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
     }
 
     // ── Pre-flight state.db integrity guard (#68474) ──
-    await deps.preflightStateDb(deps.hermesHome, deps.rememberLog)
+    await preflightStateDb()
 
     const args: string[] = [
       ...handoff.args,

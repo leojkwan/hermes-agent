@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 import { test } from 'vitest'
 
-import { preflightStateDb } from './state-db-preflight'
+import { preflightStateDb, STATE_DB_PREFLIGHT_TIMEOUT_MS } from './state-db-preflight'
 
 test('the desktop preflight publishes committed WAL rows before its caller can stop the backend', async (): Promise<void> => {
   const home: string = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-db-'))
@@ -45,7 +45,7 @@ c.close()
 
   try {
     await once(child.stdout!, 'data')
-    preflightStateDb({
+    await preflightStateDb({
       python,
       script,
       home,
@@ -87,7 +87,7 @@ with sqlite3.connect(sys.argv[1]) as c:
   }
 })
 
-test('a managed installation runs the snapshot through the installation launcher', (): void => {
+test('a managed installation runs the snapshot through the installation launcher', async (): Promise<void> => {
   const home: string = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-preflight-'))
   const shims: string = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-shim-'))
   const python: string = process.env.HERMES_PYTHON || 'python3'
@@ -125,7 +125,7 @@ test('a managed installation runs the snapshot through the installation launcher
 
     assert.equal(created.status, 0, created.stderr)
 
-    preflightStateDb({
+    await preflightStateDb({
       python: null,
       launcher: shim,
       script,
@@ -143,13 +143,13 @@ test('a managed installation runs the snapshot through the installation launcher
   }
 })
 
-test('an older selected checkout without the snapshot helper refuses before backend stop', (): void => {
+test('an older selected checkout without the snapshot helper refuses before backend stop', async (): Promise<void> => {
   const oldRoot: string = fs.mkdtempSync(path.join(os.tmpdir(), 'old-preflight-'))
   let stopped = false
 
   try {
-    assert.throws((): void => {
-      preflightStateDb({
+    await assert.rejects(async (): Promise<void> => {
+      await preflightStateDb({
         python: process.env.HERMES_PYTHON || 'python3',
         script: path.join(oldRoot, 'hermes_cli', 'backup_sqlite.py'),
         home: oldRoot,
@@ -160,5 +160,153 @@ test('an older selected checkout without the snapshot helper refuses before back
     assert.equal(stopped, false)
   } finally {
     fs.rmSync(oldRoot, { recursive: true, force: true })
+  }
+})
+
+test('the main process keeps running while a slow snapshot runs', async (): Promise<void> => {
+  const dir: string = fs.mkdtempSync(path.join(os.tmpdir(), 'slow-preflight-'))
+  const release: string = path.join(dir, 'release')
+  const script: string = path.join(dir, 'slow_snapshot.py')
+  // Stand-in snapshot: it waits up to 3 s for a file that only a main-process timer creates.
+  // A blocking call keeps that timer from firing, so the child prints "not released".
+  fs.writeFileSync(
+    script,
+    [
+      'import os, sys, time',
+      'deadline = time.monotonic() + 3',
+      'while time.monotonic() < deadline and not os.path.exists(sys.argv[1]):',
+      '    time.sleep(0.02)',
+      "print('released' if os.path.exists(sys.argv[1]) else 'not released')"
+    ].join('\n')
+  )
+  const logs: string[] = []
+  const timer = setTimeout((): void => fs.writeFileSync(release, ''), 50)
+
+  try {
+    await preflightStateDb({
+      python: process.env.HERMES_PYTHON || 'python3',
+      script,
+      home: release,
+      log: (message: string): void => {
+        logs.push(message)
+      }
+    })
+    assert.deepEqual(logs, ['[updates] state.db pre-flight: released'])
+  } finally {
+    clearTimeout(timer)
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a snapshot past its limit fails with the same message and leaves no child running', async (): Promise<void> => {
+  assert.equal(STATE_DB_PREFLIGHT_TIMEOUT_MS, 150_000)
+  const python: string = process.env.HERMES_PYTHON || 'python3'
+  const dir: string = fs.mkdtempSync(path.join(os.tmpdir(), 'hung-preflight-'))
+  const pidFile: string = path.join(dir, 'pid')
+  const script: string = path.join(dir, 'hung_snapshot.py')
+  fs.writeFileSync(script, 'import os, sys, time\nopen(sys.argv[1], "w").write(str(os.getpid()))\ntime.sleep(30)\n')
+
+  const message: string =
+    `state.db pre-flight failed: spawnSync ${python} ETIMEDOUT. ` +
+    'Update cancelled before backend shutdown. Update the selected installation with its hermes update command, then retry.'
+
+  const logs: string[] = []
+
+  try {
+    await assert.rejects(
+      preflightStateDb({
+        python,
+        script,
+        home: pidFile,
+        timeoutMs: 2_000,
+        log: (message: string): void => {
+          logs.push(message)
+        }
+      }),
+      (error: Error): boolean => {
+        assert.equal(error.message, message)
+        assert.equal((error.cause as NodeJS.ErrnoException).code, 'ETIMEDOUT')
+
+        return true
+      }
+    )
+    assert.deepEqual(logs, [`[updates] ${message}`])
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'))
+    assert.throws((): boolean => process.kill(pid, 0), { code: 'ESRCH' })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('output past the buffer limit fails as ENOBUFS, not as a timeout, and leaves no child running', async (): Promise<void> => {
+  const python: string = process.env.HERMES_PYTHON || 'python3'
+  const dir: string = fs.mkdtempSync(path.join(os.tmpdir(), 'noisy-preflight-'))
+  const pidFile: string = path.join(dir, 'pid')
+  const script: string = path.join(dir, 'noisy_snapshot.py')
+  // Floods stdout past the 1 MiB default limit, then stays alive well inside its time limit.
+  fs.writeFileSync(
+    script,
+    'import os, sys, time\nopen(sys.argv[1], "w").write(str(os.getpid()))\n' +
+      'sys.stdout.write("x" * (2 * 1024 * 1024))\nsys.stdout.flush()\ntime.sleep(30)\n'
+  )
+
+  const message: string =
+    `state.db pre-flight failed: spawnSync ${python} ENOBUFS. ` +
+    'Update cancelled before backend shutdown. Update the selected installation with its hermes update command, then retry.'
+
+  try {
+    await assert.rejects(
+      preflightStateDb({ python, script, home: pidFile, timeoutMs: 20_000, log: (): void => {} }),
+      (error: Error): boolean => {
+        assert.equal(error.message, message)
+        assert.equal((error.cause as NodeJS.ErrnoException).code, 'ENOBUFS')
+
+        return true
+      }
+    )
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'))
+    assert.throws((): boolean => process.kill(pid, 0), { code: 'ESRCH' })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test.each([
+  ['a missing interpreter', 'ENOENT'],
+  ...(process.platform === 'win32' ? [] : [['an interpreter without execute permission', 'EACCES']])
+])('%s keeps the earlier spawn failure message', async (_name: string, code: string): Promise<void> => {
+  const dir: string = fs.mkdtempSync(path.join(os.tmpdir(), 'unspawnable-preflight-'))
+  const python: string = path.join(dir, 'python3')
+
+  if (code === 'EACCES') {
+    fs.writeFileSync(python, '#!/bin/sh\n', { mode: 0o644 })
+  }
+
+  const message: string =
+    `state.db pre-flight failed: spawnSync ${python} ${code}. ` +
+    'Update cancelled before backend shutdown. Update the selected installation with its hermes update command, then retry.'
+
+  const logs: string[] = []
+
+  try {
+    await assert.rejects(
+      preflightStateDb({
+        python,
+        script: path.join(dir, 'backup_sqlite.py'),
+        home: dir,
+        log: (message: string): void => {
+          logs.push(message)
+        }
+      }),
+      (error: Error): boolean => {
+        assert.equal(error.message, message)
+        assert.equal((error.cause as NodeJS.ErrnoException).code, code)
+
+        return true
+      }
+    )
+    assert.deepEqual(logs, [`[updates] ${message}`])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
   }
 })
