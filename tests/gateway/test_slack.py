@@ -4546,6 +4546,34 @@ class TestThreadImageContext:
         a._download_slack_file.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_cold_start_delivers_thread_root_audio(
+        self, adapter_with_session_store
+    ):
+        """A voice note on the thread root reaches audio routing, not just a marker."""
+        a = self._prep(adapter_with_session_store)
+        a._download_slack_file = AsyncMock(return_value="/tmp/hermes-cached.m4a")
+        a._app.client.conversations_replies = self._replies(
+            root_files=[
+                {
+                    "id": "F1",
+                    "name": "voice_note.m4a",
+                    "mimetype": "audio/mp4",
+                    "url_private_download": "https://files.slack.com/T1-F1/voice_note.m4a",
+                }
+            ]
+        )
+
+        await a._handle_slack_message(self._thread_event())
+
+        a.handle_message.assert_awaited_once()
+        msg_event = a.handle_message.call_args[0][0]
+        assert msg_event.media_urls == ["/tmp/hermes-cached.m4a"]
+        assert msg_event.media_types == ["audio/mp4"]
+        assert msg_event.message_type == MessageType.VOICE
+        assert "[audio: voice_note.m4a]" in msg_event.channel_context
+        a._download_slack_file.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_root_image_download_failure_degrades_to_marker(
         self, adapter_with_session_store
     ):
