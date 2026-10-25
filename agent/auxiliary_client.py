@@ -4294,18 +4294,21 @@ def _failed_backend_skip(
 def _try_main_agent_model_fallback(
     failed_provider: str, task: str | None = None, reason: str = "error",
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
+    *, main_runtime: Optional[dict[str, Any]] = None,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
     ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
     so a hung aux model says nothing about the main model's health. Returns (client, model, label) or (None, None, "")."""
-    main_provider = (_read_main_provider() or "").strip()
-    main_model = (_read_main_model() or "").strip()
+    runtime = _normalize_main_runtime(main_runtime)
+    main_provider = (runtime.get("provider") or _read_main_provider() or "").strip()
+    main_model = (runtime.get("model") or _read_main_model() or "").strip()
     if main_provider.lower() == "moa":
         # MoA virtual provider: fall back to the preset's aggregator (the acting model).
         _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
         if not _agg_provider or not _agg_model:
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
+        runtime = {}  # The virtual MoA endpoint is not the aggregator's transport.
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
         return None, None, ""
     if task == "vision" and (
@@ -4315,7 +4318,7 @@ def _try_main_agent_model_fallback(
         logger.info("Auxiliary vision: %s on %s — main agent provider %s accepts no image input, not falling back",
                     reason, failed_provider, main_provider)
         return None, None, ""
-    main_base_url = _custom_health_base_url(main_provider)
+    main_base_url = _custom_health_base_url(main_provider, runtime.get("base_url"))
     if _failed_backend_skip(
             failed_provider, failed_model, failed_base_url=failed_base_url,
             failure_scope=failure_scope)(main_provider, main_model, main_base_url):
@@ -4324,7 +4327,9 @@ def _try_main_agent_model_fallback(
         _log_skip_unhealthy(main_provider, task, base_url=main_base_url)
         return None, None, ""
     try:
-        client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
+        client, resolved_model = resolve_provider_client(
+            provider=main_provider, model=main_model, main_runtime=runtime,
+            api_mode=runtime.get("api_mode"), task=task)
     except Exception:
         client, resolved_model = None, None
     if client is None:
@@ -4339,17 +4344,6 @@ def _try_main_agent_model_fallback(
 # too-small aux models; runtime chains must too, or compression stops at a reachable-but-too-small
 # candidate. ``None`` (unknown) passes through.
 
-# ── Context-window screening for runtime fallback chains (issue #52392) ── When the runtime auxiliary
-# fallback chain selects a candidate that is reachable but has a context window smaller than the compression
-# task requires, the call errors out instead of continuing to the next, viable candidate. The startup
-# feasibility check in ``agent.conversation_compression.check_compression_model_feasibility`` already
-# filters too-small auxiliary models at startup, but the runtime fallback chain
-# (``_try_configured_fallback_chain`` and ``_try_main_fallback_chain``) does not apply the same filter, so
-# compression can stop at the first alive door even if the room behind it is too small. The helpers below
-# screen each candidate by its effective context window before it is returned. ``None`` results from
-# ``get_model_context_length`` are passed through (we cannot prove a model is too small, so we do not block
-# it). This preserves the existing fallback surface for unrecognised/custom models while closing the gap on
-# the well-known ones.
 def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     """Minimum context length for an auxiliary task; None = no floor (only ``compression`` has one)."""
     return MINIMUM_CONTEXT_LENGTH if task == "compression" else None
@@ -7894,7 +7888,8 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     elif fb_client is None and not explicit_auth_with_task_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+            main_runtime=route.main_runtime)
     # Ordered walk: a candidate that returns None was quarantined (dead credential or a capacity
     # error such as a quota 429) and is now unhealthy, so re-walking the CONFIGURED chains first
     # lands on the next entry, then discovery where the selection policy allows it (#106367).
