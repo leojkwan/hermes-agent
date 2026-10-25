@@ -60,6 +60,7 @@ from hermes_cli.plugins_dispatch import (
 from hermes_cli.plugins_capability_ctx import PluginCapabilityCtxMixin
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
 from hermes_cli.plugins_registrars import _SCOPED_PROVIDER_REGISTRARS, make_scoped_provider_registrar
+from hermes_cli.plugins_tool_guards import PluginCallbackContextMixin, register_tool_guard
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
@@ -227,7 +228,7 @@ class LoadedPlugin:
     deferred: bool = False
 
 
-class PluginContext(PluginCapabilityCtxMixin):
+class PluginContext(PluginCapabilityCtxMixin, PluginCallbackContextMixin):
     """Facade given to plugins so they can register tools and hooks."""
 
     def __init__(self, manifest: PluginManifest, manager: PluginManager):
@@ -943,18 +944,9 @@ class PluginContext(PluginCapabilityCtxMixin):
             "middleware", kind, callback, self._manager._middleware, VALID_MIDDLEWARE
         )
 
-    def _track_callback(
-        self, kind: str, key: str, callback: Callable, mapping: dict[str, list[Callable]],
-        valid: set[str],
-    ) -> PluginRegistration:
-        """Append ``callback`` under ``key`` (warning on unknown ``key``) and lease its removal."""
-        if key not in valid:
-            logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
-                           key, ", ".join(sorted(valid)))
-        mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
-        logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
-        return handle
+    def register_tool_guard(self, tool_name: str, callback: Callable) -> PluginRegistration:
+        """Guard final handler arguments; ``next_call()`` is synchronous and single-use."""
+        return register_tool_guard(self, tool_name, callback)
 
     def register_system_prompt_section(
         self, id: str, content: str | Callable[[Mapping[str, Any]], str], *,
@@ -1105,6 +1097,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}
+        self._tool_guards: dict[str, list[Callable]] = {}
         self._plugin_tool_names: set[str] = set()
         self._plugin_platform_names: set[str] = set()
         self._cli_commands: dict[str, dict] = {}

@@ -1705,6 +1705,45 @@ The canonical list of kinds is `VALID_MIDDLEWARE` in `hermes_cli/middleware.py`:
 - Middleware payloads carry `middleware_schema_version` (`hermes.middleware.v1`) alongside the observer telemetry fields.
 - Unknown kinds register with a warning instead of failing, so a plugin written against a newer Hermes still loads on an older one.
 
+### Guard final tool-handler arguments
+
+`ctx.register_tool_guard(tool_name, callback)` runs inside registry dispatch, after request
+middleware, hooks and execution middleware have finished choosing the handler arguments. It
+does not replace the tool registration: native MCP refresh, lazy discovery, toolset selection,
+schemas and registration metadata keep their usual behavior. The concrete use is cursor
+provenance: a plugin can refuse a continuation that was not returned for the same session and
+query, even if native tool discovery refreshes between the pre-call hook and dispatch.
+
+```python
+import json
+
+def guard_cursor(args, next_call, session_id="", registration=None, **kwargs):
+    if not cursor_was_returned(session_id, registration, args):
+        return json.dumps({"error": "Unknown cursor; the provider was not called"})
+    result = next_call()
+    remember_next_cursor(session_id, registration, args, result)
+    return result
+
+def register(ctx):
+    ctx.register_tool_guard("mcp__mail__list_threads", guard_cursor)
+```
+
+Each callback receives `tool_name`, an independent deep copy of the final `args`,
+`next_call`, an opaque `registration` token, and available dispatch context such as
+`session_id`, `task_id` and `user_task`. Narrow callback signatures receive only their
+declared fields. The token changes when the tool is re-registered; compare identity in
+memory and do not persist or serialize it.
+
+`next_call()` accepts no arguments, is synchronous and single-use, and expires when the
+callback returns. Mutating the callback's copy cannot change the handler arguments or
+another guard's view. Returning without calling it refuses execution. Exceptions and
+continuation misuse become the normal tool error; they never skip the guard or retry the
+handler. Results retain the normal string/multimodal-dict tool contract. Guards run in registration
+order in the selected profile, including an explicit `registry.dispatch(..., scope=...)`.
+The returned registration handle supports `dispose()`, and normal plugin unload removes
+the guard without touching the tool. Safe workers suppress guards like other plugin
+callbacks. This API requires in-process plugin isolation; the plugin host refuses it.
+
 ### Register CLI commands
 
 Plugins can add their own `hermes <plugin>` subcommand tree:

@@ -14,7 +14,7 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -230,6 +230,7 @@ class ToolEntry:
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
     execution_timeout: float | None = None
+    registration_token: object = field(default_factory=object, repr=False)
 
 
 class _PluginOverridePolicy:
@@ -936,12 +937,16 @@ class ToolRegistry:
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
             # plugin handler is not broken by every field the dispatcher injects (#68318).
-            kwargs = _kwargs_accepted_by(entry.handler, kwargs)
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+            def execute(final_args):
+                accepted = _kwargs_accepted_by(entry.handler, kwargs)
+                if entry.is_async:
+                    from model_tools import _run_async
+                    return _run_async(entry.handler(final_args, **accepted))
+                return entry.handler(final_args, **accepted)
+
+            from hermes_cli.plugins_tool_guards import run_tool_guards
+            result = run_tool_guards(
+                name, args, execute, registration=entry.registration_token, scope=scope, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
