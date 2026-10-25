@@ -4,7 +4,7 @@ from contextlib import nullcontext
 
 import httpx
 import pytest
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 
 import agent.auxiliary_client as aux
 import hermes_yaml as yaml
@@ -29,11 +29,11 @@ def selected_runtime(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
-@pytest.mark.parametrize("explicit", [False, True])
-def test_main_fallback_keeps_selected_runtime(selected_runtime, api_mode, explicit, monkeypatch):
+@pytest.mark.parametrize("path", ["context", "explicit", "ladder"])
+def test_main_fallback_keeps_selected_runtime(selected_runtime, api_mode, path, monkeypatch):
     runtime = {**selected_runtime, "api_mode": api_mode}
-    binding = nullcontext() if explicit else aux.scoped_runtime_main(runtime)
-    kwargs = {"main_runtime": runtime} if explicit else {}
+    binding = aux.scoped_runtime_main(runtime) if path == "context" else nullcontext()
+    kwargs = {"main_runtime": runtime} if path == "explicit" else {}
     requests = []
 
     def respond(request):
@@ -50,10 +50,28 @@ def test_main_fallback_keeps_selected_runtime(selected_runtime, api_mode, explic
 
     monkeypatch.setattr(aux, "_create_openai_client", build_client)
     with binding:
-        client, model, label = aux._try_main_agent_model_fallback(
-            "unavailable-lane", task="compression", failed_model="unavailable-model",
-            failed_base_url="http://127.0.0.1:17776/v1", **kwargs,
-        )
+        if path == "ladder":
+            failed_url = "http://127.0.0.1:17776/v1"
+            error = APIStatusError("Payment required", response=httpx.Response(
+                402, request=httpx.Request("POST", failed_url + "/chat/completions")), body=None)
+            route = aux._LadderRoute(**{
+                **dict.fromkeys(aux._LadderRoute._fields),
+                "task": "compression", "tag": "", "resolved_provider": "unavailable-lane",
+                "base_info": failed_url, "final_model": "unavailable-model", "timeout": 1,
+                "main_runtime": runtime,
+            })
+            ladder = aux._ladder_provider_fallback(error, route)
+            try:
+                step = next(ladder)
+                assert step.kind == "fallback"
+                client, model, label = step.args
+            finally:
+                ladder.close()
+        else:
+            client, model, label = aux._try_main_agent_model_fallback(
+                "unavailable-lane", task="compression", failed_model="unavailable-model",
+                failed_base_url="http://127.0.0.1:17776/v1", **kwargs,
+            )
     assert client is not None
     raw = getattr(client, "_real_client", client)
     try:
