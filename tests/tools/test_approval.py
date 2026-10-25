@@ -1609,7 +1609,7 @@ class TestApprovalTimeoutIsNotConsent:
         # to try a different command achieving the same outcome.
         msg = result["message"]
         assert "BLOCKED" in msg
-        assert "NOT consented" in msg
+        assert "NOT consented" not in msg and "No runtime approval was obtained" in msg
         assert "Silence is not consent" in msg
         assert "retry" in msg.lower()
         assert "rephrase" in msg.lower()

@@ -61,7 +61,9 @@ def _assert_withdrawn(result, cause):
     assert result["outcome"] == "cancelled"
     assert "denied by user" not in result["message"].lower()
     assert cause in result["message"]
-    assert "NOT consented" in result["message"]  # still fail-closed for the model
+    assert "NOT consented" not in result["message"]
+    assert "No runtime approval was obtained" in result["message"]
+    assert "Do NOT retry" in result["message"]
 
 
 def test_teardown_interrupt_reports_cause_not_user_deny(gateway_session):
@@ -153,3 +155,73 @@ def test_cli_callback_failure_reports_undelivered_prompt_not_user_deny(cli_sessi
     assert "user denied" not in result["message"].lower()
     posts = [kw for name, kw in cli_session if name == "post_approval_response"]
     assert posts[-1]["choice"] == "cancelled"
+
+
+@pytest.mark.parametrize("guard", [
+    pytest.param(lambda: mod.check_all_command_guards("rm -rf .git", "local"), id="command"),
+    pytest.param(lambda: mod.check_execute_code_guard("print('probe')", "local"), id="code"),
+    pytest.param(lambda: mod.request_tool_approval("write_file", "protected write"), id="action"),
+])
+@pytest.mark.parametrize("outcome", ["cancelled", "timeout", "notify_failed", "denied"])
+def test_gateway_refusal_attributes_only_actual_user_denial(gateway_session, monkeypatch, guard, outcome):
+    timeout = 0.05 if outcome == "timeout" else 60
+    monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"mode": "manual", "timeout": timeout})
+    notified = []
+
+    def notify(data):
+        notified.append(data)
+        if outcome == "notify_failed":
+            raise RuntimeError("notification failed")
+        if outcome == "cancelled":
+            mod.withdraw_gateway_approval(SESSION_KEY, data["request_id"], "client could not render approval")
+        elif outcome == "denied":
+            mod.resolve_gateway_approval(SESSION_KEY, "deny", request_id=data["request_id"])
+
+    mod.register_gateway_notify(SESSION_KEY, notify)
+    result = guard()
+
+    assert len(notified) == 1
+    assert result["approved"] is False
+    assert result["user_consent"] is False
+    assert result["outcome"] == outcome
+    assert "Do NOT retry" in result["message"]
+    if outcome == "denied":
+        assert "denied by user" in result["message"]
+        assert "NOT consented" in result["message"]
+    else:
+        assert "NOT consented" not in result["message"]
+        assert "denied by user" not in result["message"]
+        if outcome != "notify_failed":
+            assert "No runtime approval was obtained" in result["message"]
+    assert not mod.has_blocking_approval(SESSION_KEY)
+    posts = [kw for name, kw in gateway_session if name == "post_approval_response"]
+    assert posts[-1]["choice"] == ("deny" if outcome == "denied" else outcome)
+
+
+@pytest.mark.parametrize("guard", [
+    pytest.param(lambda callback: mod.check_all_command_guards(
+        "rm -rf .git", "local", approval_callback=callback), id="command"),
+    pytest.param(lambda callback: mod.request_tool_approval(
+        "write_file", "protected write", approval_callback=callback), id="action"),
+])
+@pytest.mark.parametrize("outcome", ["cancelled", "timeout", "denied"])
+def test_cli_refusal_attributes_only_actual_user_denial(cli_session, guard, outcome):
+    def callback(command, description, **kwargs):
+        if outcome == "cancelled":
+            raise RuntimeError("prompt unavailable")
+        return "deny" if outcome == "denied" else outcome
+
+    result = guard(callback)
+
+    assert result["approved"] is False
+    assert result["user_consent"] is False
+    assert result["outcome"] == outcome
+    assert "Do NOT retry" in result["message"]
+    if outcome == "denied":
+        assert "User denied" in result["message"]
+    else:
+        assert "NOT consented" not in result["message"]
+        assert "User denied" not in result["message"]
+        assert "No runtime approval was obtained" in result["message"]
+    posts = [kw for name, kw in cli_session if name == "post_approval_response"]
+    assert posts[-1]["choice"] == ("deny" if outcome == "denied" else outcome)

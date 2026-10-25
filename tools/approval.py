@@ -699,43 +699,44 @@ class _GateSpec:
 
 
 _STOP_COMMAND = (
-    " The user has NOT consented to this action. Do NOT retry this command, do "
+    " Do NOT retry this command, do "
     "NOT rephrase it, and do NOT attempt the same outcome via a different "
     "command. Stop the current workflow and wait for the user to respond before "
     "taking any further destructive or irreversible action."
 )
 _STOP_ACTION = (
-    " The user has NOT consented to this action. Do NOT retry it, do NOT "
+    " Do NOT retry it, do NOT "
     "rephrase it, and do NOT attempt the same outcome via a different path."
 )
+_NO_RUNTIME_APPROVAL = " No runtime approval was obtained."
 
 _COMMAND_GATE = _GateSpec(
     noun="command", transport=True, user_approved=True, redact_cli=False, pending_keys=True,
     notify_failed="BLOCKED: Failed to send approval request to user. Do NOT retry.",
-    gateway_refused="BLOCKED: Command {reason}.{reason_addendum}" + _STOP_COMMAND
+    gateway_refused="BLOCKED: Command {reason}.{reason_addendum}{approval_status}" + _STOP_COMMAND
                     + "{timeout_addendum}{breaker}",
     transport_denied=(
         "BLOCKED: User denied this command through the selected approval "
         "transport. The user has NOT consented to this action. Do NOT retry or "
         "attempt the same outcome through another route.{breaker}"
     ),
-    cli_timeout="BLOCKED: Command timed out without user response." + _STOP_COMMAND
+    cli_timeout="BLOCKED: Command timed out without user response." + _NO_RUNTIME_APPROVAL + _STOP_COMMAND
                 + " Silence is not consent.{breaker}",
-    cli_denied="BLOCKED: User denied this command." + _STOP_COMMAND + "{breaker}",
+    cli_denied="BLOCKED: User denied this command. The user has NOT consented to this action."
+               + _STOP_COMMAND + "{breaker}",
     smart_log="Smart approval: auto-approved '{command}' ({description})",
 )
 _EXECUTE_CODE_GATE = _GateSpec(
     noun="code", transport=True, user_approved=True, redact_cli=True, pending_keys=True,
     notify_failed="BLOCKED: Failed to send execute_code approval request to user. Do NOT retry.",
     gateway_refused=(
-        "BLOCKED: execute_code script {reason}.{reason_addendum} The user has "
-        "NOT consented to running this code. Do NOT retry, do NOT rephrase the "
+        "BLOCKED: execute_code script {reason}.{reason_addendum}{approval_status} Do NOT retry, do NOT rephrase the "
         "script, and do NOT attempt the same outcome via a different tool.{timeout_addendum}{breaker}"
     ),
     transport_denied=(
         "BLOCKED: User denied execute_code through the selected approval transport. The user has NOT consented."
     ),
-    cli_timeout="BLOCKED: Action timed out without user response." + _STOP_ACTION
+    cli_timeout="BLOCKED: Action timed out without user response." + _NO_RUNTIME_APPROVAL + _STOP_ACTION
                 + " Silence is not consent.{breaker}",
     cli_denied=(
         "BLOCKED: User denied execute_code script execution (matched "
@@ -748,10 +749,10 @@ _EXECUTE_CODE_GATE = _GateSpec(
 _ACTION_GATE = _GateSpec(
     noun="action", transport=False, user_approved=False, redact_cli=False, pending_keys=False,
     notify_failed="BLOCKED: Failed to send approval request to user. Do NOT retry.",
-    gateway_refused="BLOCKED: Action {reason}.{reason_addendum}" + _STOP_ACTION
+    gateway_refused="BLOCKED: Action {reason}.{reason_addendum}{approval_status}" + _STOP_ACTION
                     + "{timeout_addendum}",
     transport_denied="",
-    cli_timeout="BLOCKED: Action timed out without user response." + _STOP_ACTION
+    cli_timeout="BLOCKED: Action timed out without user response." + _NO_RUNTIME_APPROVAL + _STOP_ACTION
                 + " Silence is not consent.",
     cli_denied=(
         "BLOCKED: User denied this potentially dangerous action (matched "
@@ -820,7 +821,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             breaker = _denial_breaker_addendum(session_key)
         deny_reason = fmt.pop("deny_reason", None)
         extra = {"deny_reason": deny_reason} if "reason" in fmt else {}
-        return _denied(template.format(description=description, breaker=breaker, **fmt),
+        approval_status = _NO_RUNTIME_APPROVAL
+        if outcome == "denied":
+            approval_status = (" The user has NOT consented to running this code." if spec.noun == "code"
+                               else " The user has NOT consented to this action.")
+        return _denied(template.format(description=description, breaker=breaker, approval_status=approval_status, **fmt),
                        pattern_key=pattern_key, description=description,
                        outcome=outcome, noun=spec.noun, **extra)
 
