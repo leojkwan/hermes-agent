@@ -63,3 +63,77 @@ def test_single_query_mode_never_auto_approves_this_gate(tmp_path, monkeypatch, 
     assert asked == []
     assert "BLOCKED" in res["error"]
     assert not target.exists()
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "timeout", "notify_failed", "denied"])
+def test_gateway_missing_approval_attribution(tmp_path, monkeypatch, outcome):
+    from tools import approval, approval_context
+    from tools.file_tools import write_file_tool
+
+    timeout = 0.05 if outcome == "timeout" else 60
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(f"approvals:\n  mode: manual\n  timeout: {timeout}\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    session_key = "protected-attribution"
+    token = approval_context.set_current_session_key(session_key)
+    notified = []
+
+    def notify(data):
+        notified.append(data)
+        assert data["allow_permanent"] is False
+        assert data["allow_session"] is False
+        if outcome == "notify_failed":
+            raise RuntimeError("synthetic notification failure")
+        if outcome == "cancelled":
+            approval.withdraw_gateway_approval(session_key, data["request_id"], "synthetic withdrawal")
+        elif outcome == "denied":
+            approval.resolve_gateway_approval(session_key, "deny", request_id=data["request_id"])
+
+    approval.register_gateway_notify(session_key, notify)
+    target = tmp_path / "AGENTS.md"
+    try:
+        result = json.loads(write_file_tool(str(target), "synthetic content"))
+    finally:
+        approval.unregister_gateway_notify(session_key)
+        approval_context.reset_current_session_key(token)
+
+    assert len(notified) == 1, result
+    assert not target.exists()
+    assert not approval.has_blocking_approval(session_key)
+    if outcome == "denied":
+        assert result["error"] == (
+            "BLOCKED: write to protected agent-instruction file(s) (AGENTS.md) was denied by the user. "
+            "The user has NOT consented to this write. Do NOT retry it or attempt the same edit via "
+            "another path (terminal, execute_code, etc.).")
+    else:
+        cause = {"cancelled": "synthetic withdrawal", "timeout": "timed out without a user response",
+                 "notify_failed": "approval request could not be delivered"}[outcome]
+        assert cause in result["error"]
+        assert "No runtime approval was obtained" in result["error"]
+        assert "NOT consented" not in result["error"]
+        assert "Do NOT retry" in result["error"]
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "timeout", "denied"])
+def test_cli_missing_approval_attribution(tmp_path, monkeypatch, outcome):
+    from tools.file_tools import write_file_tool
+    from tools.terminal_tool import set_approval_callback
+
+    def callback(command, description, **kwargs):
+        if outcome == "cancelled":
+            raise RuntimeError("synthetic undelivered prompt")
+        return "deny" if outcome == "denied" else outcome
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    set_approval_callback(callback)
+    target = tmp_path / "AGENTS.md"
+    result = json.loads(write_file_tool(str(target), "synthetic content"))
+
+    assert not target.exists()
+    assert "Do NOT retry" in result["error"]
+    if outcome == "denied":
+        assert "was denied by the user. The user has NOT consented" in result["error"]
+    else:
+        assert "No runtime approval was obtained" in result["error"]
+        assert "NOT consented" not in result["error"]

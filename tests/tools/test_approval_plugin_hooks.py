@@ -391,5 +391,5 @@ class TestClassicCliPromptsFireGatewayTwinHooks:
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: None)
         result, captured = _capture_hooks(lambda: _request_protected_instruction_approval(["AGENTS.md"]))
-        assert result is not None and "has NOT consented" in result
+        assert result is not None and "No runtime approval was obtained" in result
         assert captured == []

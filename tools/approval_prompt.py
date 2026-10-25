@@ -270,8 +270,8 @@ def _transport_choice(attempt: dict, *, pattern_key: str, description: str):
     from tools import approval as _a
     breaker_addendum = _a._denial_breaker_addendum(_ctx.get_current_session_key())
     return None, _a._denied(
-        f"BLOCKED: Selected approval transport failed ({failure}); the user "
-        "has NOT consented to this action. Do NOT retry this command or "
+        f"BLOCKED: Selected approval transport failed ({failure}). "
+        "No runtime approval was obtained. Do NOT retry this command or "
         f"attempt the same outcome through another route.{breaker_addendum}",
         pattern_key=pattern_key, description=description, outcome=f"transport_{failure}",
     )

@@ -368,6 +368,47 @@ def test_transport_failure_denies_without_builtin_fallback(monkeypatch):
     assert builtin_calls == []
 
 
+@pytest.mark.parametrize("guard,denied_message", [
+    pytest.param("command", "BLOCKED: User denied this command through the selected approval transport. "
+                 "The user has NOT consented to this action. Do NOT retry or attempt the same outcome "
+                 "through another route.", id="command"),
+    pytest.param("code", "BLOCKED: User denied execute_code through the selected approval transport. "
+                 "The user has NOT consented.", id="code"),
+])
+@pytest.mark.parametrize("failure", ["timeout", "interrupted", "error", "unavailable", "invalid", None])
+def test_selected_transport_failure_attribution(tmp_path, monkeypatch, guard, denied_message, failure):
+    from hermes_cli import approval_transport
+    from tools import approval
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "approvals": {"mode": "manual"},
+        "security": {"approval": {"transport": "phone"}},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "transport-attribution")
+    manager = PluginManager()
+    _context(manager).register_approval_transport("phone", lambda request: request.respond("deny"))
+    monkeypatch.setattr(approval_prompt, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(approval_transport, "invoke_approval_transport", lambda *a, **kw:
+                        approval_transport.ApprovalTransportResult("deny", failure))
+    approval.clear_session("transport-attribution")
+
+    result = (approval.check_all_command_guards("rm -rf .git", "local") if guard == "command"
+              else approval.check_execute_code_guard("print('synthetic')", "local"))
+
+    assert result["approved"] is False
+    assert result["user_consent"] is False
+    assert result["outcome"] == (f"transport_{failure}" if failure else "denied")
+    if failure:
+        assert "No runtime approval was obtained" in result["message"]
+        assert "NOT consented" not in result["message"]
+        assert "Do NOT retry" in result["message"]
+        assert "another route" in result["message"]
+    else:
+        assert result["message"] == denied_message
+
+
 def test_transport_resolution_error_does_not_log_plugin_exception(monkeypatch, caplog):
     from tools import approval
 

@@ -272,11 +272,14 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     display = f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
-        "{why} The user has NOT consented to this write. Do NOT retry it or "
+        "{why} No runtime approval was obtained. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.).")
     timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
-    denied = blocked.format(why="was denied by the user.")
+    denied = (
+        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
+        "was denied by the user. The user has NOT consented to this write. Do NOT retry it or "
+        "attempt the same edit via another path (terminal, execute_code, etc.).")
 
     try:
         import tools.approval as _approval
