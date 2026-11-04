@@ -12,7 +12,9 @@ new speed.
 
 from __future__ import annotations
 
+import copy
 import time
+from dataclasses import dataclass
 from typing import Any
 
 BOUNDED_MODES = frozenset({"auto", "cold"})
@@ -51,6 +53,36 @@ def parse_exact_service_tier(raw: Any) -> str:
     return parse_service_tier(value) or ""
 
 
+@dataclass(frozen=True)
+class ServiceTierPolicy:
+    """An explicit route-independent choice; empty tier pins normal, no policy leaves defaults alone."""
+
+    tier: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tier", parse_exact_service_tier(self.tier))
+
+
+def without_service_tier(overrides: Any) -> dict[str, Any]:
+    """Deep copy without speed-tier keys, including provider-contributed ``extra_body`` values."""
+    keys = ("service_tier", "speed")
+    cleaned = {
+        k: v
+        for k, v in copy.deepcopy(
+            overrides if isinstance(overrides, dict) else {}
+        ).items()
+        if k not in keys
+    }
+    extra = cleaned.get("extra_body")
+    if isinstance(extra, dict):
+        extra = {k: v for k, v in extra.items() if k not in keys}
+        if extra:
+            cleaned["extra_body"] = extra
+        else:
+            del cleaned["extra_body"]
+    return cleaned
+
+
 def service_tier_word(tier: Any) -> str:
     """The user-facing word for a stored tier (``priority`` -> ``fast``, None/"" -> ``normal``)."""
     return {"priority": "fast", None: "normal", "": "normal"}.get(tier, tier)
@@ -58,7 +90,12 @@ def service_tier_word(tier: Any) -> str:
 
 def begin_turn(agent: Any, conversation_history: Any) -> None:
     """Open (or refuse) the fast window at a user-turn boundary."""
-    mode = getattr(agent, "service_tier", None)
+    policy = getattr(agent, "_service_tier_policy", None)
+    mode = (
+        policy.tier
+        if isinstance(policy, ServiceTierPolicy)
+        else getattr(agent, "service_tier", None)
+    )
     agent._fast_until = 0.0
     if mode not in BOUNDED_MODES:
         return
@@ -75,20 +112,39 @@ def begin_turn(agent: Any, conversation_history: Any) -> None:
 
 
 def effective_request_overrides(agent: Any) -> dict[str, Any]:
-    """``agent.request_overrides`` plus the fast override while the window is open, minus
-    ``speed`` for a model this session learned has no fast capacity."""
+    """Resolve explicit policy on the current route after binding/restoration, then apply existing
+    window, capacity and account gates. Agents without a policy retain their stored overrides."""
     overrides = dict(getattr(agent, "request_overrides", None) or {})
-    if getattr(agent, "service_tier", None) in BOUNDED_MODES and time.monotonic() < getattr(agent, "_fast_until", 0.0):
+    policy = getattr(agent, "_service_tier_policy", None)
+    explicit = isinstance(policy, ServiceTierPolicy)
+    tier = policy.tier if explicit else getattr(agent, "service_tier", None)
+    if explicit:
+        overrides = without_service_tier(overrides)
+    static = explicit and tier in STATIC_TIERS
+    window_open = tier in BOUNDED_MODES and time.monotonic() < getattr(
+        agent, "_fast_until", 0.0
+    )
+    if static or window_open:
         from hermes_cli.models import resolve_fast_mode_overrides
+
         base_url = getattr(agent, "base_url", None)
         if getattr(agent, "api_mode", None) == "anthropic_messages":
             base_url = getattr(agent, "_anthropic_base_url", None) or base_url
         overrides.update(
-            resolve_fast_mode_overrides(getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url) or {}
+            resolve_fast_mode_overrides(
+                getattr(agent, "model", None),
+                provider=getattr(agent, "provider", None),
+                base_url=base_url,
+                tier=tier if static else None,
+            )
+            or {}
         )
-    if "speed" in overrides and getattr(agent, "model", None) in (getattr(agent, "_fast_mode_unavailable_models", None) or ()):
+    if "speed" in overrides and getattr(agent, "model", None) in (
+        getattr(agent, "_fast_mode_unavailable_models", None) or ()
+    ):
         overrides.pop("speed", None)
     from agent.codex_service_tiers import apply_daybreak, negotiate_request_tier
+
     negotiate_request_tier(agent, overrides)
     apply_daybreak(agent, overrides)
     return overrides

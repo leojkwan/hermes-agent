@@ -7,24 +7,9 @@ another tier.
 
 from __future__ import annotations
 
-import copy
 from typing import Any, Optional
 
-_TIER_KEYS = ("service_tier", "speed")
-
-
-def without_service_tier(overrides: Any) -> dict[str, Any]:
-    """Deep copy of *overrides* without a speed-tier key, at the top level or inside ``extra_body``."""
-    cleaned = {k: v for k, v in copy.deepcopy(overrides if isinstance(overrides, dict) else {}).items()
-               if k not in _TIER_KEYS}
-    extra = cleaned.get("extra_body")
-    if isinstance(extra, dict):
-        extra = {k: v for k, v in extra.items() if k not in _TIER_KEYS}
-        if extra:
-            cleaned["extra_body"] = extra
-        else:
-            del cleaned["extra_body"]
-    return cleaned
+from agent.fast_mode import without_service_tier
 
 
 def _offered_tier_overrides(tier: str, model: Any, provider: Any, base_url: Any,

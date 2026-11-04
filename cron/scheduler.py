@@ -2479,14 +2479,14 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
 
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
-    from cron.service_tier import cron_service_tier, pin_cron_service_tier
+    from cron.service_tier import bind_cron_service_tier, cron_service_tier
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
     agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"), base_url=runtime.get("base_url"),
         provider=runtime.get("provider"), requested_provider=runtime.get("requested_provider"),
-        api_mode=runtime.get("api_mode"), **cron_service_tier(job, runtime, setup.model),
+        api_mode=runtime.get("api_mode"), **cron_service_tier(job, runtime),
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),
         max_iterations=setup.max_iterations,
         reasoning_config=setup.reasoning_config,
@@ -2508,7 +2508,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
-    return pin_cron_service_tier(agent, job)
+    return bind_cron_service_tier(agent, job)
 
 
 class _FireAudit:

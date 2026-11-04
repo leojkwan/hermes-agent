@@ -208,11 +208,11 @@ def _configured_cron_request(
     )
 
     def send():
-        client.responses.create(
+        agent.client.responses.create(
             **agent._build_api_kwargs([{"role": "user", "content": "hello"}], [])
         )
         assert emitted[-1]["cron_trace"] == "preserved"
-        if provider == "custom":
+        if agent.provider == "custom":
             assert emitted[-1]["custom_trace"] == "preserved"
         assert overrides == original_overrides
         return emitted[-1]
@@ -242,19 +242,15 @@ def test_cron_job_static_tier_reaches_request(
         if route == "codex"
         else {"provider": "custom", "base_url": "https://proxy.example/v1"}
     )
-    agent, send, client = _configured_cron_request(
+    _agent, send, client = _configured_cron_request(
         monkeypatch, tmp_path, tier, runtime_tier=runtime_tier, **route_kwargs
     )
     try:
-        if expected is None:
-            assert "service_tier" not in agent.request_overrides
-            assert "service_tier" not in agent.request_overrides.get("extra_body", {})
-        assert send().get("service_tier") == expected
-        extras = {
-            "cron_trace": "preserved",
-            **({"custom_trace": "preserved"} if route == "proxy" else {}),
-        }
-        assert agent.request_overrides["extra_body"] == extras
+        request = send()
+        assert request.get("service_tier") == expected
+        assert request["cron_trace"] == "preserved"
+        if route == "proxy":
+            assert request["custom_trace"] == "preserved"
     finally:
         client.close()
 
@@ -286,4 +282,131 @@ def test_cron_explicit_fast_ignores_normal_interactive(monkeypatch, tmp_path):
     try:
         assert send()["service_tier"] == "priority"
     finally:
+        client.close()
+
+
+@pytest.mark.parametrize("tier", ["normal", "Fast", "auto", "cold", None])
+@pytest.mark.parametrize("primary", ["codex", "proxy"])
+def test_cron_job_tier_survives_fallback_and_primary_restore(
+    monkeypatch, tmp_path, tier, primary
+):
+    """The actual fallback binder and gated restore feed real serialized requests."""
+    from agent import fast_mode
+
+    clock = [1000.0]
+    monkeypatch.setattr(fast_mode.time, "monotonic", lambda: clock[0])
+    codex = ("openai-codex", "https://chatgpt.com/backend-api/codex")
+    proxy = ("custom", "https://proxy.example/v1")
+    provider, base_url = codex if primary == "codex" else proxy
+    agent, send, client = _configured_cron_request(
+        monkeypatch, tmp_path, tier, provider=provider, base_url=base_url
+    )
+    fallback_provider, fallback_url = proxy if primary == "codex" else codex
+    fallback_client = client.with_options(base_url=fallback_url)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *args, **kwargs: (fallback_client, "gpt-6-astra"),
+    )
+    agent._fallback_chain = [
+        {
+            "provider": fallback_provider,
+            "model": "gpt-6-astra",
+            "base_url": fallback_url,
+            "api_key": "test-key",
+            "api_mode": "codex_responses",
+        }
+    ]
+
+    def expected(route, *, expired=False):
+        if tier is None:
+            return "priority" if route == "custom" else None
+        if tier == "normal" or route == "custom" or expired:
+            return None
+        return "priority"
+
+    try:
+        fast_mode.begin_turn(agent, [])
+        assert send().get("service_tier") == expected(provider)
+        assert agent._try_activate_fallback() is True
+        assert agent.provider == fallback_provider
+        assert send().get("service_tier") == expected(fallback_provider)
+        if tier in ("auto", "cold"):
+            clock[0] += agent.fast_auto_seconds + 1
+            assert send().get("service_tier") == expected(
+                fallback_provider, expired=True
+            )
+        assert agent._restore_primary_runtime() is True
+        assert agent.provider == provider
+        assert send().get("service_tier") == expected(
+            provider, expired=tier in ("auto", "cold")
+        )
+        fast_mode.begin_turn(agent, [{"role": "user", "content": "earlier"}])
+        assert send().get("service_tier") == expected(provider, expired=tier == "cold")
+    finally:
+        fallback_client.close()
+        client.close()
+
+
+def test_cron_fast_rechecks_fallback_model(monkeypatch, tmp_path):
+    agent, send, client = _configured_cron_request(monkeypatch, tmp_path, "Fast")
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *args, **kwargs: (client, None),
+    )
+    agent._fallback_chain = [
+        {
+            "provider": "openai-codex",
+            "model": "unsupported-model",
+            "base_url": str(client.base_url),
+            "api_key": "test-key",
+            "api_mode": "codex_responses",
+        }
+    ]
+    try:
+        assert send()["service_tier"] == "priority"
+        assert agent._try_activate_fallback() is True
+        assert agent.model == "unsupported-model"
+        assert "service_tier" not in send()
+        assert agent._restore_primary_runtime() is True
+        assert send()["service_tier"] == "priority"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "offered,expected", [(frozenset(), None), (frozenset({"priority"}), "priority")]
+)
+def test_cron_policy_preserves_current_credential_negotiation(
+    monkeypatch, tmp_path, offered, expected
+):
+    agent, send, client = _configured_cron_request(monkeypatch, tmp_path, "ultra")
+    fallback_client = client.with_options(api_key="fallback-key")
+    monkeypatch.setattr(
+        "agent.codex_service_tiers._tiers_for_model",
+        lambda key, base, model: (
+            frozenset({"priority", "ultrafast"}) if key == "test-key" else offered
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *args, **kwargs: (fallback_client, None),
+    )
+    agent._fallback_chain = [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-6.1-sol",
+            "base_url": str(client.base_url),
+            "api_key": "fallback-key",
+            "api_mode": "codex_responses",
+        }
+    ]
+    try:
+        assert send()["service_tier"] == "ultrafast"
+        assert agent._try_activate_fallback() is True
+        assert agent.api_key == "fallback-key"
+        assert send().get("service_tier") == expected
+        assert agent._restore_primary_runtime() is True
+        assert send()["service_tier"] == "ultrafast"
+    finally:
+        fallback_client.close()
         client.close()
