@@ -11,6 +11,8 @@ the conversation thread instead of the interrupt worker.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.chat_completion_helpers import (
     direct_api_call,
 )
@@ -122,3 +124,140 @@ def test_direct_api_call_heartbeat_stops_on_exception(monkeypatch):
     assert touches_after == touches_before, (
         "heartbeat thread still firing after direct_api_call raised"
     )
+
+
+def _configured_cron_request(
+    monkeypatch,
+    tmp_path,
+    tier,
+    *,
+    provider="openai-codex",
+    base_url="https://chatgpt.com/backend-api/codex",
+    runtime_tier=None,
+):
+    """Real cron/agent/request builders and SDK serialization; only HTTP and catalog lookup fake."""
+    import json
+
+    import httpx
+    from openai import OpenAI
+
+    from cron.scheduler import _construct_cron_agent, _CronAgentSetup
+    from hermes_cli.config import load_config_readonly
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"agent:\n  service_tier: {tier}\n", encoding="utf-8"
+    )
+    config = load_config_readonly()
+    emitted = []
+
+    def receive(request):
+        emitted.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "cron-tier-test",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-6-astra",
+                "output": [],
+            },
+        )
+
+    client = OpenAI(
+        api_key="test-key",
+        base_url=base_url,
+        http_client=httpx.Client(transport=httpx.MockTransport(receive)),
+    )
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
+    monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
+    # Unknown entitlement keeps the existing negotiation policy without any account lookup.
+    monkeypatch.setattr(
+        "agent.codex_service_tiers._tiers_for_model", lambda *args: None
+    )
+    overrides = {"extra_body": {"cron_trace": "preserved"}}
+    if runtime_tier:
+        overrides["service_tier"] = runtime_tier
+    original_overrides = {**overrides, "extra_body": dict(overrides["extra_body"])}
+    setup = _CronAgentSetup(
+        model="gpt-6-astra",
+        runtime={
+            "api_key": "test-key",
+            "provider": provider,
+            "base_url": base_url,
+            "api_mode": "codex_responses",
+            "request_overrides": overrides,
+        },
+        max_iterations=1,
+    )
+    agent = _construct_cron_agent(
+        AIAgent,
+        {},
+        config,
+        setup,
+        workdir=None,
+        session_id="cron-tier-test",
+        session_db=None,
+    )
+
+    def send():
+        client.responses.create(
+            **agent._build_api_kwargs([{"role": "user", "content": "hello"}], [])
+        )
+        assert emitted[-1]["cron_trace"] == "preserved"
+        assert overrides == original_overrides
+        return emitted[-1]
+
+    return agent, send, client
+
+
+@pytest.mark.parametrize(
+    "tier,route,runtime_tier,expected",
+    [
+        ("Fast", "codex", "default", "priority"),
+        ("priority", "codex", None, "priority"),
+        ("ultra", "codex", None, "ultrafast"),
+        ("default", "codex", None, None),
+        ("normal", "codex", None, None),
+        ("Fast", "proxy", None, None),
+    ],
+)
+def test_cron_saved_static_tier_reaches_request(
+    monkeypatch, tmp_path, tier, route, runtime_tier, expected
+):
+    route_kwargs = (
+        {}
+        if route == "codex"
+        else {"provider": "custom", "base_url": "https://proxy.example/v1"}
+    )
+    agent, send, client = _configured_cron_request(
+        monkeypatch, tmp_path, tier, runtime_tier=runtime_tier, **route_kwargs
+    )
+    try:
+        assert send().get("service_tier") == expected
+        assert agent.request_overrides["extra_body"] == {"cron_trace": "preserved"}
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("tier", ["auto", "cold"])
+def test_cron_saved_bounded_tier_keeps_request_window(monkeypatch, tmp_path, tier):
+    from agent import fast_mode
+
+    clock = [1000.0]
+    monkeypatch.setattr(fast_mode.time, "monotonic", lambda: clock[0])
+    agent, send, client = _configured_cron_request(monkeypatch, tmp_path, tier)
+    try:
+        assert agent.service_tier == tier
+        assert "service_tier" not in agent.request_overrides
+        fast_mode.begin_turn(agent, [])
+        assert send()["service_tier"] == "priority"
+        clock[0] += agent.fast_auto_seconds + 1
+        assert "service_tier" not in send()
+        fast_mode.begin_turn(agent, [{"role": "user", "content": "earlier"}])
+        assert send().get("service_tier") == ("priority" if tier == "auto" else None)
+    finally:
+        client.close()
