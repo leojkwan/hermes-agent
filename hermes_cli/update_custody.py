@@ -45,6 +45,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 import itertools
 
@@ -403,15 +404,23 @@ def _run_owner_watched(argv: Sequence[str], kwargs: dict, *, watch_owner: bool =
     the owner's death ends its helpers with it, not git's pid alone (#144439)."""
     input, timeout = kwargs.pop("input", None), kwargs.pop("timeout", None)
     check = kwargs.pop("check", False)
-    if input is not None:
-        kwargs["stdin"] = subprocess.PIPE
     if kwargs.pop("capture_output", False):
         kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
-    # detached-spawn: ok — awaited; _owner_watch kills a fetch's group on owner death, and a mutator must finish its write
-    with subprocess.Popen(list(argv), start_new_session=True, **kwargs) as proc:
+    with contextlib.ExitStack() as stack:
+        if input is not None:
+            # Darwin can block communicate() in os.write even after writable readiness, while
+            # git blocks writing its output. A file removes that pipe cycle and keeps timeouts live.
+            text_mode = any(kwargs.get(key) for key in ("text", "universal_newlines", "encoding", "errors"))
+            stdin = stack.enter_context(tempfile.TemporaryFile(
+                mode="w+" if text_mode else "w+b", encoding=kwargs.get("encoding"), errors=kwargs.get("errors")))
+            stdin.write(input)
+            stdin.seek(0)
+            kwargs["stdin"] = stdin
+        # detached-spawn: ok — awaited; _owner_watch kills a fetch's group on owner death, and a mutator must finish its write
+        proc = stack.enter_context(subprocess.Popen(list(argv), start_new_session=True, **kwargs))
         dismiss = _owner_watch(proc.pid) if watch_owner else None
         try:
-            stdout, stderr = proc.communicate(input, timeout=timeout)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             _kill_tree(proc)
             try:
