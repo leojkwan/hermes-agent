@@ -36,6 +36,8 @@ Whichever provider a job resolves to, its provider-specific request settings (e.
 :::
 
 :::tip
+**Per-job service tier.** Cron does not inherit interactive `agent.service_tier`. To opt a job into Fast, explicitly set `service_tier="fast"` with `cronjob_manage(action="create", ...)` or `action="update"`; `priority` is equivalent. `normal`/`off` removes only speed-tier overrides, preserving other request settings. `auto` and `cold` keep the existing bounded Fast windows; `ultrafast` retains provider/model/credential entitlement checks. Unsupported routes do not gain Fast. Omitted/null leaves the job's existing behavior unchanged; existing jobs are not upgraded or opted in automatically. Change this field only when the user requests it.
+
 **Per-job reasoning effort.** A job can pin its own thinking level, independent of the model pin: one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. When set, it overrides both the global `agent.reasoning_effort` and per-model `agent.reasoning_overrides` for that job's runs (`none` disables thinking). Set it via `hermes cron create/edit --reasoning-effort high`; pass an empty string on edit to clear the pin and follow config again. (It is deliberately not exposed on the agent's `cronjob_manage` tool — model configuration stays a user decision.) Levels a model doesn't support are clamped or omitted by the provider at request time — pinning `xhigh` on a model that caps at `high` runs at `high`. The pin has no effect on `no_agent` jobs (there is no LLM call to tune). Use it to run heavy scheduled analyses at `high` while cheap recurring jobs run at `minimal`, without touching your global default.
 :::
 

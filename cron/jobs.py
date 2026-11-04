@@ -36,6 +36,7 @@ from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECOND
 from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
 from cron.jobs_model_pin import _main_model_pin
+from cron.service_tier import normalize_job_service_tier
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron import extra_fire, store_health
@@ -1766,7 +1767,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "interpreter": _normalize_job_optional_text,
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
-    "catch_up": _normalize_catch_up,
+    "catch_up": _normalize_catch_up, "service_tier": normalize_job_service_tier,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1780,7 +1781,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # ``in {None, "", False}`` test — ``0 == False`` would silently clear it.
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
-    "catch_up": _normalize_catch_up,
+    "catch_up": _normalize_catch_up, "service_tier": normalize_job_service_tier,
 }
 
 
@@ -1834,7 +1835,7 @@ def create_job(
     pinned: bool = False,
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
-    grace_minutes: Optional[int] = None,
+    grace_minutes: Optional[int] = None, service_tier: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1931,14 +1932,13 @@ def create_job(
         "enabled_toolsets": f["enabled_toolsets"],
         "workdir": f["workdir"],
     }
-    # Optional keys are persisted only when explicitly set: an absent key falls back to global
-    # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature
-    # jobs.
+    # Persist optional keys only when set: unset jobs retain their pre-feature shape and behavior.
+    # Attach/reasoning inherit config; failure_deliver falls back to deliver; tier stays normal.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("service_tier", f["service_tier"]),
     ):
         if value is not None:
             job[key] = value

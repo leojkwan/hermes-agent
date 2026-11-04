@@ -729,7 +729,7 @@ def _action_create(a: dict[str, Any]) -> str:
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
-            reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
+            reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"], service_tier=a["service_tier"],
             timezone=_normalize_optional_job_value(a["timezone"]),
             grace_minutes=a["grace_minutes"],
             pinned=bool(a["pinned"]),
@@ -891,12 +891,10 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         updates["pinned"] = bool(a["pinned"])
     if a["base_url"] is not None:
         updates["base_url"] = _normalize_optional_job_value(a["base_url"], strip_trailing_slash=True)
-    if a["reasoning_effort"] is not None:
-        # CLI-only lane; update_job validates, empty string clears the pin.
-        updates["reasoning_effort"] = a["reasoning_effort"]
-    if a["interpreter"] is not None:
-        # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
-        updates["interpreter"] = a["interpreter"]
+    # Storage validates tuning fields; empty strings explicitly clear their overrides.
+    for key in ("service_tier", "reasoning_effort", "interpreter"):
+        if a[key] is not None:
+            updates[key] = a[key]
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1079,7 +1077,7 @@ def cronjob(
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
-    grace_minutes: Optional[int | str] = None) -> str:
+    grace_minutes: Optional[int | str] = None, service_tier: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1135,6 +1133,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "job_id": {
                 "type": "string",
                 "description": "Required for update/pause/resume/remove/run/cancel."
+            },
+            "service_tier": {
+                "type": ["string", "null"],
+                "description": "Explicit per-job Fast opt-in: normal/off, fast/priority, ultrafast, auto or cold. Omit/null keeps existing behavior, without inheriting interactive Fast. On update normal removes only tier overrides. Set only when the user requests it."
             },
             "pinned": {
                 "type": "boolean",
@@ -1241,7 +1243,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "timezone", "grace_minutes", "catch_up")
+    "paused_reason", "pinned", "timezone", "grace_minutes", "catch_up", "service_tier")
 
 
 def _cronjob_handler(args, **kw):

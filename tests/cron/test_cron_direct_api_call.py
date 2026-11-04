@@ -134,6 +134,7 @@ def _configured_cron_request(
     provider="openai-codex",
     base_url="https://chatgpt.com/backend-api/codex",
     runtime_tier=None,
+    configured_tier="Fast",
 ):
     """Real cron/agent/request builders and SDK serialization; only HTTP and catalog lookup fake."""
     import json
@@ -147,7 +148,10 @@ def _configured_cron_request(
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
-        f"agent:\n  service_tier: {tier}\n", encoding="utf-8"
+        f"agent:\n  service_tier: {configured_tier}\n"
+        "custom_providers:\n  - name: cron-proxy\n    base_url: https://proxy.example/v1\n"
+        "    extra_body:\n      service_tier: priority\n      custom_trace: preserved\n",
+        encoding="utf-8",
     )
     config = load_config_readonly()
     emitted = []
@@ -195,7 +199,7 @@ def _configured_cron_request(
     )
     agent = _construct_cron_agent(
         AIAgent,
-        {},
+        {"service_tier": tier},
         config,
         setup,
         workdir=None,
@@ -208,6 +212,8 @@ def _configured_cron_request(
             **agent._build_api_kwargs([{"role": "user", "content": "hello"}], [])
         )
         assert emitted[-1]["cron_trace"] == "preserved"
+        if provider == "custom":
+            assert emitted[-1]["custom_trace"] == "preserved"
         assert overrides == original_overrides
         return emitted[-1]
 
@@ -221,11 +227,14 @@ def _configured_cron_request(
         ("priority", "codex", None, "priority"),
         ("ultra", "codex", None, "ultrafast"),
         ("default", "codex", None, None),
-        ("normal", "codex", None, None),
+        ("normal", "codex", "priority", None),
+        (None, "codex", None, None),
+        (None, "codex", "default", "default"),
         ("Fast", "proxy", None, None),
+        ("normal", "proxy", None, None),
     ],
 )
-def test_cron_saved_static_tier_reaches_request(
+def test_cron_job_static_tier_reaches_request(
     monkeypatch, tmp_path, tier, route, runtime_tier, expected
 ):
     route_kwargs = (
@@ -237,14 +246,21 @@ def test_cron_saved_static_tier_reaches_request(
         monkeypatch, tmp_path, tier, runtime_tier=runtime_tier, **route_kwargs
     )
     try:
+        if expected is None:
+            assert "service_tier" not in agent.request_overrides
+            assert "service_tier" not in agent.request_overrides.get("extra_body", {})
         assert send().get("service_tier") == expected
-        assert agent.request_overrides["extra_body"] == {"cron_trace": "preserved"}
+        extras = {
+            "cron_trace": "preserved",
+            **({"custom_trace": "preserved"} if route == "proxy" else {}),
+        }
+        assert agent.request_overrides["extra_body"] == extras
     finally:
         client.close()
 
 
 @pytest.mark.parametrize("tier", ["auto", "cold"])
-def test_cron_saved_bounded_tier_keeps_request_window(monkeypatch, tmp_path, tier):
+def test_cron_job_bounded_tier_keeps_request_window(monkeypatch, tmp_path, tier):
     from agent import fast_mode
 
     clock = [1000.0]
@@ -259,5 +275,15 @@ def test_cron_saved_bounded_tier_keeps_request_window(monkeypatch, tmp_path, tie
         assert "service_tier" not in send()
         fast_mode.begin_turn(agent, [{"role": "user", "content": "earlier"}])
         assert send().get("service_tier") == ("priority" if tier == "auto" else None)
+    finally:
+        client.close()
+
+
+def test_cron_explicit_fast_ignores_normal_interactive(monkeypatch, tmp_path):
+    _agent, send, client = _configured_cron_request(
+        monkeypatch, tmp_path, "Fast", configured_tier="normal"
+    )
+    try:
+        assert send()["service_tier"] == "priority"
     finally:
         client.close()
