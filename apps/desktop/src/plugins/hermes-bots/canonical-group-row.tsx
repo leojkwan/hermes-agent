@@ -20,6 +20,7 @@ import { useCanonicalGroupLabels } from './canonical-group-labels'
 import { disbandGatewayGroupRoom, type GatewayGroupRoom } from './canonical-group-registry'
 import { RoomBotAvatar } from './group-room-avatar'
 import { AvatarStack } from './group-room-ui'
+import { $hiddenRooms, isRoomHidden, setRoomHidden } from './hidden-rooms'
 import { useBots } from './i18n'
 import { rowAge } from './row-age'
 
@@ -37,6 +38,7 @@ export function CanonicalGroupRow({ active, onOpen, room }: CanonicalGroupRowPro
   const labels = useCanonicalGroupLabels()
   const { group } = useBots()
   const [confirming, setConfirming] = useState(false)
+  const hidden = isRoomHidden(room.binding, useValue($hiddenRooms))
   const live = useValue($canonicalRoomLive)[canonicalRoomLiveKey(room.binding, room.binding.roomId)]
   const state = live?.needsYou ? 'needsYou' : live?.failed ? 'failed' : live?.working ? 'working' : null
   const memberCount = group.memberCount(room.members.length)
@@ -107,6 +109,9 @@ export function CanonicalGroupRow({ active, onOpen, room }: CanonicalGroupRowPro
         </ContextMenuTrigger>
         <ContextMenuContent>
           <ContextMenuItem onSelect={onOpen}>{labels.openGroup}</ContextMenuItem>
+          <ContextMenuItem onSelect={() => void setRoomHidden(room.binding, !hidden)}>
+            {hidden ? 'Restore' : 'Hide'}
+          </ContextMenuItem>
           <ContextMenuSeparator />
           <ContextMenuItem onSelect={() => setConfirming(true)} variant="destructive">
             {group.deleteAction}

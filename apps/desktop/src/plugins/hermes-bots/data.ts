@@ -8,6 +8,7 @@
 
 import { atom, host, queryClient, useQuery, useValue } from '@hermes/plugin-sdk'
 
+import { loadHiddenRooms } from './hidden-rooms'
 import { botsText } from './i18n'
 import { displayName } from './labels'
 import {
@@ -166,12 +167,12 @@ export function clearBotAttention(key: string) {
   $botAttention.set(next)
 }
 
-/** The persisted record adds two keys the shared domain model deliberately
- *  omits: `chat`, the dead canonical-chat pointer that mergeServerMeta strips
- *  on sight, and `pet`, the extracted pet icon that stays local and is never
- *  sent to the server. */
+/** The persisted record adds the dead `chat` pointer and renderer-local
+ *  presentation fields that never belong in server profile metadata. */
 interface StoredBotMeta extends BotMeta {
   chat?: unknown
+  /** Legacy room visibility, moved out of appearance metadata on load. */
+  hiddenRooms?: string[]
   pet?: unknown
 }
 
@@ -385,8 +386,8 @@ async function persistBotMetaPatch(
       return null
     }
 
-    const { chat: _chat, ...base } = server.meta
-    const { image: _image, pet: _pet, ...fields } = rebase ? rebase(server.meta) : patch
+    const { chat: _chat, hiddenRooms: _serverHiddenRooms, ...base } = server.meta
+    const { image: _image, pet: _pet, hiddenRooms: _hiddenRooms, ...fields } = rebase ? rebase(server.meta) : patch
 
     const params: Record<string, unknown> = {
       name,
@@ -449,7 +450,7 @@ async function settleServerOutcome(
 
 /** Rewrite this window's copy of one bot's metadata (and its plugin storage) without touching
  *  the bot's backend: the local half of a save, and how a caller mirrors a server value it read. */
-function writeLocalBotMeta(key: string, route: null | ProfileRoute, patch: StoredBotMeta): Promise<void> {
+function writeLocalBotMeta(key: string, scoped: boolean, patch: StoredBotMeta): Promise<void> {
   const next = {
     ...$botMeta.get(),
     [key]: {
@@ -464,7 +465,7 @@ function writeLocalBotMeta(key: string, route: null | ProfileRoute, patch: Store
   // Local plugin storage: instant, and the fallback for older gateways.
   try {
     const persisted =
-      route || botMetaV2Active
+      scoped || botMetaV2Active
         ? commitBotMetaV2(getPluginCtx()?.storage, next)
         : Promise.resolve(getPluginCtx()?.storage?.set?.(BOT_META_V1_KEY, next))
 
@@ -482,7 +483,7 @@ function writeLocalBotMeta(key: string, route: null | ProfileRoute, patch: Store
 export function setLocalBotMeta(owner: RosterRow | string, patch: StoredBotMeta): Promise<void> {
   const { key, route } = botOwner(owner)
 
-  return writeLocalBotMeta(key, route, patch)
+  return writeLocalBotMeta(key, Boolean(route), patch)
 }
 
 /** The bot's `hermes-bots` metadata as its own backend holds it now; null when it does not answer. */
@@ -508,7 +509,7 @@ export async function saveBotMeta(
 ): Promise<BotMetaSaveResult> {
   const { bot, key, name, route } = botOwner(owner)
   const prevMeta = $botMeta.get()[key] || {}
-  const localPersistence = writeLocalBotMeta(key, route, patch)
+  const localPersistence = writeLocalBotMeta(key, Boolean(route), patch)
 
   // Server-side (source of truth when supported): profile.yaml ui_meta,
   // namespaced under this plugin's id — every client machine sees the same
@@ -618,6 +619,51 @@ function hydrateBotMeta(snapshot: BotMetaSnapshot, remap: Map<string, string> | 
   return next
 }
 
+async function separateRoomMeta(storage: BotMetaStorage | undefined, snapshot: BotMetaSnapshot, scoped: boolean) {
+  const hasLegacyHides = Object.entries(snapshot).some(
+    ([scope, meta]) => scope.includes('::') && Array.isArray(meta?.hiddenRooms)
+  )
+
+  if (!hasLegacyHides) {
+    return snapshot
+  }
+
+  try {
+    await loadHiddenRooms(storage, snapshot)
+    const appearance = { ...snapshot }
+
+    // A user or roster edit may have landed while visibility storage was pending.
+    for (const [scope, meta] of Object.entries($botMeta.get())) {
+      appearance[scope] = { ...appearance[scope], ...meta }
+    }
+
+    for (const [scope, meta] of Object.entries(appearance)) {
+      if (!scope.includes('::') || !Array.isArray(meta?.hiddenRooms)) {
+        continue
+      }
+
+      const { hiddenRooms: _hiddenRooms, ...look } = meta
+
+      if (Object.keys(look).length) {
+        appearance[scope] = look
+      } else {
+        delete appearance[scope]
+      }
+    }
+
+    if (scoped) {
+      await commitBotMetaV2(storage, appearance)
+    } else {
+      await storage?.set(BOT_META_V1_KEY, appearance)
+    }
+
+    return appearance
+  } catch {
+    // Never discard the old hides until their separate persistence is durable.
+    return snapshot
+  }
+}
+
 export async function migrateBotMeta(storage: BotMetaStorage | undefined = getPluginCtx()?.storage) {
   let v1: BotMetaSnapshot | null = null
   let v2: BotMetaSnapshot | null = null
@@ -633,11 +679,18 @@ export async function migrateBotMeta(storage: BotMetaStorage | undefined = getPl
     return false
   }
 
+  await loadHiddenRooms(storage).catch(() => undefined)
+
   if (v2Committed === true && v2 && typeof v2 === 'object' && !Array.isArray(v2)) {
+    v2 = await separateRoomMeta(storage, v2, true)
     hydrateBotMeta(v2)
     botMetaV2Active = true
 
     return true
+  }
+
+  if (v1 && typeof v1 === 'object' && !Array.isArray(v1)) {
+    v1 = await separateRoomMeta(storage, v1, false)
   }
 
   if (!v1 || typeof v1 !== 'object' || Array.isArray(v1) || typeof host.agents !== 'function') {

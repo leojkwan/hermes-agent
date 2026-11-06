@@ -21,7 +21,7 @@ export function editedLook(opened: EditProfileLook, current: EditProfileLook): B
   }
 
   if (current.color !== opened.color) {
-    patch.color = current.color ?? undefined
+    patch.color = current.color ?? ''
   }
 
   if (current.image !== opened.image) {

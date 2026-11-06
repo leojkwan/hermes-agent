@@ -7,6 +7,7 @@ import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-
 import { sortGroupRosterRows } from './group-order'
 import { isBotPinned } from './hidden-bots'
 import { isBotHidden } from './hidden-bots'
+import { type HiddenRooms, isRoomHidden } from './hidden-rooms'
 import { filterBotsByGateway, groupMatchesRosterFilters, rosterGatewaySections } from './roster-sections'
 import type { rosterGatewayOptions } from './roster-sections'
 import { botRosterMeta } from './routing'
@@ -65,6 +66,7 @@ function gatewayRoomActive(room: GatewayGroupRoom, live: CanonicalRoomLive | und
 interface RosterRowsInput {
   roster: RosterRow[]
   allMeta: Record<string, BotMeta>
+  hiddenRooms?: HiddenRooms
   gatewayFilter: string
   query: string
   activityFilter: RosterActivityFilter
@@ -82,6 +84,7 @@ export function deriveRosterRows(input: RosterRowsInput) {
   const {
   roster,
   allMeta,
+  hiddenRooms = {},
   gatewayFilter,
   query,
   activityFilter,
@@ -123,6 +126,9 @@ export function deriveRosterRows(input: RosterRowsInput) {
   )
 
   const groupNames = groupChatNames(allMeta, groupRooms)
+  const gatewayRows = gatewayGroupRows(input)
+  const hiddenGroupRows = gatewayRows.filter(row => row.gateway && isRoomHidden(row.gateway.binding, hiddenRooms))
+  const hiddenGroupCount = gatewayRooms.filter(room => isRoomHidden(room.binding, hiddenRooms)).length
 
   const groupRows = groupNames
     .map(name => ({
@@ -143,7 +149,7 @@ export function deriveRosterRows(input: RosterRowsInput) {
         ) || row.members.some(member => activeRosterKeys.has(botRosterKey(member)))
     }))
     .filter(row => rowKindFilter !== 'bots' && rosterActivityMatches(row, activityFilter))
-    .concat(gatewayGroupRows(input))
+    .concat(gatewayRows.filter(row => row.gateway && !isRoomHidden(row.gateway.binding, hiddenRooms)))
 
   const botRows =
     rowKindFilter === 'groups'
@@ -166,6 +172,8 @@ export function deriveRosterRows(input: RosterRowsInput) {
     hiddenBots,
     visibleRoster,
     filteredHiddenBots,
+    hiddenGroupRows,
+    hiddenGroupCount,
     groupNames: [...groupNames, ...gatewayRooms.map(room => room.name)],
     rosterRows,
     sortedGroupRows,
@@ -181,6 +189,8 @@ interface RosterPresentationInput {
   query: string
   filteredHiddenBots: RosterRow[]
   hiddenBots: RosterRow[]
+  hiddenGroupRows?: RosterGroupRow[]
+  hiddenGroupCount?: number
   hiddenExpanded: boolean
   roster: RosterRow[]
   groupNames: string[]
@@ -195,6 +205,8 @@ export function deriveRosterPresentation({
   query,
   filteredHiddenBots,
   hiddenBots,
+  hiddenGroupRows = [],
+  hiddenGroupCount = 0,
   hiddenExpanded,
   roster,
   groupNames,
@@ -206,7 +218,10 @@ export function deriveRosterPresentation({
 
   const hasRosterConstraint = Boolean(query.trim()) || activeFilterCount > 0
   const matchingHiddenBots = rowKindFilter === 'groups' ? [] : filteredHiddenBots
-  const showHiddenSection = hiddenBots.length > 0 && (!hasRosterConstraint || matchingHiddenBots.length > 0)
+
+  const showHiddenSection = hiddenBots.length + hiddenGroupCount > 0 &&
+    (!hasRosterConstraint || matchingHiddenBots.length + hiddenGroupRows.length > 0)
+
   const showHiddenRows = hiddenExpanded || hasRosterConstraint
   const rosterItemCount = roster.length + groupNames.length
 
@@ -214,7 +229,7 @@ export function deriveRosterPresentation({
     !hasRosterConstraint && visibleRoster.length === 0 && groupNames.length === 0 && hiddenBots.length > 0
 
   const showRosterSearch =
-    gatewayOptions.length > 1 || rosterItemCount >= BOT_ROSTER_SEARCH_THRESHOLD || Boolean(query.trim())
+    hiddenGroupCount > 0 || gatewayOptions.length > 1 || rosterItemCount >= BOT_ROSTER_SEARCH_THRESHOLD || Boolean(query.trim())
 
   const showRosterFilters =
     gatewayOptions.length > 1 ||

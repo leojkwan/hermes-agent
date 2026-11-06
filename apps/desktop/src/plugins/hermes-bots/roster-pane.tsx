@@ -41,6 +41,7 @@ import { groupChatMemberBots } from './group-membership'
 import { $groupMainTabsRev, groupOpenOrigin, shouldRenderGroupChatInPane } from './group-panes'
 import { $activeGroupMemberKeys } from './group-presence'
 import { $showHiddenBots, isBotHidden } from './hidden-bots'
+import { $hiddenRooms } from './hidden-rooms'
 import { useBots } from './i18n'
 import { $activityToasts } from './roster-actions'
 import { openRosterGroup } from './roster-navigation'
@@ -334,12 +335,15 @@ export function BotsPane() {
     }
   }, [gatewayFilterExists])
   const hiddenExpanded = useValue($showHiddenBots)
+  const hiddenRooms = useValue($hiddenRooms)
 
   const {
     activeSourceRoster,
     hiddenBots,
     visibleRoster,
     filteredHiddenBots,
+    hiddenGroupRows,
+    hiddenGroupCount,
     groupNames,
     rosterRows,
     sortedGroupRows,
@@ -349,6 +353,7 @@ export function BotsPane() {
     roster,
     allMeta,
     gatewayFilter,
+    hiddenRooms,
     query,
     activityFilter,
     rowKindFilter,
@@ -379,6 +384,8 @@ export function BotsPane() {
     query,
     filteredHiddenBots,
     hiddenBots,
+    hiddenGroupRows,
+    hiddenGroupCount,
     hiddenExpanded,
     roster,
     groupNames,
@@ -523,6 +530,8 @@ export function BotsPane() {
         hiddenExpanded,
         rosterRows,
         matchingHiddenBots,
+        hiddenGroupRows,
+        hiddenGroupCount,
         query,
         selectedGateway,
         showGatewaySections,
@@ -535,6 +544,7 @@ export function BotsPane() {
         showHiddenRows,
         hiddenGatewaySections,
         renderBotRow,
+        renderGroupRow,
         renderGroupChatSection,
         renderGatewaySection,
         renderUserSections,

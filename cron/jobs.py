@@ -1986,6 +1986,8 @@ def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
 
 def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
+    from cron.bot_chat_status import project_delivery_status
+
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
@@ -1999,6 +2001,7 @@ def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
         job["live_execution"] = live.get(job.get("id", ""))
+        project_delivery_status(job)
     return jobs
 
 

@@ -4,7 +4,7 @@ import type { ReactNode, RefObject } from 'react'
 import type { useRoster } from './data'
 import { $showHiddenBots } from './hidden-bots'
 import type { useBots } from './i18n'
-import type { deriveRosterPresentation, deriveRosterRows } from './roster-pane-derivation'
+import type { deriveRosterPresentation, deriveRosterRows, RosterGroupRow } from './roster-pane-derivation'
 import type { rosterSectionRenderers } from './roster-pane-sections'
 import type { rosterGatewayOptions } from './roster-sections'
 import type { RosterRow } from './types'
@@ -23,6 +23,8 @@ interface RosterContentProps {
   hiddenExpanded: boolean
   rosterRows: ReturnType<typeof deriveRosterRows>['rosterRows']
   matchingHiddenBots: RosterRow[]
+  hiddenGroupRows: RosterGroupRow[]
+  hiddenGroupCount: number
   query: string
   selectedGateway: ReturnType<typeof rosterGatewayOptions>[number] | undefined
   showGatewaySections: boolean
@@ -35,6 +37,7 @@ interface RosterContentProps {
   showHiddenRows: boolean
   hiddenGatewaySections: ReturnType<typeof deriveRosterPresentation>['hiddenGatewaySections']
   renderBotRow: (bot: RosterRow, keyPrefix?: string) => ReactNode
+  renderGroupRow: (row: RosterGroupRow) => ReactNode
   renderGroupChatSection: ReturnType<typeof rosterSectionRenderers>['renderGroupChatSection']
   renderGatewaySection: ReturnType<typeof rosterSectionRenderers>['renderGatewaySection']
   renderUserSections: ReturnType<typeof rosterSectionRenderers>['renderUserSections']
@@ -54,6 +57,8 @@ export function renderRosterContent({
   hiddenExpanded,
   rosterRows,
   matchingHiddenBots,
+  hiddenGroupRows,
+  hiddenGroupCount,
   query,
   selectedGateway,
   showGatewaySections,
@@ -66,6 +71,7 @@ export function renderRosterContent({
   showHiddenRows,
   hiddenGatewaySections,
   renderBotRow,
+  renderGroupRow,
   renderGroupChatSection,
   renderGatewaySection,
   renderUserSections,
@@ -111,7 +117,7 @@ export function renderRosterContent({
             {b.roster.showHidden}
           </Button>
         </div>
-      ) : rosterRows.length === 0 && matchingHiddenBots.length === 0 ? (
+      ) : rosterRows.length === 0 && matchingHiddenBots.length === 0 && hiddenGroupRows.length === 0 ? (
         <div aria-live="polite" className="flex min-h-0 flex-1 flex-col" role="status">
           <PanelEmpty
             description={
@@ -145,7 +151,9 @@ export function renderRosterContent({
                   <div className="flex w-full items-center gap-1 px-2 py-1.5 text-[0.6875rem] font-medium text-(--ui-text-tertiary)">
                     <Codicon name="eye-closed" />
                     <span>Hidden</span>
-                    <span className="text-(--ui-text-quaternary)">{matchingHiddenBots.length}</span>
+                    <span className="text-(--ui-text-quaternary)">
+                      {matchingHiddenBots.length + hiddenGroupRows.length}
+                    </span>
                   </div>
                 ) : (
                   <RowButton
@@ -155,16 +163,17 @@ export function renderRosterContent({
                   >
                     <DisclosureCaret open={hiddenExpanded} />
                     <span>Hidden</span>
-                    <span className="text-(--ui-text-quaternary)">{hiddenBots.length}</span>
+                    <span className="text-(--ui-text-quaternary)">{hiddenBots.length + hiddenGroupCount}</span>
                   </RowButton>
                 )}
                 {showHiddenRows ? (
-                  matchingHiddenBots.length ? (
-                    hiddenGatewaySections.sectioned ? (
-                      hiddenGatewaySections.sections.map(renderHiddenGatewaySection)
-                    ) : (
-                      matchingHiddenBots.map((bot: RosterRow) => renderBotRow(bot, 'hidden:'))
-                    )
+                  matchingHiddenBots.length + hiddenGroupRows.length ? (
+                    <>
+                      {hiddenGroupRows.map(renderGroupRow)}
+                      {hiddenGatewaySections.sectioned
+                        ? hiddenGatewaySections.sections.map(renderHiddenGatewaySection)
+                        : matchingHiddenBots.map((bot: RosterRow) => renderBotRow(bot, 'hidden:'))}
+                    </>
                   ) : (
                     <div className="px-2 py-2 text-xs text-(--ui-text-quaternary)">{b.roster.noHiddenMatch}</div>
                   )

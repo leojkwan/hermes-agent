@@ -33,7 +33,7 @@ import {
   ROSTER_KEY,
   saveBotMeta
 } from './data'
-import { botConnectionRoute, botRouteKey, requestForBot } from './routing'
+import { aliasIdentityFor, botConnectionRoute, botRouteKey, requestForBot } from './routing'
 import { getPluginCtx } from './shared'
 import type { BotMeta, RosterRow } from './types'
 
@@ -266,6 +266,9 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
     const server = raw && typeof raw === 'object' ? raw : null
     const title = serverReportedTitle(bot, server)
 
+    // A thin backend heading is not an authored override of the Desktop alias.
+    if (!server && !Object.hasOwn(bot, 'ui_meta_revisions') && aliasIdentityFor(bot)) {continue}
+
     if (server || title !== undefined) {
       const key = botMetaKey(bot)
 
@@ -286,6 +289,10 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
         ...mine,
         ...server
       }
+
+      // Room visibility is this renderer's choice, never server profile metadata.
+      if (mine.hiddenRooms) {merged.hiddenRooms = mine.hiddenRooms}
+      else {delete merged.hiddenRooms}
 
       // The name is the backend's: a local title it does not carry is stale or
       // another bot's (a restored record, a legacy name-keyed one), never this
@@ -392,7 +399,7 @@ export async function duplicateBot(source: RosterRow, roster: RosterRow[]) {
   const meta = $botMeta.get()[botMetaKey(bot)]
 
   if (meta) {
-    const { chat, created, ...look } = meta
+    const { chat, created, hiddenRooms, ...look } = meta
     await saveBotMeta(
       {
         ...bot,

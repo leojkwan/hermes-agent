@@ -11,7 +11,7 @@ import { host } from '@hermes/plugin-sdk'
 
 import type { BotMeta, GroupMessageAuthor, ProfileRoute, RosterRow } from './types'
 
-export function botRouteKey(route: ProfileRoute): string {
+export function botRouteKey(route: Pick<ProfileRoute, 'connectionId' | 'profile'>): string {
   return `${route.connectionId}::${route.profile}`
 }
 
@@ -409,6 +409,8 @@ export function aliasIdentityFor(bot: Partial<RosterRow> | null | undefined): Al
 // exception is a configured alias route claiming the row — see
 // aliasRouteIndex above — which is connection-exact, never name-based.
 export function botRosterMeta(bot: RosterRow, metaByName: Record<string, BotMeta>) {
+  let direct: BotMeta | null | undefined
+
   if (bot?.sourceScoped || bot?.remoteSource) {
     // Passive meta lookup: branch on the typed status instead of catching
     // botConnectionRoute's throw, so an owner_removed row (e.g. a stale
@@ -416,42 +418,28 @@ export function botRosterMeta(bot: RosterRow, metaByName: Record<string, BotMeta
     // route" without masking an unrelated failure under the same catch.
     const resolved = resolveBotConnectionRoute(bot)
     const route = resolved.status === 'resolved' ? resolved.route : null
-    const direct = route ? metaByName?.[botRouteKey(route)] : null
-
-    if (direct) {
-      return direct
-    }
-
-    const alias = aliasIdentityFor(bot)
-
-    if (alias) {
-      for (const key of alias.metaKeys) {
-        if (metaByName?.[key]) {
-          return metaByName[key]
-        }
-      }
-    }
-
-    return direct
-  }
-
-  const own = metaByName?.[bot?.name]
-
-  if (own) {
-    return own
+    direct = route ? metaByName?.[botRouteKey(route)] : null
+  } else {
+    direct = metaByName?.[bot?.name]
   }
 
   const alias = aliasIdentityFor(bot)
 
   if (alias) {
     for (const key of alias.metaKeys) {
-      if (metaByName?.[key]) {
-        return metaByName[key]
+      const fallback = metaByName?.[key]
+
+      if (fallback) {
+        // A direct record may contain only room visibility. Inherit the alias
+        // look field by field; explicit false/null/empty values still win.
+        return direct
+          ? { ...fallback, ...Object.fromEntries(Object.entries(direct).filter(([, value]) => value !== undefined)) }
+          : fallback
       }
     }
   }
 
-  return own
+  return direct
 }
 
 type TranscriptEntry = { from?: GroupMessageAuthor } | null | undefined
