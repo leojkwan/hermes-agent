@@ -1,6 +1,6 @@
-"""Prepare the policy-only session edits: session-scope reasoning and the workspace (Move to project).
+"""Prepare policy-only session edits, including reasoning, service tier and workspace.
 
-Both rewrite the frozen LocalSessionPolicy the next turn runs under, re-bound like a model switch
+These rewrite the frozen LocalSessionPolicy the next turn runs under, re-bound like a model switch
 (policy identity covers config/cwd, so its config-secret reference is re-fingerprinted).
 """
 import asyncio
@@ -31,6 +31,17 @@ async def prepare_reasoning(authority, live, payload, prepared):
         # A bypass launch never reads the profile: its reset is the built-in default.
         profile = {} if old.ignore_user_config else await asyncio.to_thread(profile_config, authority)
         unpin_reasoning(frozen, profile)
+    return _rebind(authority, prepared, old, replace(old, config_json=json.dumps(frozen)))
+
+
+async def prepare_service_tier(authority, live, payload, prepared):
+    """Pin the next turn's tier without rewriting the immutable creation request."""
+    from agent.fast_mode import parse_exact_service_tier
+    from gateway.session_policy import SESSION_PINS, restore_policy
+    old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    frozen = old.config()
+    frozen.setdefault('agent', {})['service_tier'] = parse_exact_service_tier(payload['tier']) or 'normal'
+    frozen[SESSION_PINS] = {**(frozen.get(SESSION_PINS) or {}), 'service_tier': True}
     return _rebind(authority, prepared, old, replace(old, config_json=json.dumps(frozen)))
 
 
@@ -68,4 +79,5 @@ async def prepare_edit_policy(authority, live, payload, prepared):
     return _rebind(authority, prepared, old, replace(old, edit_approval_policy=payload['policy']))
 
 
-PREPARE = {'reasoning': prepare_reasoning, 'workspace': prepare_workspace, 'edit_policy': prepare_edit_policy}
+PREPARE = {'reasoning': prepare_reasoning, 'service_tier': prepare_service_tier,
+           'workspace': prepare_workspace, 'edit_policy': prepare_edit_policy}

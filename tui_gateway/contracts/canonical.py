@@ -81,10 +81,13 @@ canonical_method("prompt.resolve_unknown", params=PromptResolveUnknownParams, re
 
 class SessionMutateParams(Params):
     """``operation`` + ``payload`` are validated by ``hermes_state_mutations.validate_action``;
-    ``expected_generation`` is required for delete/rewind/reset/branch/model/compress/reasoning/workspace.
+    ``expected_generation`` is required for delete/rewind/reset/branch/model/compress/reasoning/workspace/service_tier.
     ``reasoning`` (``{effort}``) and ``workspace`` (``{cwd}``, refused ``session_busy`` mid-turn) rewrite
     the session's frozen policy: session-scope ``/reasoning`` and Desktop's Move to project. ``edit_policy``
-    (``{policy}``: ask / workspace_session / session) is an ACP session's edit approval (main's ACP modes)."""
+    (``{policy}``: ask / workspace_session / session) is an ACP session's edit approval (main's ACP modes).
+    ``service_tier`` takes exactly ``{tier: <valid service-tier string>}``, pins its normalized value in
+    the frozen policy and requires idle execution (including no queued inputs or live turn lease).
+    It preserves the creation request, model, provider, history and cached prompt."""
 
     session_id: str
     request_id: str
@@ -106,7 +109,7 @@ class SessionMutateResult(OpenModel):
 
 canonical_method("session.mutate", params=SessionMutateParams, result=SessionMutateResult,
                  doc="Revision-fenced, retry-idempotent session edit (rename, archive, sidebar, branch, "
-                     "delete, rewind, reset, model, reasoning, workspace, edit_policy, compress, import).")
+                     "delete, rewind, reset, model, reasoning, service_tier, workspace, edit_policy, compress, import).")
 
 
 class SessionPruneParams(Params):
