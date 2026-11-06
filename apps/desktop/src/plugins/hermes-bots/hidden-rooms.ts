@@ -56,6 +56,17 @@ function persistHiddenRooms(storage: RoomStorage | undefined, rooms: HiddenRooms
     }
 
     await storage.set(HIDDEN_ROOMS_KEY, rooms)
+
+    // Plugin storage silently ignores quota/permission failures; only readback proves the copy.
+    const saved = decodeHiddenRooms(await storage.get?.(HIDDEN_ROOMS_KEY, {}))
+
+    if (
+      !Object.entries(rooms).every(([scope, entries]) =>
+        Object.entries(entries).every(([id, hidden]) => saved[scope]?.[id] === hidden)
+      )
+    ) {
+      throw new Error('Room visibility could not be persisted')
+    }
   })
 
   pendingWrite = write.catch(() => undefined)
