@@ -462,11 +462,11 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 # giant token) once held the GIL for minutes. These caps bound one whole walk and are charged
 # BEFORE any text reaches shlex. Exhaustion fails closed (an unscanned script could hide a
 # lifecycle command) and is logged at WARNING so an operator can tell it from a real block. Sizes
-# sit well above any legitimate wrapper graph; remote reads are a backend roundtrip each, so they
-# get a far tighter cap.
+# bound supported wrapper graphs, including large public CLI sources; remote reads are a backend
+# roundtrip each, so they get a far tighter cap.
 # See #78398.
 _MAX_LIFECYCLE_SCAN_BYTES = _MAX_REFERENCED_SCRIPT_BYTES  # 1 MiB across the walk
-_MAX_LIFECYCLE_SCAN_LINES = 16384
+_MAX_LIFECYCLE_SCAN_LINES = 32768
 _MAX_LIFECYCLE_SCAN_LINE_BYTES = 64 * 1024
 _MAX_LIFECYCLE_SCAN_PATHS = 1024
 _MAX_LIFECYCLE_SCAN_REMOTE_READS = 64
