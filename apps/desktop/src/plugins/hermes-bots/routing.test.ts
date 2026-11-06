@@ -97,6 +97,25 @@ describe('alias identity survives the hosted handoff (#89131)', () => {
     expect(displayName({ name: 'default' }, { title: 'Custom' })).toBe('Custom')
   })
 
+  it('inherits missing alias fields while preserving explicit direct clears and overrides', () => {
+    indexAliasRoutes([MOXIE_ROUTE])
+
+    const meta = {
+      'cloud-abc::moxie': { title: 'Moxie', image: 'alias.png', pinned: true, color: '#cd8800' },
+      'cloud-abc::default': { title: undefined, image: null, pinned: false, color: '#123456' }
+    }
+
+    expect(botRosterMeta(hostedRow, meta)).toEqual({ title: 'Moxie', image: null, pinned: false, color: '#123456' })
+    // The active Cloud's unannotated rich row uses the same field precedence.
+    hostMock.state.connectionId.get.mockReturnValue('cloud-abc')
+    expect(botRosterMeta({ name: 'default' }, { ...meta, default: meta['cloud-abc::default'] })).toEqual({
+      title: 'Moxie',
+      image: null,
+      pinned: false,
+      color: '#123456'
+    })
+  })
+
   it('never leaks the alias onto a same-named default on another connection', () => {
     indexAliasRoutes([MOXIE_ROUTE])
 
