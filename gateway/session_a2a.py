@@ -91,7 +91,8 @@ async def forward(connection, params):
         raise RuntimeStoreError('invalid_params')
     identity = [params[k] for k in ('agent', 'tenant', 'peer', 'context_id')]
     key = 'a2a:' + hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
-    from gateway.session_local_recovery import local_identity, restore_local_session
+    from gateway.session_local_recovery import restore_local_session
+    from hermes_state_local_identity import resolve_creation_id
     from gateway.session_local import stage_local_session
     from gateway.session_runtime_workers import tracked_write
     from hermes_state_local import commit_local_session, local_receipt
@@ -105,7 +106,7 @@ async def forward(connection, params):
     pinned = lambda conn, sid: conn.execute('SELECT 1 FROM state_meta WHERE key=?', (
         identity_key(actor.subject, sid, params['input_id']),)).fetchone() is not None
     generation, sid = first_generation(
-        authority.db, lambda n: local_identity(authority.profile_id, actor.subject, request_id(n)), pinned=pinned)
+        authority.db, lambda n: resolve_creation_id(authority.db, authority.profile_id, actor.subject, request_id(n)), pinned=pinned)
     key = request_id(generation)
     authority._require_admission_open()
     if authority.db.get_session(sid) is not None:

@@ -261,9 +261,9 @@ def staged_creation_follows(authority, actor, request_id):
     """
     if not isinstance(request_id, str) or not request_id:
         return True
-    from gateway.session_local_recovery import local_identity
+    from hermes_state_local_identity import resolve_creation_id
     from hermes_state_local import local_receipt
-    sid = local_identity(authority.profile_id, actor.subject, request_id)
+    sid = resolve_creation_id(authority.db, authority.profile_id, actor.subject, request_id)
     if authority.db.get_session(sid) is None:
         return True
     try:
@@ -329,9 +329,10 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     from dataclasses import asdict
     from gateway.session import SessionEntry
     from gateway.session_lifecycle import _now
-    from gateway.session_local_recovery import local_identity, restore_local_session
+    from gateway.session_local_recovery import restore_local_session
+    from hermes_state_local_identity import resolve_creation_id
     authority._require_admission_open()
-    sid = local_identity(authority.profile_id, actor.subject, request_id)
+    sid = resolve_creation_id(authority.db, authority.profile_id, actor.subject, request_id)
     from gateway.session_policy import bind_launch_key, restore_policy, launch_key
     if authority.db.get_session(sid) is not None:
         from hermes_state_local import local_receipt

@@ -190,7 +190,7 @@ def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) ->
     project identity is always durable-only. Never fatal to the rename, which has already happened
     by this point.
     """
-    checkpoint_migrated = _migrate_checkpoint_identity(old_canon, new_canon)
+    checkpoint_migrated = True
 
     if live_mux:
         from hermes_constants import get_default_hermes_root
@@ -202,7 +202,7 @@ def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) ->
             reason = f"{type(exc).__name__}: {exc}"
         else:
             if isinstance(answer, dict) and answer.get("ok") is True:
-                return checkpoint_migrated
+                return _migrate_checkpoint_identity(old_canon, new_canon)
             reason = _control_answer_failure(answer)
             if answer is None and _gateway_accepts_profile_identity_verb(root):
                 reason += (" — the gateway is running but does not implement "
@@ -218,24 +218,45 @@ def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) ->
     from hermes_state_registry import acquire, release_or_close
     from hermes_constants import get_default_hermes_root
     root = get_default_hermes_root()
+    from gateway.runtime_ownership import exclusive_maintenance
     migrated = checkpoint_migrated
-    for db_path in (root / "state.db", get_profile_dir(new_canon) / "state.db"):
-        if not db_path.exists():
-            continue
-        db = None
-        try:
-            db = acquire(db_path)
-            db.rekey_profile_state(old_canon, new_canon)
-        except Exception as exc:
-            migrated = False
-            print(
-                f"⚠ Profile was renamed, but identity migration failed for {db_path}: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr)
-        finally:
-            if db is not None:
-                with contextlib.suppress(Exception):
+    target = get_profile_dir(new_canon)
+    try:
+        with exclusive_maintenance([root, target], purpose="profile-identity-migration"):
+            for db_path in (target / "state.db", root / "state.db"):
+                if not db_path.exists():
+                    continue
+                db = acquire(db_path)
+                try:
+                    db.rekey_profile_state(old_canon, new_canon, validate_only=True)
+                finally:
                     release_or_close(db)
+            from gateway.session_profile_mailbox import migration_pending
+            if (target / "state.db").exists():
+                db = acquire(target / "state.db")
+                try:
+                    migration_pending(db, old_canon, new_canon, start=True)
+                finally:
+                    release_or_close(db)
+            for db_path in (target / "state.db", root / "state.db"):
+                if not db_path.exists():
+                    continue
+                db = acquire(db_path)
+                try:
+                    db.rekey_profile_state(old_canon, new_canon)
+                finally:
+                    release_or_close(db)
+            if (target / "state.db").exists():
+                db = acquire(target / "state.db")
+                try:
+                    migration_pending(db, old_canon, new_canon, finish=True)
+                finally:
+                    release_or_close(db)
+            migrated = _migrate_checkpoint_identity(old_canon, new_canon)
+    except Exception as exc:
+        migrated = False
+        print(f"⚠ Profile identity migration failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
     return migrated
 
 

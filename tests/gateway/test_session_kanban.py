@@ -135,7 +135,8 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
         calls.append(('submit', submission))
     async def resume(ref, params):
         calls.append(('resume', ref))
-    db = SimpleNamespace(get_session=lambda sid: None, db_path=str(tmp_path / 'state.db'))
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / 'state.db')
     authority = SimpleNamespace(profile_id=str(tmp_path), db=db, submit=submit)
     actor = SessionActor('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
     connection = SimpleNamespace(authority=authority, actor=actor, native_owner=True, resume=resume)
@@ -143,6 +144,7 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     from gateway.session_kanban import run_task
     with pytest.raises(RuntimeStoreError, match='stale_kanban_claim'):
         asyncio.run(run_task(connection, params))
+    db.close()
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0

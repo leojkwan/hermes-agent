@@ -76,7 +76,7 @@ async def run_task(connection, params):
     from gateway.run import _load_gateway_config
     from gateway.session_local import create_local_session
     from gateway.session_contract import Submission
-    from gateway.session_local_recovery import local_identity
+    from hermes_state_local_identity import resolve_creation_id
     from hermes_state_local import local_receipt
     from gateway.session_policy import restore_policy
     authority = connection.authority
@@ -87,7 +87,7 @@ async def run_task(connection, params):
     # The dispatcher attempt is the durable request identity, including after the
     # task closes. Retry checks the saved claim, never reinterprets updated cards.
     request_id = 'kanban:' + json.dumps([params.get('board'), params.get('task_id'), params.get('run_id')], separators=(',', ':'))
-    sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
+    sid = resolve_creation_id(authority.db, authority.profile_id, connection.actor.subject, request_id)
     saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
     if saved:
         policy = restore_policy(saved['policy'])
