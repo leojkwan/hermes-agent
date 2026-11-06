@@ -466,7 +466,7 @@ def test_shell_option_operands_do_not_hide_initialization(tmp_path, command):
 
 
 def test_login_shebang_does_not_reuse_foreground_facts(tmp_path):
-    (tmp_path / "entry").write_text("#!/bin/bash -l\nnode -e 1\n")
+    (tmp_path / "entry").write_text("#!/usr/bin/env -S bash -l\nnode -e 1\n")
     unsafe, reason = guard.scan_gateway_lifecycle(
         "./entry", cwd=str(tmp_path), execution_context=known_context()
     )
