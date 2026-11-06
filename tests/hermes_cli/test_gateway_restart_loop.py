@@ -1865,8 +1865,8 @@ class TestLifecycleGuardNeverRaises:
             ("fat", b"\xca\xfe\xba\xbe"),
         ]:
             path = tmp_path / name
-            # No NUL after the magic — proves the magic check itself fires.
-            path.write_bytes(magic + b"ABCDEF" * 10)
+            # Compiled headers include NULs; signature-prefixed text remains scannable.
+            path.write_bytes(magic + bytes(64) + b"ABCDEF" * 10)
             text, unsafe = _read_referenced_script(path)
             assert text is None, name
             assert unsafe is False, name
