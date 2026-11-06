@@ -150,6 +150,18 @@ describe('opening a group from the Bots roster', () => {
     act(() => openRosterGroup('Team', 'name'))
     expect(globalThis.document.querySelector('[data-narrow-overlay="hermes-bots:pane"]')).not.toBeNull()
   })
+
+  it('does not change the docked layout on a wide browser', () => {
+    asBrowserHost()
+    $narrowViewport.set(false)
+    const tree = $layoutTree.get()
+    render(<NarrowOverlays />)
+
+    act(() => openRosterGroup('Team', 'name'))
+
+    expect($layoutTree.get()).toBe(tree)
+    expect($hiddenTreePanes.get().size).toBe(0)
+  })
 })
 
 describe('narrow overlay of a stacked zone', () => {
