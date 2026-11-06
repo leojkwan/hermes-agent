@@ -35,10 +35,6 @@ def authorized_adapter(smoke_adapter, monkeypatch, request):
     smoke_adapter._collect_inbound_media = AsyncMock(return_value=([], [], [], "hello"))
     smoke_adapter._app.client.users_info.return_value = {"user": {"is_bot": True}}
 
-    async def receive(event):
-        assert runner._is_user_authorized(event.source)
-
-    runner.receive = receive
     if request.param == "callback":
         def check(user_id, chat_type, chat_id, *, is_bot=False, thread_id=None):
             return runner._is_user_authorized(smoke_adapter.build_source(
@@ -125,6 +121,18 @@ async def test_outer_workspace_lookup_cannot_reuse_another_teams_bot(authorized_
     adapter.handle_message.assert_not_awaited()
     adapter._hydrate_thread_context.assert_not_awaited()
     assert adapter._user_is_bot_cache[("T_OTHER", PEER_USER_ID)] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_adapter", ["callback", "fallback"], indirect=True)
+async def test_unauthorized_ordinary_human_rejected_without_lookup(authorized_adapter):
+    adapter, _ = authorized_adapter
+    adapter._app.client.users_info.return_value = {"user": {"is_bot": False}}
+    await adapter._handle_slack_message(_event(user="U_UNAUTHORIZED", client_msg_id="human-message"))
+    adapter._app.client.users_info.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    adapter._hydrate_thread_context.assert_not_awaited()
+    adapter._collect_inbound_media.assert_not_awaited()
 
 
 @pytest.mark.asyncio

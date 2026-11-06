@@ -4602,9 +4602,11 @@ class SlackAdapter(BasePlatformAdapter):
         # the runner's own auth check only runs after MessageEvent is built.
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
         # Retain the declaration or workspace-verified identity across both auth seams and the
-        # final source. A failed/unknown lookup stays human for authorization purposes.
+        # final source. Only unlabeled candidates without client_msg_id need a bot probe;
+        # ordinary humans must reach early authorization without a credentialed lookup.
+        # A failed/unknown lookup stays human for authorization purposes.
         sender_is_bot = self._event_declares_bot_sender(event)
-        if not sender_is_bot and user_id:
+        if not sender_is_bot and user_id and not event.get("client_msg_id"):
             sender_is_bot = await self._resolve_user_is_bot(
                 user_id, chat_id=channel_id, team_id=team_id)
         if self._early_reject_unauthorized(
