@@ -19,6 +19,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Optional
@@ -497,7 +498,12 @@ def read_target_files(git_cmd, root: Path, target_ref: str, relpaths) -> dict[st
     names = list(dict.fromkeys(relpaths))
     found: dict[str, bytes | None] = dict.fromkeys(names)
     request = "".join(f"{target_ref}:{rel}\n" for rel in names).encode("utf-8")
-    cp = run_git(git_cmd, ["cat-file", "--batch"], cwd=str(root), input=request, capture_output=True, timeout=120)
+    # Git can fill its response pipe before consuming the rest of a batch request.
+    with tempfile.TemporaryFile() as request_file:
+        request_file.write(request)
+        request_file.seek(0)
+        cp = run_git(git_cmd, ["cat-file", "--batch"], cwd=str(root), stdin=request_file,
+                     capture_output=True, timeout=120)
     out, pos = (cp.stdout or b"") if cp.returncode == 0 else b"", 0
     for rel in names:
         end = out.find(b"\n", pos)
