@@ -116,6 +116,16 @@ async def test_normal_pick_survives_restart_without_rebuilding_conversation(tmp_
         assert (agent.model, agent.provider, agent.system_prompt, agent.tools) == (
             'frozen', 'custom', 'cached system prompt', ['retained'])
         assert not evictions
+        from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+        from gateway.run_turn_runner import TurnRunner
+        agent.request_overrides = {'speed': 'fast', 'extra_body': {'keep': True}}
+        agent._gateway_turn_request_overrides = {'speed': 'fast'}
+        route = GatewayTurnPrepareMixin._resolve_turn_agent_config(
+            SimpleNamespace(), '', agent.model, {'provider': agent.provider,
+                'request_overrides': {'extra_body': {'keep': True}}},
+            tier=policy.current_service_tier(authority.runner, live.route))
+        TurnRunner._merge_turn_request_overrides(agent, route)
+        assert agent.request_overrides == {'extra_body': {'keep': True}}
         events = live.event_stream.since(*watermark)['events']
         assert any(event['type'] == 'session.info' and event['payload']['service_tier'] == '' for event in events)
         assert _stored(other_db, other_ref.session_id) == other_before
@@ -186,3 +196,73 @@ async def test_tier_mutation_refuses_invalid_authority_fences_and_busy_work(tmp_
                 await client.close()
             await owner.close()
             store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('restart', [False, True])
+@pytest.mark.parametrize(('durable', 'transient', 'expected'), [
+    ('priority', 'normal', None), ('normal', 'ultrafast', 'ultrafast'),
+])
+async def test_tier_receipt_replay_preserves_newer_transient_choice(
+    tmp_path, monkeypatch, restart, durable, transient, expected,
+):
+    from gateway.session_local_recovery import restore_local_session
+
+    home = tmp_path / 'home'
+    store, db, authority, owner, _, _ = _owner(home, monkeypatch)
+    ref = _create(authority, owner, home)
+    request = _mutation(db, ref)
+    request['params']['payload']['tier'] = durable
+    first = await owner.dispatch(request)
+    if restart:
+        await owner.close()
+        store.close_all_db_handles()
+        store, db, authority, owner, _, _ = _owner(home, monkeypatch)
+        restore_local_session(authority, ref.session_id)
+    try:
+        await owner.dispatch({'id': 'later', 'method': 'config.set', 'params': {
+            'session_id': ref.session_id, 'key': 'service_tier', 'value': transient}})
+        assert await owner.dispatch(request) == first
+        live = authority.sessions[ref.session_id]
+        policy = policy_for_source(authority.runner, live.source)
+        assert policy.current_service_tier(authority.runner, live.route) == expected
+    finally:
+        await owner.close()
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('newer_choice', [False, True])
+async def test_tier_retry_repairs_failed_publication_without_overwriting_later_choice(
+    tmp_path, monkeypatch, newer_choice,
+):
+    from gateway import session_local
+
+    home = tmp_path / 'home'
+    store, db, authority, owner, _, _ = _owner(home, monkeypatch)
+    ref = _create(authority, owner, home)
+    await owner.dispatch({'id': 'initial', 'method': 'config.set', 'params': {
+        'session_id': ref.session_id, 'key': 'service_tier', 'value': 'priority'}})
+    request = _mutation(db, ref)
+    publish = session_local.publish_local_policy
+
+    def fail_once(*args, **kwargs):
+        monkeypatch.setattr(session_local, 'publish_local_policy', publish)
+        raise RuntimeError('publication interrupted')
+
+    monkeypatch.setattr(session_local, 'publish_local_policy', fail_once)
+    try:
+        with pytest.raises(RuntimeError, match='publication interrupted'):
+            await owner.dispatch(request)
+        if newer_choice:
+            # The same value is a new choice too; comparing only tier values loses its order.
+            await owner.dispatch({'id': 'later', 'method': 'config.set', 'params': {
+                'session_id': ref.session_id, 'key': 'service_tier', 'value': 'priority'}})
+        result = await owner.dispatch(request)
+        assert result['result']['tier'] == 'normal'
+        live = authority.sessions[ref.session_id]
+        policy = policy_for_source(authority.runner, live.source)
+        assert policy.current_service_tier(authority.runner, live.route) == ('priority' if newer_choice else None)
+    finally:
+        await owner.close()
+        store.close_all_db_handles()

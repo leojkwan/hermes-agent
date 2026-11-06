@@ -269,7 +269,9 @@ class GatewayConfigLoadersMixin:
             return
         # Presence-sensitive: "priority" or None (explicit normal) both count as an override; the
         # sentinel means "no override". Per-session field write: a lazy dict replace races sessions.
-        self._session_state(session_key).conversation.service_tier_override = (
+        conversation = self._session_state(session_key).conversation
+        conversation.service_tier_revision += 1
+        conversation.service_tier_override = (
             _SERVICE_TIER_UNSET if clear else service_tier
         )
 

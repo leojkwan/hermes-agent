@@ -42,7 +42,10 @@ async def prepare_service_tier(authority, live, payload, prepared):
     frozen = old.config()
     frozen.setdefault('agent', {})['service_tier'] = parse_exact_service_tier(payload['tier']) or 'normal'
     frozen[SESSION_PINS] = {**(frozen.get(SESSION_PINS) or {}), 'service_tier': True}
-    return _rebind(authority, prepared, old, replace(old, config_json=json.dumps(frozen)))
+    state = authority.runner._peek_session_state(live.route)
+    revision = state.conversation.service_tier_revision if state is not None else 0
+    return _rebind(authority, prepared, old, replace(old, config_json=json.dumps(frozen)),
+                   tier_control_stamp=[authority.epoch, revision])
 
 
 async def prepare_workspace(authority, live, payload, prepared):
