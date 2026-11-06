@@ -223,6 +223,62 @@ async def test_authorized_api_human_preserves_filter_policy_without_bot_exemptio
         assert runner._is_user_authorized(replace(source, user_id="U_UNAUTHORIZED")) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_adapter", ["callback", "fallback"], indirect=True)
+@pytest.mark.parametrize("identity", ["human", "missing", "error", "bot", "declared", "self", "unknown"])
+async def test_thread_history_trust_requires_verified_identity(authorized_adapter, identity):
+    adapter, _ = authorized_adapter
+    msg = {"user": PEER_USER_ID, "app_id": "A_FRONTEND", "team": TEAM_ID}
+    adapter._app.client.users_info.return_value = (
+        {} if identity == "missing" else {"user": {"is_bot": identity == "bot"}})
+    if identity == "error":
+        adapter._app.client.users_info.side_effect = RuntimeError("synthetic lookup failure")
+    if identity in {"declared", "self"}:
+        msg["bot_id"] = "B_PEER"
+    if identity == "self":
+        msg["user"] = BOT_USER_ID
+    if identity == "unknown":
+        msg.pop("user")
+    line = await adapter._thread_context_line(
+        msg, "context", False, TEAM_ID, "C_SMOKE", thread_ts="100.0")
+    if identity == "self":
+        assert line == "[assistant] context"
+    else:
+        assert ("[unverified] " in line) is (identity not in {"bot", "declared"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_adapter", ["callback", "fallback"], indirect=True)
+@pytest.mark.parametrize("failure", [None, {}, {"user": {}}, {"user": {"is_bot": "false"}}, RuntimeError("unavailable")])
+async def test_identity_lookup_recovers_on_later_event(authorized_adapter, failure):
+    adapter, _ = authorized_adapter
+    adapter._app.client.users_info.side_effect = [failure, {"user": {"is_bot": True}}]
+    await adapter._handle_slack_message(_event(app_id="A_FRONTEND"))
+    adapter.handle_message.assert_not_awaited()
+    assert (TEAM_ID, PEER_USER_ID) not in adapter._user_is_bot_cache
+    await adapter._handle_slack_message(_event(app_id="A_FRONTEND", ts="1700000001.2"))
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].source.is_bot is True
+    assert adapter._app.client.users_info.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, {}, {"user": {}}, {"user": {"is_bot": "false"}}])
+async def test_name_lookup_cannot_poison_bot_identity_cache(smoke_adapter, payload):
+    smoke_adapter._app.client.users_info.side_effect = [payload, {"user": {"is_bot": True}}]
+    await type(smoke_adapter)._resolve_user_name(smoke_adapter, PEER_USER_ID, team_id=TEAM_ID)
+    assert (TEAM_ID, PEER_USER_ID) not in smoke_adapter._user_is_bot_cache
+    assert await smoke_adapter._resolve_user_is_bot(PEER_USER_ID, team_id=TEAM_ID) is True
+
+
+@pytest.mark.asyncio
+async def test_validated_human_identity_remains_cached(smoke_adapter):
+    smoke_adapter._app.client.users_info.return_value = {"user": {"is_bot": False}}
+    assert await smoke_adapter._resolve_user_is_bot(PEER_USER_ID, team_id=TEAM_ID) is False
+    assert await smoke_adapter._resolve_user_is_bot(PEER_USER_ID, team_id=TEAM_ID) is False
+    smoke_adapter._app.client.users_info.assert_awaited_once_with(user=PEER_USER_ID)
+
+
 def test_legacy_three_argument_callback_keeps_human_semantics(smoke_adapter):
     smoke_adapter.set_authorization_check(lambda user, chat_type, chat_id: user == "U_OWNER")
     assert smoke_adapter._early_reject_unauthorized("U_OWNER", "C_SMOKE", False) is False

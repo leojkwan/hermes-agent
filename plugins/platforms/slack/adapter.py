@@ -3301,10 +3301,11 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             payload = await self._users_info_payload(user_id, chat_id, team_id)
             if not payload:
-                self._user_is_bot_cache[cache_key] = False
-                self._user_name_cache[cache_key] = user_id
                 return user_id
-            name, self._user_is_bot_cache[cache_key] = self._parse_users_info(payload, user_id)
+            name, is_bot = self._parse_users_info(payload, user_id)
+            if is_bot is not None:
+                self._user_is_bot_cache[cache_key] = is_bot
+                self._trim_oldest_dict_entries(self._user_is_bot_cache, self._USER_NAME_CACHE_MAX)
         except Exception as e:
             logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
             name = user_id
@@ -3390,15 +3391,14 @@ class SlackAdapter(BasePlatformAdapter):
         if cache_key in self._user_is_bot_cache:
             return self._user_is_bot_cache[cache_key]
         if not self._app:
-            self._user_is_bot_cache[cache_key] = False
             return False
         try:
             payload = await self._users_info_payload(user_id, chat_id, team_id)
             if not payload:
-                self._user_is_bot_cache[cache_key] = False
-                self._user_name_cache.setdefault(cache_key, user_id)
                 return False
             name, is_bot = self._parse_users_info(payload, user_id)
+            if is_bot is None:
+                return False
             self._user_is_bot_cache[cache_key] = is_bot
             self._trim_oldest_dict_entries(self._user_is_bot_cache, self._USER_NAME_CACHE_MAX)
             # Populate the name cache from the same users.info response so the
@@ -3407,7 +3407,6 @@ class SlackAdapter(BasePlatformAdapter):
             return is_bot
         except Exception as e:
             logger.debug("[Slack] users.info bot check failed for %s: %s", user_id, e)
-            self._user_is_bot_cache[cache_key] = False
             return False
 
     async def _users_info_payload(self, user_id: str, chat_id: str, team_id: str) -> dict:
@@ -3416,14 +3415,15 @@ class SlackAdapter(BasePlatformAdapter):
         return _slack_response_payload(await client.users_info(user=user_id))
 
     @staticmethod
-    def _parse_users_info(payload: dict, user_id: str) -> tuple[str, bool]:
-        """``(display name, is_bot)`` from a users.info payload; name prefers display → real → id."""
+    def _parse_users_info(payload: dict, user_id: str) -> tuple[str, Optional[bool]]:
+        """Display name and verified bot identity (None when absent/malformed, never cached)."""
         user = payload.get("user", {})
         profile = user.get("profile", {}) if isinstance(user, dict) else {}
-        is_bot = bool(
-            user.get("is_bot")
-            or user.get("is_workflow_bot")
-            or (isinstance(profile, dict) and profile.get("bot_id")))
+        is_bot = user.get("is_bot")
+        if not isinstance(is_bot, bool):
+            is_bot = None
+        if user.get("is_workflow_bot") is True or (isinstance(profile, dict) and profile.get("bot_id")):
+            is_bot = True
         name = (
             profile.get("display_name")
             or profile.get("real_name")
@@ -4156,6 +4156,17 @@ class SlackAdapter(BasePlatformAdapter):
         first (works under multiplex, where the handler has no ``__self__``), then runner
         introspection. Unknown (None) is NOT a rejection. ``thread_id``: thread-scoped profile_routes."""
         chat_type = "dm" if is_dm else "group"
+        decision = self._sender_authorization_decision(
+            user_id, channel_id, chat_type, thread_id=thread_id, is_bot=is_bot)
+        if decision is False:
+            logger.warning(
+                "[Slack] Early reject of unauthorized user %s in channel %s", user_id, channel_id)
+        return decision is False
+
+    def _sender_authorization_decision(
+        self, user_id: str, channel_id: str, chat_type: str, *,
+        thread_id: Optional[str] = None, is_bot: bool = False) -> Optional[bool]:
+        """Profile-bound callback or legacy runner decision, preserving unknown as None."""
         decision = (
             self._is_sender_authorized(
                 user_id, chat_type, channel_id, thread_id=thread_id, is_bot=is_bot)
@@ -4167,10 +4178,7 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_id=channel_id, chat_name="", chat_type=chat_type, user_id=user_id, user_name="",
                 thread_id=thread_id, is_bot=is_bot)
             decision = bool(auth_fn(source))
-        if decision is False:
-            logger.warning(
-                "[Slack] Early reject of unauthorized user %s in channel %s", user_id, channel_id)
-        return decision is False
+        return decision
 
     async def _channel_gate_allows(
         self, *, channel_id: str, routing_text: str, bot_uid: str, is_mentioned: bool,
@@ -4603,15 +4611,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Only a 1:1 IM earns DM exemptions (no mention needed, free reactions); an MPIM obeys
         # channel gating, though session/thread scoping treats both as DM-style.
         is_one_to_one_dm = channel_type == "im"
-        # Reject unauthorized users before the expensive lookups/downloads;
-        # the runner's own auth check only runs after MessageEvent is built.
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
-        # Probe unlabeled candidates before auth only without client_msg_id; ordinary humans
-        # must reach early authorization without a credentialed lookup.
-        # A failed/unknown lookup stays human for authorization purposes.
-        # User-bearing app events need explicit bot markers or users.info verification:
-        # app_id alone also appears on human Web API posts. Userless workflow posts retain
-        # their existing classification; they cannot borrow a human user's authorization.
+        # app_id also appears on human Web API posts: only explicit markers or verified
+        # lookup grant bot identity. Ordinary client messages reach auth before lookup.
+        # Userless workflows retain their existing classification.
         sender_is_bot = self._event_has_bot_markers(event) or (
             not user_id and self._event_declares_bot_sender(event))
         if not sender_is_bot and user_id and not event.get("client_msg_id"):
@@ -5958,9 +5961,11 @@ class SlackAdapter(BasePlatformAdapter):
         forge a "## SYSTEM" heading — so both collapse to one inert line."""
         # Local import: don't force gateway.session at module load.
         from gateway.session import neutralize_untrusted_inline_text
-        is_bot = self._event_declares_bot_sender(msg)
         msg_user = msg.get("user", "")
-        msg_team = msg.get("team") or team_id  # our own bot for this message's workspace
+        msg_team = self._event_team_id(msg) or team_id
+        is_bot = self._event_has_bot_markers(msg)
+        if not is_bot and msg_user:
+            is_bot = await self._resolve_user_is_bot(msg_user, chat_id=channel_id, team_id=msg_team)
         self_bot_uid = (
             self._team_bot_user_ids.get(msg_team) if msg_team else None
         ) or self._bot_user_id
@@ -5972,12 +5977,12 @@ class SlackAdapter(BasePlatformAdapter):
         if is_bot and not display_user:
             display_user = msg.get("username") or "bot"
         trust_tag = ""
-        if not is_bot and msg_user:
-            is_authorized = self._is_sender_authorized(
-                msg_user, chat_type=chat_type, chat_id=channel_id, thread_id=thread_ts or None)
-            if is_authorized is False:
+        if not is_bot:
+            is_authorized = self._sender_authorization_decision(
+                msg_user, channel_id, chat_type, thread_id=thread_ts or None)
+            if is_authorized is not True:
                 trust_tag = "[unverified] "
-        name = await self._resolve_user_name(display_user, chat_id=channel_id, team_id=team_id)
+        name = await self._resolve_user_name(display_user, chat_id=channel_id, team_id=msg_team)
         safe_name = neutralize_untrusted_inline_text(name)
         safe_text = neutralize_untrusted_inline_text(msg_text, max_chars=0)  # untruncated
         return f"{prefix}{trust_tag}{safe_name}: {safe_text}"
