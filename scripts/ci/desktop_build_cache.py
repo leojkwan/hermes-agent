@@ -24,7 +24,7 @@ from scripts.ci.setup_toolchain import current_target, file_commands
 
 CACHE_DOMAINS = ("tools", "python/runtime", "python/build", "pnpm/store", "native", "packager")
 _INPUT_FILES = (
-    "pnpm-lock.yaml", "pnpm-workspace.yaml",
+    "pnpm-lock.yaml", "pnpm-workspace.yaml", ".pnpmfile.cjs",
     "pyproject.toml", "uv.lock", "pm/lock.json", "pm/pyproject.toml", "pm/uv.lock",
     "scripts/ci/desktop_build_cache.py", "scripts/ci/setup_toolchain.py",
     "scripts/bundles/desktop_prepare.py", "scripts/bundles/desktop_toolchain.py",

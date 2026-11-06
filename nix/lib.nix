@@ -223,6 +223,7 @@ let
       (repoRoot + "/package.json")
       (repoRoot + "/pnpm-lock.yaml")
       (repoRoot + "/pnpm-workspace.yaml")
+      (repoRoot + "/.pnpmfile.cjs")
     ]
     ++ map (d: repoRoot + "/${d}/package.json") workspaceMemberDirs
   );

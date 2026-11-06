@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { expect, test } from 'vitest'
@@ -16,6 +16,30 @@ const fixture = (name) => {
   writeFileSync(path.join(dir, 'web/src/main.ts'), 'export const answer: string = "prepared web";')
   return dir
 }
+
+test('package hooks invalidate products and follow the prepared Webapp workspace', async () => {
+  const { sourceHash } = await import('../scripts/build/freshness.mjs')
+  const { mirrorWebappInputs } = await import('../apps/desktop/scripts/build-webapp.mjs')
+  const source = fixture('freshness-hook-')
+  const workspace = mkdtempSync(path.join(tmpdir(), 'freshness-hook-workspace-'))
+  const products = ['tui', 'webapp', 'desktop', 'web']
+  const before = products.map(product => sourceHash(source, product))
+  const hook = 'module.exports = {}\n'
+  try {
+    writeFileSync(path.join(source, '.pnpmfile.cjs'), hook)
+    for (const [index, product] of products.entries()) {
+      expect(sourceHash(source, product), product).not.toBe(before[index])
+    }
+    mirrorWebappInputs(source, workspace)
+    expect(readFileSync(path.join(workspace, '.pnpmfile.cjs'), 'utf8')).toBe(hook)
+    rmSync(path.join(source, '.pnpmfile.cjs'))
+    mirrorWebappInputs(source, workspace)
+    expect(existsSync(path.join(workspace, '.pnpmfile.cjs'))).toBe(false)
+  } finally {
+    rmSync(source, { recursive: true, force: true })
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
 
 test('OS file-manager metadata landing in hashed trees never invalidates a recorded product', async () => {
   const { buildInputs, recordProduct, productCurrent } = await import('../scripts/build/freshness.mjs')
