@@ -16,7 +16,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from cron.lifecycle_guard_lex import _iter_command_segments, _shlex_tokens
+from cron.lifecycle_guard_lex import _CONTROL_CHARS, _iter_command_segments, _shlex_tokens
+from tools.environments.local_execution_context import ExecutionContext, EnvFact, FIELD_NAMES, NPM_PREFIX, SHELL_HOOK_NAMES
 
 
 class ScanRefused(RuntimeError):
@@ -39,24 +40,6 @@ class Invocation:
     cwd: str
     package_root: str | None = None
     literal_commands: bool = False
-
-
-@dataclass(frozen=True)
-class NodeOptions:
-    value: str | None
-    reason: str = "execution-affecting Node options unavailable from actual execution context"
-
-    def assignment(self, token: str) -> NodeOptions:
-        name, _, value = token.partition("=")
-        if name in {"npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL"}:
-            raise ScanRefused("unsupported npm shell selection")
-        if name == "NODE_OPTIONS+":
-            return NodeOptions(None, "unresolved appended NODE_OPTIONS assignment")
-        if name != "NODE_OPTIONS":
-            return self
-        if _DYNAMIC.search(value):
-            return NodeOptions(None, "unresolved execution-affecting NODE_OPTIONS")
-        return NodeOptions(value)
 
 
 @dataclass(frozen=True)
@@ -136,12 +119,8 @@ def read_local_source(path: Path, *, max_bytes: int, checkpoint=lambda: None) ->
 
 
 _SHELL_OPTION_SETTERS = frozenset({"export", "unset", "declare", "readonly", "typeset", "local"})
-_SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+_SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=")
 _DYNAMIC = re.compile(r"[$`*?{}\x00]")
-_NPM_SHORTCUTS = frozenset({"test", "start", "stop", "restart"})
-_NPM_FLAGS = frozenset({"-s", "--silent", "--ignore-scripts", "--no-ignore-scripts",
-                        "--if-present", "--foreground-scripts", "--no-progress", "--color", "--no-color"})
-_NPM_VALUES = frozenset({"--prefix", "--loglevel", "--cache", "--userconfig", "--globalconfig"})
 _NODE_VALUES = frozenset({"--conditions", "-C", "--inspect-port", "--title", "--stack-trace-limit",
                          "--max-old-space-size", "--max-semi-space-size", "--input-type"})
 _NODE_FLAGS = frozenset({"--no-warnings", "--trace-warnings", "--enable-source-maps", "--disable-warning",
@@ -187,16 +166,17 @@ def node_option_parts(token: str) -> tuple[str, str, str]:
 
 
 class ReferenceScanner:
-    def __init__(self, budget, remote_reader, remote_namespace: bool, execution_options: str | None):
+    def __init__(self, budget, remote_reader, remote_namespace: bool, execution_context: ExecutionContext | None):
         self.budget = budget
         self.remote_reader = remote_reader
         self.remote_namespace = remote_namespace
-        self.options = NodeOptions(execution_options)
+        self.options = execution_context or ExecutionContext.unknown()
         self.reads: dict[str, SourceRead] = {}
         self.remote_paths: set[str] = set()
         self.completed: set[tuple] = set()
         self.active_files: set[tuple] = set()
         self.active_aliases: set[tuple[str, str]] = set()
+        self.npm_exports = None
 
     def read(self, path: str, *, metadata: bool = False) -> SourceRead:
         from cron import lifecycle_guard as guard
@@ -310,6 +290,8 @@ class ReferenceScanner:
                 shebang, self.options = self.invocation_context(_shlex_tokens(raw))
                 if not shebang:
                     raise ScanRefused("unsupported empty shebang invocation")
+                if self.shell_initializes_context(shebang, self.options):
+                    self.options = ExecutionContext.unknown("shell-initialization-context-unavailable")
                 name = guard._executable_name(shebang[0])
                 source = source or name in {"node", "nodejs"} or bool(re.fullmatch(r"python[0-9.]*", name))
                 if name in {"node", "nodejs"}:
@@ -337,60 +319,30 @@ class ReferenceScanner:
             raise ScanRefused(f"malformed package metadata: {path}")
         return data
 
-    def package(self, cwd: str) -> tuple[str, dict]:
-        for parent in (Path(cwd), *Path(cwd).parents):
-            data = self.metadata(str(parent / "package.json"))
-            if data is not None:
-                return str(parent), data
-        raise ScanRefused("required package.json not found by bounded upward lookup")
-
     def npm(self, invocation: Invocation, depth: int) -> bool:
-        if self.node(Invocation(("node", "-e", "1"), invocation.cwd, invocation.package_root), depth):
-            return True
-        args = list(invocation.argv[1:])
-        cwd, selected, forwarded, index = invocation.cwd, None, [], 0
-        while index < len(args):
-            token = args[index]
-            index += 1
-            if token == "--":
-                if selected is None:
-                    raise ScanRefused("npm script selector missing")
-                forwarded = args[index:]
-                break
-            option, equals, value = token.partition("=")
-            if option in _NPM_FLAGS:
-                if equals and value not in {"true", "false"}:
-                    raise ScanRefused("unsupported npm boolean option selection")
-                continue
-            if option in _NPM_VALUES:
-                if not equals:
-                    if index == len(args):
-                        raise ScanRefused("npm option value missing")
-                    value, index = args[index], index + 1
-                if option == "--prefix":
-                    cwd = anchored(value, invocation.cwd)
-                elif option in {"--userconfig", "--globalconfig"}:
-                    raise ScanRefused("unsupported npm config selection")
-                continue
-            if token.startswith("-"):
-                raise ScanRefused(f"unsupported npm workspace/shell/config selection: {option}")
-            if token in {"run", "run-script"} and selected is None:
-                selected = ""
-            elif selected == "" or (selected is None and token in _NPM_SHORTCUTS):
-                selected = static_selector(token, "npm script name")
-            elif selected is None:
-                # Other npm operations are not statically selected script invocations.
-                return False
-            else:
-                forwarded.append(token)
-        if not selected:
-            raise ScanRefused("npm script selector missing or unresolved")
-        if self.argument_references(forwarded, invocation, depth):
-            return True
-        return self.npm_script(cwd, selected, forwarded, depth)
+        from cron.lifecycle_guard_npm import NpmProjection, parse_selection
 
-    def npm_script(self, cwd: str, selected: str, forwarded: list[str], depth: int) -> bool:
-        root, data = self.package(cwd)
+        if self.scan_ambient_node_options(invocation, depth):
+            return True
+        selection = parse_selection(invocation.argv, invocation.cwd)
+        projection = NpmProjection(self, selection, invocation.argv, invocation.cwd, self.npm_exports)
+        facts = projection.project()
+        if facts.status == "refused":
+            raise ScanRefused(facts.reason)
+        if self.argument_references(list(selection.forwarded), invocation, depth):
+            return True
+        previous, exports = self.options, self.npm_exports
+        self.npm_exports = projection.children
+        self.options = projection.children.context
+        try:
+            return self.npm_script(facts.local_prefix, selection.script, list(selection.forwarded), depth)
+        finally:
+            self.options, self.npm_exports = previous, exports
+
+    def npm_script(self, root: str, selected: str, forwarded: list[str], depth: int) -> bool:
+        data = self.metadata(str(Path(root) / "package.json"))
+        if data is None:
+            raise ScanRefused("required package metadata missing")
         scripts = data.get("scripts")
         if not isinstance(scripts, dict) or not isinstance(scripts.get(selected), str) or not scripts[selected]:
             raise ScanRefused(f"required npm script missing or malformed: {selected}")
@@ -457,16 +409,30 @@ class ReferenceScanner:
                 return target + "/index.js"
         raise ScanRefused(f"selected Node module unresolved: {value}")
 
+    def scan_ambient_node_options(self, invocation: Invocation, depth: int) -> bool:
+        if any(getattr(self.options, field).reason == "execution context changed earlier in this command"
+               for field in FIELD_NAMES.values()):
+            raise ScanRefused("execution context changed earlier in this command")
+        fact = self.options.node_options
+        if fact.status == "unknown":
+            raise ScanRefused("execution-affecting Node options unavailable from actual execution context (" + fact.reason + ")")
+        if fact.status == "absent" or not fact.value:
+            return False
+        if not self.budget.charge_text(fact.value):
+            raise ScanRefused("Node execution options source budget exhausted")
+        visible_paths = len(self.budget.reached_paths)
+        try:
+            return self.node(Invocation(("node", *_shlex_tokens(fact.value)), invocation.cwd,
+                                        invocation.package_root), depth, injected=True)
+        except (RuntimeError, OSError, ValueError):
+            raise ScanRefused("private Node execution options could not be completely inspected") from None
+        finally:
+            del self.budget.reached_paths[visible_paths:]
+
     def node(self, invocation: Invocation, depth: int, *, injected=False) -> bool:
         args, index, inline = list(invocation.argv[1:]), 0, False
-        if not injected and self.options.value is None:
-            raise ScanRefused(self.options.reason)
-        if not injected and self.options.value:
-            if not self.budget.charge_text(self.options.value):
-                raise ScanRefused("Node execution options source budget exhausted")
-            options = _shlex_tokens(self.options.value)
-            if self.node(Invocation(("node", *options), invocation.cwd, invocation.package_root), depth, injected=True):
-                return True
+        if not injected and self.scan_ambient_node_options(invocation, depth):
+            return True
         while index < len(args):
             token = args[index]
             index += 1
@@ -566,7 +532,17 @@ class ReferenceScanner:
         # Expand only actual command positions. Source literal reference discovery below is
         # deliberately additive and retains dynamicImport/require wrappers without eval.
         previous = ""
-        for segment in _iter_command_segments(walk):
+        arithmetic = False
+        from cron.lifecycle_guard_shell import arithmetic_mutation
+        for segment in _iter_command_segments(walk, keep_controls=not source):
+            if not source and len(segment) == 1 and set(segment[0]) <= _CONTROL_CHARS:
+                if "((" in segment[0]:
+                    arithmetic = True
+                if "))" in segment[0]:
+                    arithmetic = False
+                continue
+            if arithmetic and arithmetic_mutation(segment):
+                self.options = ExecutionContext.unknown("execution context changed earlier in this command")
             literal_commands = source and bool(re.search(
                 r"(?:^|\.)(?:exec|execSync|spawn|spawnSync)$|^os\.(?:system|popen)$|^subprocess\.(?:run|call|check_call|check_output|Popen)$",
                 previous,
@@ -582,7 +558,10 @@ class ReferenceScanner:
 
     def scan_segment(self, segment, cwd: str, depth: int, package_root, source: bool, execution_cwd: str, literal_commands: bool) -> bool:
         from cron import lifecycle_guard as guard
+        from cron.lifecycle_guard_shell import peel_shell_prefixes
 
+        if not source:
+            segment = peel_shell_prefixes(segment)
         original = guard._command_token_index(segment)
         index = guard._executed_command_index(segment)
         previous = self.options
@@ -590,16 +569,19 @@ class ReferenceScanner:
             argv = segment if literal_commands else segment[index:] if index is not None else []
         else:
             argv, options = self.invocation_context(segment)
-            if self.inline_options_mutation(segment, argv, depth):
-                previous = NodeOptions(None, "unresolved inline NODE_OPTIONS shell mutation")
-            self.options = previous if options == self.options else options
+            if self.shell_initializes_context(argv, options):
+                options = ExecutionContext.unknown("shell-initialization-context-unavailable")
+            if self.inline_options_mutation(segment, argv):
+                previous = ExecutionContext.unknown("execution context changed earlier in this command")
+                options = previous
+            self.options = options
         try:
             if argv:
                 invocation = Invocation(tuple(argv), execution_cwd if source else cwd, package_root, literal_commands)
                 if not source:
                     payloads = dict.fromkeys(
                         payload for tokens in (segment, argv)
-                        for payload in guard._iter_shell_command_payloads(shlex.join(tokens))
+                        for payload in guard._shell_payloads_from_tokens(tokens)
                     )
                     for payload in payloads:
                         if self.nested(payload, cwd, depth, package_root):
@@ -632,6 +614,8 @@ class ReferenceScanner:
                 if self.source_literal(literal, invocation, depth):
                     return True
             return False
+        if _DYNAMIC.search(name):
+            raise ScanRefused("unresolved execution routing")
         if name in {"node", "nodejs"}:
             if self.node(invocation, depth):
                 return True
@@ -662,23 +646,27 @@ class ReferenceScanner:
                      or re.fullmatch(r"python[0-9.]*", name) or "/" in token)
         return bool(supported) and self.nested(literal, invocation.cwd, depth, invocation.package_root)
 
-    def invocation_context(self, segment: list[str]) -> tuple[list[str], NodeOptions]:
+    def invocation_context(self, segment: list[str]) -> tuple[list[str], ExecutionContext]:
         from cron import lifecycle_guard as guard
 
         tokens, index, options = list(segment), 0, self.options
+        wrapper_unknown = False
         for _ in range(guard._MAX_PREFIX_PEELS):
             while index < len(tokens) and _SHELL_ASSIGNMENT.match(tokens[index]):
-                options = options.assignment(tokens[index])
+                options = self.context_assignment(options, tokens[index])
                 index += 1
             if index == len(tokens):
                 return [], options
             name = guard._executable_name(tokens[index])
             if name not in guard._TRANSPARENT_COMMAND_PREFIXES:
-                return tokens[index:], options
+                return tokens[index:], ExecutionContext.unknown("environment-changing-wrapper") if wrapper_unknown else options
             index += 1
             if name == "env":
                 tokens, index, options = self.env_context(tokens, index, options)
             else:
+                if name in {"sudo", "doas", "su", "runuser", "pkexec", "setpriv", "systemd-run", "nsenter", "unshare", "eatmydata", "stdbuf"}:
+                    wrapper_unknown = True
+                    options = ExecutionContext.unknown("environment-changing-wrapper")
                 index = self.wrapper_operand(tokens, index, name)
         raise ScanRefused("invocation wrapper depth budget exhausted")
 
@@ -701,7 +689,7 @@ class ReferenceScanner:
                 break
         return min(len(tokens), index + guard._TRANSPARENT_PREFIX_OPERANDS.get(name, 0))
 
-    def env_context(self, tokens, index, options) -> tuple[list[str], int, NodeOptions]:
+    def env_context(self, tokens, index, options) -> tuple[list[str], int, ExecutionContext]:
         operations = {"-u": "unset", "--unset": "unset", "-S": "split", "--split-string": "split"}
         splits = 0
         while index < len(tokens):
@@ -711,7 +699,7 @@ class ReferenceScanner:
             if token == "--":
                 break
             if token in {"-i", "--ignore-environment", "-"}:
-                options = NodeOptions("")
+                options = ExecutionContext(*(EnvFact("absent") for _ in FIELD_NAMES), frozenset(), npm_path_safe=True, shell_startup_safe=True)
                 continue
             if not token.startswith("-"):
                 index -= 1
@@ -727,9 +715,9 @@ class ReferenceScanner:
                 value, index = tokens[index], index + 1
             if operations[option] == "unset":
                 if _DYNAMIC.search(value):
-                    options = NodeOptions(None, "unresolved env unset selector for NODE_OPTIONS")
-                elif value == "NODE_OPTIONS":
-                    options = NodeOptions("")
+                    options = ExecutionContext.unknown("unresolved env unset selector")
+                else:
+                    options = options.with_fact(value, EnvFact("absent"))
             else:
                 splits += 1
                 if splits > 8:
@@ -737,31 +725,58 @@ class ReferenceScanner:
                 if _DYNAMIC.search(value) or "\\" in value or "#" in value:
                     raise ScanRefused("unsupported dynamic or escaped env split-string")
                 tokens = [*tokens[:index], *_shlex_tokens(value), *tokens[index:]]
+        while index < len(tokens) and "=" in tokens[index] and not tokens[index].startswith("="):
+            options = self.context_assignment(options, tokens[index])
+            index += 1
         return tokens, index, options
 
-    def inline_options_mutation(self, segment, argv, depth: int) -> bool:
+    def shell_initializes_context(self, argv, context) -> bool:
         from cron import lifecycle_guard as guard
 
-        if not argv:
-            return any(token.startswith(("NODE_OPTIONS=", "NODE_OPTIONS+=")) for token in segment)
-        name = guard._executable_name(argv[0])
-        if name in _SHELL_OPTION_SETTERS:
-            return any(re.match(r"^NODE_OPTIONS(?:[=+\[]|$)", token)
-                       or _DYNAMIC.search(token.partition("=")[0]) for token in argv[1:])
-        if name != "eval":
+        if not argv or guard._executable_name(argv[0]) not in guard._SHELL_EXECUTABLES:
             return False
-        if depth >= guard._MAX_REFERENCED_SCRIPT_DEPTH:
-            raise ScanRefused("eval mutation inspection depth budget exhausted")
-        payload = " ".join(argv[1:])
-        if _DYNAMIC.search(payload):
+        name = guard._executable_name(argv[0])
+        if name not in {"sh", "dash", "bash"} or (name == "bash" and not context.shell_startup_safe):
             return True
-        if not self.budget.charge_text(payload):
-            raise ScanRefused("eval mutation inspection source budget exhausted")
-        for child in _iter_command_segments(payload):
-            child_argv, _ = self.invocation_context(child)
-            if self.inline_options_mutation(child, child_argv, depth + 1):
+        index = 1
+        while index < len(argv):
+            flag = argv[index]
+            if not flag.startswith(("-", "+")) or flag == "--":
+                break
+            if flag.partition("=")[0] in {"--login", "--rcfile", "--init-file"}:
                 return True
-        for child in guard._iter_shell_command_payloads(payload):
-            if self.inline_options_mutation([], ["eval", child], depth + 1):
-                return True
+            if not flag.startswith("--"):
+                from cron.lifecycle_guard_shell import option_mutation
+                if any(c in flag[1:] for c in "li") or option_mutation("bash", argv[index:]):
+                    return True
+                if "c" in flag[1:]:
+                    break
+            index += 2 if flag in guard._SHELL_OPTIONS_WITH_VALUES else 1
         return False
+
+    def context_assignment(self, context: ExecutionContext, token: str) -> ExecutionContext:
+        name, _, value = token.partition("=")
+        if name in {"SHELLOPTS", "BASHOPTS"}:
+            return ExecutionContext.unknown("shell-initialization-context-unavailable")
+        if _DYNAMIC.search(name):
+            return ExecutionContext.unknown("unresolved environment assignment name")
+        appended = name.endswith("+") or "[" in name
+        name = name.rstrip("+").partition("[")[0]
+        if name not in FIELD_NAMES and name not in SHELL_HOOK_NAMES and name.casefold() != "path" and not NPM_PREFIX.match(name):
+            return context
+        fact = (EnvFact("unknown", reason="unresolved execution-affecting " + (name if name in FIELD_NAMES else "npm config"))
+                if appended or _DYNAMIC.search(value) else EnvFact("value", value))
+        return context.with_fact(name, fact)
+
+    def inline_options_mutation(self, segment, argv) -> bool:
+        from cron import lifecycle_guard as guard
+        from cron.lifecycle_guard_shell import assignment_mutation
+
+        if argv:
+            name = guard._executable_name(argv[0])
+            if name in {"source", ".", "eval"}:
+                return True
+            from cron.lifecycle_guard_shell import option_mutation
+            if option_mutation(name, argv[1:]):
+                return True
+        return assignment_mutation(segment, argv)

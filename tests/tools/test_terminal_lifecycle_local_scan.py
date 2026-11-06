@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from tools.terminal_tool_guards import gateway_lifecycle_block
+from tools.environments.local_execution_context import ExecutionContext
+from tests.cron.lifecycle_context_fixtures import known_context, npm_context
 
 
 @pytest.fixture
@@ -28,7 +30,7 @@ def test_local_source_labels_do_not_dispatch_backend_reads(supervised, tmp_path)
         calls.append(command)
         raise AssertionError("local preflight dispatched a backend command")
 
-    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden)
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden, execution_context=lambda: ExecutionContext.unknown())
     script = tmp_path / "app.cjs"
     script.write_text('const options = {\n "./absent": 1,\n};\n')
     assert _block(tmp_path, env, "local", "./app.cjs") is None
@@ -83,7 +85,7 @@ def test_local_magic_prefixed_text_helper_is_scanned_without_backend(supervised,
         calls.append(command)
         raise AssertionError("local preflight dispatched a backend command")
 
-    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden)
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden, execution_context=lambda: ExecutionContext.unknown())
     (tmp_path / "restart").write_text("MZ=1\nhermes gateway restart\n")
     result = json.loads(_block(tmp_path, env, "local", "./restart"))
     assert "cannot restart, stop, or uninstall the gateway" in result["error"]
@@ -99,11 +101,29 @@ def test_local_node_fact_and_unknown_context_never_execute(supervised, tmp_path)
 
     (tmp_path / "entry.cjs").write_text("const value = 1;\n")
     (tmp_path / "helper.cjs").write_text("require('node:child_process').execSync('hermes gateway restart');\n")
-    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden)
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden, execution_context=lambda: ExecutionContext.unknown())
     result = json.loads(_block(tmp_path, env, "local", "node entry.cjs"))
     assert "execution context" in result["error"]
     assert _block(tmp_path, env, "local", "NODE_OPTIONS='' node entry.cjs") is None
-    env.lifecycle_node_options = "--require ./helper.cjs"
+    env.execution_context = lambda: known_context("--require ./helper.cjs")
     result = json.loads(_block(tmp_path, env, "local", "node entry.cjs"))
     assert "cannot restart, stop, or uninstall" in result["error"]
     assert calls == []
+
+
+@pytest.mark.platforms("posix")
+def test_local_npm_config_projection_never_dispatches_execution(supervised, tmp_path, monkeypatch):
+    import subprocess
+
+    context = npm_context(tmp_path)
+    (tmp_path / "package.json").write_text('{"scripts":{"check":"node -e 1"}}')
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("effective-local npm preflight executed a command")
+
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden, execution_context=lambda: context)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    assert _block(tmp_path, env, "local", "npm run check") is None
+    (tmp_path / ".npmrc").write_text("node-options=--require ./hidden.cjs\n")
+    result = json.loads(_block(tmp_path, env, "local", "npm run check"))
+    assert "npm projection" in result["error"]

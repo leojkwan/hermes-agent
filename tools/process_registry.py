@@ -1109,12 +1109,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return tempfile.gettempdir()
 
-    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> list[str]:
+    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str, prepared_launch=None) -> list[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
         gateway and its messaging control plane)."""
-        argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
+        argv = ([prepared_launch.bash, "--noprofile", "--norc", "-c", safe_command]
+                if prepared_launch is not None else [_find_shell(), "-lic", f"set +m; {safe_command}"])
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():
@@ -1128,61 +1129,45 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
         return argv
 
-    @staticmethod
-    def _spawn_env(env_vars: dict) -> dict:
-        """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress."""
-        from agent.session_client_env import toolchain_environ
-        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
-        env["PYTHONUNBUFFERED"] = "1"
-        return env
-
-    def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:
-        """Register before the reader can publish completion, even for an exited child."""
-        from contextvars import copy_context
-
-        # Reader completion must retain the producer's multiplex profile scope.
-        reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
-                                  daemon=True, name=reader_name)
-        session._reader_thread = reader
-        with self._lock:
-            self._prune_if_needed()
-            # Completion takes this lock too. Starting here also leaves no
-            # ghost entry if the interpreter cannot start another thread.
-            reader.start()
-            self._running[session.id] = session
-        self._write_checkpoint()
-
-    def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
+    def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict, prepared_launch=None) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
-        Raises ImportError when no PTY backend is installed and re-raises any spawn
-        failure; ``spawn_local`` falls back to pipe mode in both cases."""
+        Pipe fallback is permitted only before a child handle has been returned."""
         if _IS_WINDOWS:
             from winpty import PtyProcess as _PtyProcessCls
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
-        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
-        pty_env = self._spawn_env(env_vars)
-        if session.systemd_unit:
+        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY", **({"prepared_launch": prepared_launch} if prepared_launch is not None else {}))
+        pty_env = prepared_launch.spawn_env if prepared_launch is not None else self._spawn_env(env_vars)
+        if session.systemd_unit and prepared_launch is None:
             pty_env = systemd_user_bus_env(pty_env)
         # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
-        pty_env.setdefault("GIT_PAGER", "cat")
-        pty_env.setdefault("PAGER", "cat")
+        if prepared_launch is None:
+            pty_env.setdefault("GIT_PAGER", "cat")
+            pty_env.setdefault("PAGER", "cat")
         pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
-        self._own_pty_job(session, pty_proc)
+        session._pty = pty_proc
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
-        session._pty = pty_proc
+        if prepared_launch is not None:
+            prepared_launch.attach(pty_proc)
+            session._prepared_launch = prepared_launch
+        self._own_pty_job(session, pty_proc)
         self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
         return session
 
     def spawn_local(
         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
         env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False, restore_login_path: bool = False) -> ProcessSession:
+        persist_on_release: bool = False, restore_login_path: bool = False, prepared_launch=None) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends: spawn_via_env()).
         ``use_pty`` asks ptyprocess/pywinpty for a pseudo-terminal; on failure: pipe + ``pty_fallback``.
         ``persist_on_release``: no agent kill sweeps (#41225); ``restore_login_path``: re-add reset PATH dirs (#56634)."""
+        if prepared_launch is not None:
+            from tools.process_registry_prepared import spawn_prepared_local
+            return spawn_prepared_local(
+                self, prepared_launch, task_id=task_id, session_key=session_key,
+                owner_task_id=owner_task_id, use_pty=use_pty, persist_on_release=persist_on_release)
         # Bash runs ``A && B &`` as a subshell holding our stdout pipe open while a server B lives;
         # the rewriter makes it ``A && { B & }`` (#68915). Lazy: terminal_tool imports this module.
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
@@ -1196,12 +1181,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         if use_pty and log is None:
             try:
                 return self._spawn_local_pty(session, safe_command, env_vars)
-            except ImportError:
-                session.pty_fallback = "the PTY library (ptyprocess/pywinpty) is not installed"
-                logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
-                session.pty_fallback = f"the PTY spawn failed ({e})"
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if session._pty is not None:
+                    from tools.process_registry_ownership import refuse_pty_replay
+                    refuse_pty_replay(self, session)
+                session.pty_fallback = ("the PTY library (ptyprocess/pywinpty) is not installed"
+                                        if isinstance(e, ImportError) else f"the PTY spawn failed ({e})")
+                logger.warning("PTY unavailable (%s), falling back to pipe mode", e)
                 if session.systemd_unit:
                     pty_scope_attempted = True
                     if not _stop_systemd_unit(session.systemd_unit):
@@ -1620,8 +1606,16 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         kill anything — the child has already exited — it only releases the
         parent's pipe FDs, which is exactly the retained-resource leak.
         """
+        launch = getattr(session, "_prepared_launch", None)
+        if launch is None and session.process is not None:
+            launch = getattr(session.process, "_hermes_prepared_launch", None)
+        if launch is not None:
+            launch.close_if_finished()
         proc = session.process
         if proc is not None:
+            publication = getattr(proc, "_hermes_publication", None)
+            if publication is not None:
+                publication.close_if_finished()
             for stream in (proc.stdout, proc.stderr, proc.stdin):
                 if stream is not None:
                     with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE

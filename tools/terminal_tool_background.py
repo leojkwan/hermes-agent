@@ -93,14 +93,14 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty, persist_on_release: bool = False):
+           session_key, effective_pty, persist_on_release: bool = False, prepared_launch=None):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
-            restore_login_path=True, **common)
+            restore_login_path=True, **({"prepared_launch": prepared_launch} if prepared_launch is not None else {}), **common)
     return process_registry.spawn_via_env(env=env, **common)
 
 
@@ -156,6 +156,7 @@ def spawn_background_process(
     persist_on_release: bool = False,
     mounted_host: Optional[str] = None,
     auto_backgrounded: bool = False,
+    prepared_launch=None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -170,7 +171,7 @@ def spawn_background_process(
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
 
-    effective_cwd = _resolve_command_cwd(
+    effective_cwd = prepared_launch.cwd if prepared_launch is not None else _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
         env=env,
@@ -180,9 +181,13 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
+            **({"prepared_launch": prepared_launch} if prepared_launch is not None else {}),
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
+        if prepared_launch is not None and prepared_launch.environment_recreated:
+            from tools.terminal_tool_result import environment_recreated_note
+            result_data["environment_recreated"] = environment_recreated_note("local_snapshot")
         if persist_on_release:
             result_data["persist_on_release"] = True
         if approval_note:

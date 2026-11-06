@@ -1343,7 +1343,7 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    metered: bool = True,
+    metered: bool = True, prepared_launch=None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
     is False for Hermes' own control-plane commands (``_host_local``)."""
@@ -1362,21 +1362,30 @@ def _run_foreground(
 
     for retry_count in range(max_retries + 1):
         try:
-            command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
-                mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
-                env=env,
-            )
-            # bounded_capture: model-facing output keeps a head/tail window
-            # while streaming so a verbose command can't OOM the gateway;
-            # internal env.execute() consumers stay unbounded.
-            result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
-            )
+            if prepared_launch is not None:
+                command_cwd = prepared_launch.cwd
+                result = env.execute_prepared(
+                    prepared_launch, bounded_capture=True,
+                    **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                                    task_id=task_id, session_key=session_key))
+            else:
+                command_cwd = _resolve_command_cwd(
+                    workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                    mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
+                    env=env,
+                )
+                # bounded_capture: model-facing output keeps a head/tail window
+                # while streaming so a verbose command can't OOM the gateway;
+                # internal env.execute() consumers stay unbounded.
+                result = env.execute(
+                    command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                    **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                                    task_id=task_id, session_key=session_key),
+                )
             break
         except Exception as e:
+            if prepared_launch is not None:
+                return _error_json("Prepared local execution failed; command was not replayed.")
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
             if "timeout" in str(e).lower():
@@ -1393,10 +1402,13 @@ def _run_foreground(
             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
 
     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
+        from tools.terminal_tool_result import environment_recreated_note, _STATE_NOT_PERSISTED_NOTE
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
             "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
+            **({"environment_recreated": environment_recreated_note(result["environment_recreated"])} if result.get("environment_recreated") else {}),
+            **({"state_not_persisted": _STATE_NOT_PERSISTED_NOTE} if result.get("state_not_persisted") else {}),
         }, ensure_ascii=False)
     if metered:
         record_terminal_outcome(command, env_type, result)
@@ -1415,7 +1427,7 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, background: bool = False, prepared_launch=None,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
@@ -1423,7 +1435,8 @@ def _pre_exec_block(
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
     blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key, background=background,
+        **({"prepared_launch": prepared_launch} if prepared_launch is not None else {}),
     )
     if blocked:
         raise _Rejected(blocked)
@@ -1508,6 +1521,8 @@ def terminal_tool(
     """
     from hermes_cli.observability.shared_metrics_loop import record_terminal_backend as _metered
     plan = None
+    prepared_launch = None
+    guard_cancelled = threading.Event()
     try:
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
@@ -1543,18 +1558,35 @@ def terminal_tool(
             # The guard chain runs on the deadline worker; keep it answerable to /stop
             # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
             guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+            from tools.environments.local import LocalEnvironment, _IS_WINDOWS
+            prepare_local = env_type == "local" and isinstance(env, LocalEnvironment) and not _IS_WINDOWS
+            if prepare_local:
+                guard_timeout = plan.effective_timeout
+            def prepare_and_guard():
+                nonlocal prepared_launch, command
+                if prepare_local:
+                    launch_cwd = _resolve_command_cwd(
+                        workdir=workdir, default_cwd=cwd, session_key=session_key,
+                        env_type=env_type, env=env)
+                    prepared_launch = env.prepare_local_launch(
+                        command, launch_cwd, timeout=plan.effective_timeout,
+                        background=background or plan.promoted_from_foreground_timeout is not None)
+                    if guard_cancelled.is_set():
+                        prepared_launch.close()
+                        raise RuntimeError("Local preparation deadline expired; command was not started")
+                    command = prepared_launch.command
+                _pre_exec_block(
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    background=background or plan.promoted_from_foreground_timeout is not None,
+                    **({"prepared_launch": prepared_launch} if prepared_launch is not None else {}))
             _acting_token = acting_for_tid.set(threading.current_thread().ident)
             try:
                 bounded_guard = run_bounded_sync(
-                    lambda: _pre_exec_block(
-                        command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
-                    ),
-                    guard_timeout,
-                    label="terminal.pre-exec-guard",
-                )
+                    prepare_and_guard, guard_timeout, label="terminal.pre-exec-guard")
             finally:
                 acting_for_tid.reset(_acting_token)
             if bounded_guard.timed_out:
+                guard_cancelled.set()
                 raise _Rejected(_error_json(
                     f"Terminal pre-execution guard did not finish within {guard_timeout}s "
                     "(process-identity probe wedged); the command was not run. Retry the call.",
@@ -1581,6 +1613,7 @@ def terminal_tool(
                     heartbeat_seconds=heartbeat,
                     persist_on_release=persist_on_release,
                     auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
+                    **({"prepared_launch": prepared_launch} if prepared_launch is not None else {}),
                 )
                 if plan.promoted_from_foreground_timeout is not None:
                     result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
@@ -1589,7 +1622,7 @@ def terminal_tool(
                 command, env, plan,
                 task_id=task_id, session_id=session_id, session_key=session_key,
                 workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
+                metered=not _host_local, prepared_launch=prepared_launch,
             ))
     except _Rejected as r:
         return r.result_json
@@ -1597,6 +1630,13 @@ def terminal_tool(
         return _metered(None if _host_local else plan, _degraded_result(e, task_id), error_class="tool_error")
     except Exception as e:
         return _metered(None if _host_local else plan, _fatal_error_json(e), error_class="exception")
+    finally:
+        guard_cancelled.set()
+        if prepared_launch is not None:
+            if not prepared_launch._lifetime.consumed:
+                prepared_launch.close()
+            else:
+                prepared_launch.close_if_finished()
 
 
 def check_terminal_requirements() -> bool:

@@ -1,11 +1,77 @@
 """Which local background jobs die with their owner, for ProcessRegistry (process_identity layer 4)."""
 
+from __future__ import annotations
+
 import subprocess
+import logging
+import os
 import threading
 from contextlib import suppress
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from hermes_cli.process_identity import own_process_groups, release_process_groups, spawn_owned
+if TYPE_CHECKING:
+    from tools.process_registry import ProcessSession
+
+from hermes_cli.process_identity import (
+    own_process_groups,
+    release_process_groups,
+    spawn_owned,
+)
+
+logger = logging.getLogger("tools.process_registry")
+
+
+def refuse_pty_replay(registry, session):
+    """Reap a returned PTY or retain its existing registry ownership, then refuse replay."""
+    from tools.process_registry import _stop_systemd_unit
+
+    pty = session._pty
+    pid = session.pid
+    # psutil.Process(None) targets this process; incomplete identities must stay owned.
+    usable_identity = (
+        pty is not None and type(pid) is int and pid > 0 and pid != os.getpid()
+        and pid == pty.pid and session.host_start_time is not None
+    )
+    try:
+        try:
+            # Keep the only child handle reachable even if termination or close fails.
+            with registry._lock:
+                registry._running[session.id] = session
+            terminated = False
+            try:
+                if usable_identity:
+                    registry._terminate_host_pid(pid, session.host_start_time)
+                    terminated = True
+            except Exception:
+                logger.exception(
+                    "PTY startup cleanup could not terminate the process tree"
+                )
+        finally:
+            closed = False
+            try:
+                if pty is not None:
+                    pty.close(force=True)
+                    closed = True
+            except Exception:
+                logger.exception("PTY startup cleanup could not close the child")
+        scope_reaped = not session.systemd_unit
+        if session.systemd_unit and usable_identity:
+            scope_reaped = _stop_systemd_unit(session.systemd_unit)
+            if scope_reaped:
+                session.systemd_unit = ""
+        try:
+            reaped = pty is not None and not pty.isalive()
+        except Exception:
+            logger.exception("PTY startup cleanup could not determine child exit")
+            reaped = False
+        if terminated and closed and reaped and scope_reaped:
+            registry._release_job_group(session)
+            registry._release_finished_handles(session)
+            with registry._lock:
+                registry._running.pop(session.id, None)
+        registry._write_checkpoint()
+    finally:
+        raise RuntimeError("PTY child started; refusing duplicate execution") from None
 
 
 class ProcessOwnershipMixin:
@@ -35,6 +101,31 @@ class ProcessOwnershipMixin:
 
         return not (_IS_WINDOWS or persist_on_release or self._jobs_outlive_host
                     or is_worker_process() or _is_supervised_gateway_process())
+
+    @staticmethod
+    def _spawn_env(env_vars: dict) -> dict:
+        """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress."""
+        from tools.process_registry import _terminal_env, _sanitize_subprocess_env
+        from agent.session_client_env import toolchain_environ
+        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
+        env["PYTHONUNBUFFERED"] = "1"
+        return env
+
+    def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:
+        """Register before the reader can publish completion, even for an exited child."""
+        from contextvars import copy_context
+
+        # Reader completion must retain the producer's multiplex profile scope.
+        reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
+                                  daemon=True, name=reader_name)
+        session._reader_thread = reader
+        with self._lock:
+            self._prune_if_needed()
+            # Completion takes this lock too. Starting here also leaves no
+            # ghost entry if the interpreter cannot start another thread.
+            reader.start()
+            self._running[session.id] = session
+        self._write_checkpoint()
 
     def _spawn_job(self, session: Any, argv: list[str], persist_on_release: bool, **popen_kwargs) -> subprocess.Popen:
         """Start a pipe job in its own session, owned unless ``_owns_job`` says it must outlive us."""

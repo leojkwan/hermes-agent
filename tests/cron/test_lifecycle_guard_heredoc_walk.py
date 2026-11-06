@@ -8,6 +8,8 @@ inside the Python body failed closed as an oversized "script".
 
 import pytest
 
+from tests.cron.lifecycle_context_fixtures import known_context
+
 from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script as guard
 
 
@@ -76,9 +78,9 @@ def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, m
             command = f"cd {tmp_path} && python3 - <<'PY'\nt = open('{data}', encoding='utf-8').read()\nPY"
             assert guard(command, cwd=str(tmp_path), read_remote_script=remote) is False, data.name
         assert remote_misses  # the notes table was walked and its misses were bounded, not fatal
-        unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {minified}")
+        unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {minified}", execution_context=known_context())
         assert unsafe is True and "budget" in refusal
-        unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {db}")
+        unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {db}", execution_context=known_context())
         assert unsafe is True and "SQLite" in refusal
     finally:
         conn.close()
@@ -92,7 +94,7 @@ def test_mentioned_script_with_lifecycle_command_still_blocks(tmp_path):
     script = tmp_path / "restart.sh"
     script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
     command = f"cd {tmp_path} && python3 - <<'PY'\nimport os\nos.system('{script}')\nPY"
-    assert lifecycle_guard.scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
+    assert lifecycle_guard.scan_gateway_lifecycle(command, cwd=str(tmp_path), execution_context=known_context()) == (True, None)
 
 
 @pytest.mark.parametrize("shape", ["oversized", "sqlite"])

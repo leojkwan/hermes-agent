@@ -20,6 +20,8 @@ from cron.lifecycle_guard_lex import (
     _iter_command_segments, _shlex_tokens, _split_segments, lexical_scope,
 )
 
+from tools.environments.local_execution_context import ExecutionContext
+
 logger = logging.getLogger(__name__)
 
 
@@ -272,7 +274,7 @@ _LAUNCHCTL_LIFECYCLE_VERBS_RE = re.compile(
 _HERMES_GATEWAY_LABEL_RE = re.compile(r"(?i)\bhermes[.\-]?gateway\b")
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
-_SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+_SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o", "--rcfile", "--init-file"})
 _SHELL_COMMAND_FLAGS = {"-c", "--command"}
 _MAX_REFERENCED_SCRIPT_BYTES = 8 * 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
@@ -790,6 +792,12 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
+def _shell_command_flag(argument: str) -> bool:
+    return argument in _SHELL_COMMAND_FLAGS or bool(
+        re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", argument)
+    )
+
+
 def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
     """Yield the scripts the token at *index* executes, if any."""
     if index >= len(segment):
@@ -810,16 +818,16 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
             if argument == "--":
                 arg_index += 1
                 break
-            if argument in _SHELL_COMMAND_FLAGS:
+            if _shell_command_flag(argument):
                 break
             if argument in _SHELL_OPTIONS_WITH_VALUES:
                 arg_index += 2
                 continue
-            if argument.startswith("-"):
+            if argument.startswith(("-", "+")):
                 arg_index += 1
                 continue
             break
-        if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
+        if arg_index < len(arguments) and not _shell_command_flag(arguments[arg_index]):
             yield from _resolved_or_nothing(arguments[arg_index], cwd)
         return
 
@@ -847,20 +855,33 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` (and ``su -c`` / ``env -S``) for recursive
     scanning."""
     for segment in _iter_command_segments(command):
-        index = _command_token_index(segment)
-        if index is None:
-            continue
-        # Read at the ORIGINAL token: peeling past `su`/`env` would discard the command option.
-        for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
-            yield from _iter_option_values(segment, index, option)
-        index = _executed_command_index(segment)
-        if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
-            continue
-        arguments = segment[index + 1 :]
-        for arg_index, argument in enumerate(arguments[:-1]):
-            if argument in _SHELL_COMMAND_FLAGS:
-                yield arguments[arg_index + 1]
-                break
+        yield from _shell_payloads_from_tokens(segment)
+
+
+def _shell_payloads_from_tokens(segment) -> Iterator[str]:
+    """Consume a token view directly. Only the returned payload is new shell text."""
+    index = _command_token_index(segment)
+    if index is None:
+        return
+    # Read at the ORIGINAL token: peeling past `su`/`env` would discard the command option.
+    for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
+        yield from _iter_option_values(segment, index, option)
+    index = _executed_command_index(segment)
+    if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
+        return
+    arguments = segment[index + 1 :]
+    arg_index = 0
+    while arg_index < len(arguments) - 1:
+        argument = arguments[arg_index]
+        if _shell_command_flag(argument):
+            yield arguments[arg_index + 1]
+            break
+        if argument in _SHELL_OPTIONS_WITH_VALUES:
+            arg_index += 2
+        elif argument.startswith(("-", "+")) and argument != "--":
+            arg_index += 1
+        else:
+            break
 
 
 # --- referenced-script reading ----------------------------------------------------------------
@@ -914,14 +935,14 @@ def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
     remote_namespace: bool = False,
-    execution_options: Optional[str] = "",
+    execution_context: ExecutionContext | None = None,
     scan_stats: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Return (unsafe, named refusal); incomplete supported inspection always refuses.
 
     Legacy one-argument readers remain supported. Explicit remote namespaces never touch
     the host filesystem; metadata-dependent expansion needs a typed backend reader.
-    ``execution_options`` is the actual execution context's NODE_OPTIONS, never config.
+    ``execution_context`` contains private facts from the actual foreground owner; omitted means unknown.
     """
     from cron.lifecycle_guard_references import ReferenceScanner, ScanRefused
 
@@ -934,7 +955,7 @@ def scan_gateway_lifecycle(
                 raise ScanRefused("remote home-relative selector requires explicit execution home")
             if not budget.charge_text(command, root=True):
                 raise ScanRefused("root text budget exhausted (1 MiB / 32768 lines / 64 KiB physical line)")
-            scanner = ReferenceScanner(budget, read_remote_script, remote_namespace, execution_options)
+            scanner = ReferenceScanner(budget, read_remote_script, remote_namespace, execution_context)
             unsafe = scanner.scan(command, cwd or str(Path.cwd()), depth=0)
             return unsafe, budget.refusal if unsafe else None
     except ScanRefused as exc:
@@ -957,10 +978,11 @@ def scan_gateway_lifecycle(
 def contains_gateway_lifecycle_command_or_referenced_script(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    execution_context: ExecutionContext | None = None,
 ) -> bool:
     """Detect lifecycle/submit commands, including bounded nested scripts (see
     ``scan_gateway_lifecycle`` for the contract)."""
-    return scan_gateway_lifecycle(command, cwd=cwd, read_remote_script=read_remote_script)[0]
+    return scan_gateway_lifecycle(command, cwd=cwd, read_remote_script=read_remote_script, execution_context=execution_context)[0]
 
 
 def _scan_cron_job(prompt: str, script: Optional[str]) -> tuple[bool, Optional[str]]:

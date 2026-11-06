@@ -1246,29 +1246,46 @@ class TestLifecycleGuardModule:
         )
         assert result is True
 
-    def test_guard_is_total_against_adversarial_inputs(self, monkeypatch):
-        """The public guard is a total function: no input may raise. Covers
-        the residual class beyond the four named sites — including
-        ``expanduser`` RuntimeError when HOME is unset under launchd."""
+    def test_guard_is_total_against_adversarial_inputs(self, monkeypatch, tmp_path):
+        """Unresolved executable routing refuses; rejected path tokens stay clean.
+
+        Both public entry points remain total, including failed home expansion.
+        """
+        from pathlib import Path
+
         from cron.lifecycle_guard import (
             contains_gateway_lifecycle_command_or_referenced_script,
+            scan_gateway_lifecycle,
         )
 
+        def expand_without_home(path):
+            if str(path).startswith("~"):
+                raise RuntimeError("Could not determine home directory")
+            return path
+
         monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(Path, "expanduser", expand_without_home)
+        (tmp_path / "clean.sh").write_text("echo okay\n", encoding="utf-8")
         adversarial = [
-            "'~\x00' run",
-            "bash '~user\x00/x.sh'",
-            "source /tmp/e\x00vil.sh",
-            "sh ~/scripts/anything.sh",  # HOME unset → RuntimeError pre-fix
-            ". '\x00\x00\x00'",
-            "bash " + "A" * 5000 + ".sh",  # over-long path → OSError
+            ("'~\x00' run", "unresolved execution routing"),
+            ("bash '~user\x00/x.sh'", None),
+            ("source /tmp/e\x00vil.sh", None),
+            ("sh ~/scripts/anything.sh", None),
+            (". '\x00\x00\x00'", None),
+            ("bash " + "A" * 5000 + ".sh", None),
+            ("bash clean.sh", None),
+            ("bash missing.sh", None),
         ]
-        for command in adversarial:
-            # Must return a bool, never raise.
+        for command, refusal in adversarial:
+            expected = refusal is not None
             verdict = contains_gateway_lifecycle_command_or_referenced_script(
-                command, cwd="/tmp"
+                command, cwd=str(tmp_path)
             )
-            assert verdict is False
+            assert verdict is expected, repr(command)
+            assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (
+                expected,
+                refusal,
+            )
 
     def test_walk_crash_refuses_incomplete_inspection(self, monkeypatch):
         """A supported walk failure is a named refusal, never a silent clean result."""

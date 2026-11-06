@@ -269,6 +269,8 @@ def gateway_lifecycle_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
+    background: bool = False,
+    prepared_launch=None,
 ) -> Optional[str]:
     """Refuse gateway lifecycle commands issued from inside the supervised gateway.
 
@@ -308,14 +310,17 @@ def gateway_lifecycle_block(
             "not by switching launchctl verbs to bypass this rejection.",
             "error",
         )
-    guard_cwd_base = get_session_cwd(session_key)
-    if guard_cwd_base is None:
-        guard_cwd_base = getattr(env, "cwd", None) or cwd
-    guard_cwd = _resolve_command_cwd(
-        workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
-        mounted_host=getattr(env, "host_cwd", None),
-        env=env,
-    )
+    if prepared_launch is not None:
+        guard_cwd = prepared_launch.cwd
+    else:
+        guard_cwd_base = get_session_cwd(session_key)
+        if guard_cwd_base is None:
+            guard_cwd_base = getattr(env, "cwd", None) or cwd
+        guard_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
+            mounted_host=getattr(env, "host_cwd", None),
+            env=env,
+        )
     effective_local = env_type == "local" and getattr(env, "env_type", None) == "local"
     unsafe, refusal = scan_gateway_lifecycle(
         command,
@@ -324,7 +329,8 @@ def gateway_lifecycle_block(
             None if effective_local else _BackendSourceReader(env, guard_cwd)
         ),
         remote_namespace=not effective_local,
-        execution_options=getattr(env, "lifecycle_node_options", None),
+        execution_context=(prepared_launch.context if prepared_launch is not None else env.execution_context() if effective_local and not background
+                           and callable(getattr(env, "execution_context", None)) else None),
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,

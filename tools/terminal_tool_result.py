@@ -43,6 +43,20 @@ _SIGNAL_EXIT_NOTES: dict[int, str] = {
     25: "SIGXFSZ (file size limit exceeded)",
 }
 
+_LOCAL_RECREATED_NOTE = (
+    "The saved local Bash environment was recreated before this command. "
+    "Earlier session exports, functions and aliases may have been reset. "
+    "Check saved shell state before relying on earlier commands."
+)
+_STATE_NOT_PERSISTED_NOTE = (
+    "Another foreground process still owns session publication. "
+    "This command ran from saved state; its exports will not persist."
+)
+
+
+def environment_recreated_note(value):
+    return _LOCAL_RECREATED_NOTE if value == "local_snapshot" else _ENV_RECREATED_NOTE
+
 
 def _interpret_signal_exit(exit_code: int) -> str | None:
     """Note for a signal-termination exit code, or None. Negative codes are
@@ -261,7 +275,8 @@ def finalize_foreground_result(
     # metadata is present only when output overflowed the capture window.
     optional_fields: list[tuple[str, Any]] = [
         ("cwd", changed_cwd),
-        ("environment_recreated", _ENV_RECREATED_NOTE if result.get("environment_recreated") else None),
+        ("state_not_persisted", _STATE_NOT_PERSISTED_NOTE if result.get("state_not_persisted") else None),
+        ("environment_recreated", environment_recreated_note(result["environment_recreated"]) if result.get("environment_recreated") else None),
         *_redact_spill_file(result.get("full_output_path"), result.get("output_total_chars"), command),
         ("verification_evidence", _verification_evidence(
             command, command_cwd, session_id or task_id or effective_task_id or "default",

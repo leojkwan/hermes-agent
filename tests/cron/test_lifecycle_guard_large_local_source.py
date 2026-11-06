@@ -2,19 +2,21 @@
 
 import pytest
 
+from tests.cron.lifecycle_context_fixtures import known_context
+
 from cron import lifecycle_guard, lifecycle_guard_lex
 
 
 def test_twenty_thousand_line_node_source_is_scanned(tmp_path):
     script = tmp_path / "public.cjs"
     script.write_text("#!/usr/bin/env node\n" + "const value = 1;\n" * 20_000)
-    assert lifecycle_guard.scan_gateway_lifecycle("./public.cjs", cwd=str(tmp_path)) == (False, None)
+    assert lifecycle_guard.scan_gateway_lifecycle("./public.cjs", cwd=str(tmp_path), execution_context=known_context()) == (False, None)
     script.write_text(script.read_text() + "hermes gateway restart\n")
-    assert lifecycle_guard.scan_gateway_lifecycle("./public.cjs", cwd=str(tmp_path)) == (True, None)
+    assert lifecycle_guard.scan_gateway_lifecycle("./public.cjs", cwd=str(tmp_path), execution_context=known_context()) == (True, None)
 
 
 def test_default_line_boundary_and_plus_one_before_shlex(monkeypatch):
-    assert lifecycle_guard.scan_gateway_lifecycle("\n" * 32767) == (False, None)
+    assert lifecycle_guard.scan_gateway_lifecycle("\n" * 32767, execution_context=known_context()) == (False, None)
     calls = []
 
     def forbidden(*args, **kwargs):
@@ -22,7 +24,7 @@ def test_default_line_boundary_and_plus_one_before_shlex(monkeypatch):
         raise AssertionError("over-budget root reached shlex")
 
     monkeypatch.setattr(lifecycle_guard_lex, "_lex", forbidden)
-    unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle("\n" * 32768)
+    unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle("\n" * 32768, execution_context=known_context())
     assert unsafe and "budget" in refusal
     assert calls == []
 
@@ -36,15 +38,15 @@ def test_node_source_retains_nested_lifecycle_detection(tmp_path, callee):
         (tmp_path / "module.cjs").write_text("require('child_process').execSync('hermes gateway restart');\n")
         source = "require('./module.cjs');\n"
     (tmp_path / "app.cjs").write_text(source)
-    assert lifecycle_guard.scan_gateway_lifecycle("./app.cjs", cwd=str(tmp_path)) == (True, None)
+    assert lifecycle_guard.scan_gateway_lifecycle("./app.cjs", cwd=str(tmp_path), execution_context=known_context()) == (True, None)
 
 
 @pytest.mark.parametrize("prefix", [b"MZ=1\n", b"!<arch>\n", b"PK\x03\x04\n", b"\x1f\x8b\n"])
 def test_magic_prefixed_text_remains_scannable(tmp_path, prefix):
     (tmp_path / "restart").write_bytes(prefix + b"hermes gateway restart\n")
-    assert lifecycle_guard.scan_gateway_lifecycle("./restart", cwd=str(tmp_path)) == (True, None)
+    assert lifecycle_guard.scan_gateway_lifecycle("./restart", cwd=str(tmp_path), execution_context=known_context()) == (True, None)
 
 
 def test_shebang_wins_over_embedded_magic_and_nul(tmp_path):
     (tmp_path / "restart").write_bytes(b"#!/bin/sh\nMZ\x00\nhermes gateway restart\n")
-    assert lifecycle_guard.scan_gateway_lifecycle("./restart", cwd=str(tmp_path)) == (True, None)
+    assert lifecycle_guard.scan_gateway_lifecycle("./restart", cwd=str(tmp_path), execution_context=known_context()) == (True, None)
