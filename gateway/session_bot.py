@@ -551,8 +551,12 @@ def peer_wait_admission(authority, record):
     return None, False
 
 
+def bot_request_identity(key):
+    return 'bot:' + key
+
+
 def _retry_identity(key):
-    return 'bot:' + key + ':retry'
+    return bot_request_identity(key) + ':retry'
 
 
 def _retry_eligible(authority, record):
@@ -957,7 +961,7 @@ async def _admit(authority, actor, home, root, key, message, ref, live, entry, a
     notification = automation_notification_metadata({'notification_category': notification_category})
     path = root / f'{key}.json'
     event = MessageEvent(text=message, source=live.source, internal=True,
-        message_id='bot:' + key, metadata={'gateway_session_key': live.route,
+        message_id=bot_request_identity(key), metadata={'gateway_session_key': live.route,
                                          'gateway_session_id': entry.session_id})
     event.metadata.update(notification)
     if author is not None:
@@ -977,7 +981,7 @@ async def _admit(authority, actor, home, root, key, message, ref, live, entry, a
             return None
         raise RuntimeStoreError('admission_conflict')
     try:
-        receipt = await authority.admit_automation(authority.runner._adapter_for_source(live.source), event, 'bot:' + key)
+        receipt = await authority.admit_automation(authority.runner._adapter_for_source(live.source), event, bot_request_identity(key))
     except RuntimeStoreError as exc:
         if _admission_at(authority, ref.session_id, 'bot:' + key) is not None:
             raise  # committed after all: the pin stays the explicit unknown record
