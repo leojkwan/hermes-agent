@@ -548,11 +548,11 @@ def request_serve_profile_hot(home: Path, name: str) -> Optional[dict[str, Any]]
 
 
 def migrate_gateway_profile_identity(home: Path, old_name: str, new_name: str, *,
-                                     timeout: float = 8.0) -> Optional[dict[str, Any]]:
+                                     timeout: float = 35.0) -> Optional[dict[str, Any]]:
     """Ask the multiplexer serving ``home`` to rekey a renamed profile's in-memory + on-disk routing
     from ``agent:<old>:`` to ``agent:<new>:`` now. Returns its ``{"rekeyed": N, ...}`` answer, or None
-    when no gateway answers / the gateway predates the verb — the CLI's durable DB rewrite still lands,
-    and a restart reconciles the in-memory copy."""
+    when the gateway does not answer. The default wait lets the owner return its pending
+    result after 30 seconds without cancelling the migration."""
     return query_gateway_control(home, "migrate-profile-identity",
                                  params={"old": old_name, "new": new_name}, timeout=timeout)
 

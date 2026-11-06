@@ -190,14 +190,16 @@ async def test_config_reference_moves_metadata_without_reading_or_changing_secre
     receipt['policy'] = asdict(replace(policy, config_secret_ref=encoded))
     save_receipt(authority.db, receipt)
     monkeypatch.setattr(run, '_load_gateway_config', lambda *args: pytest.fail('migration read credentials'))
-    authority.db.rekey_profile_state('watchdog', 'studio')
-    moved = local_receipt(authority.db, ref.session_id)
-    before, after = json.loads(encoded[len(PREFIX):]), json.loads(moved['policy']['config_secret_ref'][len(PREFIX):])
-    assert {k: v for k, v in before.items() if k not in {'home', 'profile'}} == {
-        k: v for k, v in after.items() if k not in {'home', 'profile'}}
     authority.db.close()
     renamed = home.with_name('studio')
     home.rename(renamed)
+    db = SessionDB(renamed / 'state.db')
+    db.rekey_profile_state('watchdog', 'studio')
+    moved = local_receipt(db, ref.session_id)
+    before, after = json.loads(encoded[len(PREFIX):]), json.loads(moved['policy']['config_secret_ref'][len(PREFIX):])
+    assert {k: v for k, v in before.items() if k not in {'home', 'profile'}} == {
+        k: v for k, v in after.items() if k not in {'home', 'profile'}}
+    db.close()
     authority, _ = await owner(renamed, root)
     config = {'model': {'default': 'fixture', 'provider': 'custom', 'base_url': 'http://127.0.0.1:99/v1', 'api_key': 'synthetic-key'}}
     monkeypatch.setattr(run, '_load_gateway_config', lambda *args: config)
@@ -527,3 +529,89 @@ async def test_partial_cross_store_failure_blocks_startup_until_same_migration_f
     assert not authority.db._read_one('SELECT value FROM state_meta WHERE key=?', (PENDING,))
     authority.db.close()
     routing.close()
+
+
+@pytest.mark.asyncio
+async def test_post_rename_compression_and_reset_keep_creation_identity(tmp_path, monkeypatch):
+    from gateway.session_local_recovery import local_history
+    authority, _, ref, home, root = await scenario(tmp_path, monkeypatch)
+    authority.db.close()
+    renamed = home.with_name('studio')
+    home.rename(renamed)
+    db = SessionDB(renamed / 'state.db')
+    db.rekey_profile_state('watchdog', 'studio')
+    db.close()
+    authority, actor = await owner(renamed, root)
+    restore_local_session(authority, ref.session_id)
+    db = authority.db
+    assert db.try_acquire_compression_lock(ref.session_id, 'fixture')
+    try:
+        db.publish_compression_child(parent_session_id=ref.session_id, child_session_id='compressed', source='gui',
+                                     messages=[{'role': 'user', 'content': 'summary'}], compression_lock_holder='fixture')
+    finally:
+        db.release_compression_lock(ref.session_id, 'fixture')
+    restore_local_session(authority, ref.session_id)
+    entry = authority.runner.session_store.reset_session(local_receipt(db, ref.session_id)['route'])
+    db.append_message(entry.session_id, 'user', 'after renamed reset')
+    receipt = local_receipt(db, ref.session_id)
+    assert receipt['creation_profile_id'] == str(home)
+    assert receipt['lineage'] == [ref.session_id, 'compressed', entry.session_id]
+    db.close()
+    authority, actor = await owner(renamed, root)
+    restored = restore_local_session(authority, ref.session_id)
+    assert local_history(authority, restored)[0]['content'] == 'after renamed reset'
+    params = dict(request_id='bot', source='gui', cwd=str(tmp_path), model='fixture', toolsets=[])
+    assert create_local_session(authority, actor, params).session_id == ref.session_id
+    assert len(authority.db._read_all('SELECT id FROM sessions')) == 3
+    authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_adoption_rename_does_not_alias_a_new_creation(tmp_path, monkeypatch):
+    from gateway.session_local_migration import adopt_legacy_session
+    from gateway.session_local_migration import bind_native_transport
+    authority, actor, _, home, root = await scenario(tmp_path, monkeypatch)
+    authority.db.create_session('legacy-chat', 'gui', model='fixture', cwd=str(tmp_path))
+    authority.db.append_message('legacy-chat', 'user', 'retained legacy history')
+    bind_native_transport(authority, actor, {'provider': 'local', 'profile_id': str(home), 'instance_id': 'fixture'})
+    legacy = adopt_legacy_session(authority, actor, authority.db.get_session('legacy-chat'))
+    assert legacy.session_id == 'legacy-chat'
+    authority.db.close()
+    renamed = home.with_name('studio')
+    home.rename(renamed)
+    db = SessionDB(renamed / 'state.db')
+    db.rekey_profile_state('watchdog', 'studio')
+    db.close()
+    authority, actor = await owner(renamed, root)
+    assert restore_local_session(authority, legacy.session_id).session_id == legacy.session_id
+    receipt = local_receipt(authority.db, legacy.session_id)
+    params = dict(json.loads(receipt['policy']['request_json']), request_id=receipt['request_id'])
+    created = create_local_session(authority, actor, params)
+    assert created.session_id != legacy.session_id
+    assert create_local_session(authority, actor, params).session_id == created.session_id
+    assert authority.db.get_messages_as_conversation(legacy.session_id)[0]['content'] == 'retained legacy history'
+    authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_mailbox_resume_clears_valid_noncanonical_journal(tmp_path, monkeypatch):
+    from tools import bot_live_delivery as mailbox
+    from gateway.session_profile_mailbox import JOURNAL
+    authority, actor, ref, home, _ = await scenario(tmp_path, monkeypatch)
+    key = 'd' * 32
+    record = dict(delivery_id=key, admission_id='retired', status='settled', message='once', reply='done',
+                  profile_home=str(home), session_id=ref.session_id, principal_id=actor.subject)
+    with mailbox._locked(home) as directory:
+        path = directory / (key + '.json')
+        mailbox._write(path, record)
+    write = mailbox._write
+    monkeypatch.setattr(mailbox, '_write', lambda *args: (_ for _ in ()).throw(OSError('interrupted write')))
+    with pytest.raises(OSError):
+        authority.db.rekey_profile_state('watchdog', 'studio')
+    raw = authority.db._read_one('SELECT value FROM state_meta WHERE key=?', (JOURNAL,))[0]
+    authority.db._write_sql('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(json.loads(raw), indent=2), JOURNAL))
+    monkeypatch.setattr(mailbox, '_write', write)
+    authority.db.rekey_profile_state('watchdog', 'studio')
+    assert authority.db._read_one('SELECT value FROM state_meta WHERE key=?', (JOURNAL,)) is None
+    assert mailbox._read(path) == {**record, 'profile_home': str(home.with_name('studio'))}
+    authority.db.close()

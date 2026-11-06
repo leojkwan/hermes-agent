@@ -44,6 +44,8 @@ def resolve_creation_id(db, profile_id, principal_id, request_id):
 
 def bind_creation_retry(conn, receipt):
     from hermes_state_local import POLICY_PREFIX
+    if 'legacy_session_id' in receipt:
+        return
     sid = receipt['session_id']
     candidate = local_identity(receipt['profile_id'], receipt['principal_id'], receipt['request_id'])
     if candidate != sid and (conn.execute('SELECT 1 FROM sessions WHERE id=?', (candidate,)).fetchone()

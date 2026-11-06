@@ -126,3 +126,32 @@ def test_retry_after_partial_rekey_keeps_checkpoints_taken_under_new_name(profil
         assert cm._list_project_refs(store, str(new_workdir)) == [cm._ref_name(cm._project_hash(str(new_workdir)))]
     finally:
         reset_hermes_home_override(token)
+
+
+def test_live_pending_migration_finishes_checkpoints_and_names_safe_retry(profile_env, monkeypatch, capsys):
+    from hermes_cli import profile_identity
+    monkeypatch.setattr('gateway.control_socket.migrate_gateway_profile_identity',
+                        lambda *args: {'ok': False, 'pending': True})
+    migrated = []
+    monkeypatch.setattr(profile_identity, '_migrate_checkpoint_identity', lambda *args: migrated.append(args) or True)
+    assert profile_identity._migrate_profile_identity('oldname', 'newname', True) is False
+    assert migrated == [('oldname', 'newname')]
+    warning = capsys.readouterr().err
+    assert 'still running' in warning
+    assert 'hermes profile migrate-identity oldname newname' in warning
+    assert 'Restart' not in warning
+
+
+def test_migration_control_wait_allows_the_owner_to_report_pending(profile_env, monkeypatch):
+    from gateway import control_socket
+    from gateway.profile_identity_control import CONTROL_WAIT_SECONDS
+    calls = []
+
+    def query(home, verb, *, params, timeout):
+        calls.append((verb, params, timeout))
+        return {'ok': False, 'pending': True}
+
+    monkeypatch.setattr(control_socket, 'query_gateway_control', query)
+    assert control_socket.migrate_gateway_profile_identity(profile_env, 'oldname', 'newname')['pending']
+    assert calls[0][0:2] == ('migrate-profile-identity', {'old': 'oldname', 'new': 'newname'})
+    assert calls[0][2] > CONTROL_WAIT_SECONDS
