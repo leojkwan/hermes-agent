@@ -10,9 +10,10 @@
 import { atom } from '@hermes/plugin-sdk'
 
 import { $selectedBot } from './bot-state'
+import type { CanonicalGroupBinding } from './canonical-groups'
 import { $botMeta, $lastRoster, botSelectionKey, isDefaultBot } from './data'
 import type { BotMetaSnapshot } from './data'
-import { botRosterMeta } from './routing'
+import { botRosterMeta, botRouteKey } from './routing'
 import type { RosterRow } from './types'
 
 // ── hidden bots (right-click → Hide Bot) ────────────────────────────────────
@@ -28,6 +29,12 @@ export function isBotHidden(bot: RosterRow, metaByName: BotMetaSnapshot) {
 
 export function isBotPinned(bot: RosterRow, metaByName: BotMetaSnapshot) {
   return Boolean(botRosterMeta(bot, metaByName)?.pinned)
+}
+
+export function isRoomHidden(binding: CanonicalGroupBinding, meta: BotMetaSnapshot): boolean {
+  const rooms = meta[botRouteKey(binding)]?.hiddenRooms
+
+  return Array.isArray(rooms) && rooms.includes(binding.roomId)
 }
 
 /** Hiding the selected bot re-homes the selection to the next visible owner. */

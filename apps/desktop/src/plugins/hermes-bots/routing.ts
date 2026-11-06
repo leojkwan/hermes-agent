@@ -11,7 +11,7 @@ import { host } from '@hermes/plugin-sdk'
 
 import type { BotMeta, GroupMessageAuthor, ProfileRoute, RosterRow } from './types'
 
-export function botRouteKey(route: ProfileRoute): string {
+export function botRouteKey(route: Pick<ProfileRoute, 'connectionId' | 'profile'>): string {
   return `${route.connectionId}::${route.profile}`
 }
 

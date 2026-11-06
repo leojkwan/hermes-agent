@@ -287,6 +287,10 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
         ...server
       }
 
+      // Room visibility is this renderer's choice, never server profile metadata.
+      if (mine.hiddenRooms) {merged.hiddenRooms = mine.hiddenRooms}
+      else {delete merged.hiddenRooms}
+
       // The name is the backend's: a local title it does not carry is stale or
       // another bot's (a restored record, a legacy name-keyed one), never this
       // bot's identity.
@@ -392,7 +396,7 @@ export async function duplicateBot(source: RosterRow, roster: RosterRow[]) {
   const meta = $botMeta.get()[botMetaKey(bot)]
 
   if (meta) {
-    const { chat, created, ...look } = meta
+    const { chat, created, hiddenRooms, ...look } = meta
     await saveBotMeta(
       {
         ...bot,

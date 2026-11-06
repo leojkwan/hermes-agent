@@ -8,6 +8,7 @@
 
 import { atom, host, queryClient, useQuery, useValue } from '@hermes/plugin-sdk'
 
+import type { CanonicalGroupBinding } from './canonical-groups'
 import { botsText } from './i18n'
 import { displayName } from './labels'
 import {
@@ -166,12 +167,12 @@ export function clearBotAttention(key: string) {
   $botAttention.set(next)
 }
 
-/** The persisted record adds two keys the shared domain model deliberately
- *  omits: `chat`, the dead canonical-chat pointer that mergeServerMeta strips
- *  on sight, and `pet`, the extracted pet icon that stays local and is never
- *  sent to the server. */
+/** The persisted record adds the dead `chat` pointer and renderer-local
+ *  presentation fields that never belong in server profile metadata. */
 interface StoredBotMeta extends BotMeta {
   chat?: unknown
+  /** Local roster presentation only, keyed by room ID on this connection/profile. */
+  hiddenRooms?: string[]
   pet?: unknown
 }
 
@@ -385,8 +386,8 @@ async function persistBotMetaPatch(
       return null
     }
 
-    const { chat: _chat, ...base } = server.meta
-    const { image: _image, pet: _pet, ...fields } = rebase ? rebase(server.meta) : patch
+    const { chat: _chat, hiddenRooms: _serverHiddenRooms, ...base } = server.meta
+    const { image: _image, pet: _pet, hiddenRooms: _hiddenRooms, ...fields } = rebase ? rebase(server.meta) : patch
 
     const params: Record<string, unknown> = {
       name,
@@ -449,7 +450,7 @@ async function settleServerOutcome(
 
 /** Rewrite this window's copy of one bot's metadata (and its plugin storage) without touching
  *  the bot's backend: the local half of a save, and how a caller mirrors a server value it read. */
-function writeLocalBotMeta(key: string, route: null | ProfileRoute, patch: StoredBotMeta): Promise<void> {
+function writeLocalBotMeta(key: string, scoped: boolean, patch: StoredBotMeta): Promise<void> {
   const next = {
     ...$botMeta.get(),
     [key]: {
@@ -464,7 +465,7 @@ function writeLocalBotMeta(key: string, route: null | ProfileRoute, patch: Store
   // Local plugin storage: instant, and the fallback for older gateways.
   try {
     const persisted =
-      route || botMetaV2Active
+      scoped || botMetaV2Active
         ? commitBotMetaV2(getPluginCtx()?.storage, next)
         : Promise.resolve(getPluginCtx()?.storage?.set?.(BOT_META_V1_KEY, next))
 
@@ -482,7 +483,19 @@ function writeLocalBotMeta(key: string, route: null | ProfileRoute, patch: Store
 export function setLocalBotMeta(owner: RosterRow | string, patch: StoredBotMeta): Promise<void> {
   const { key, route } = botOwner(owner)
 
-  return writeLocalBotMeta(key, route, patch)
+  return writeLocalBotMeta(key, Boolean(route), patch)
+}
+
+/** Reuse local display metadata; hiding never writes to a profile or room. */
+export function setLocalRoomHidden(binding: CanonicalGroupBinding, hidden: boolean): Promise<void> {
+  const key = botRouteKey(binding)
+  const stored = $botMeta.get()[key]?.hiddenRooms
+  const current = Array.isArray(stored) ? stored.filter(id => typeof id === 'string') : []
+  const hiddenRooms = current.filter(id => id !== binding.roomId)
+
+  if (hidden) {hiddenRooms.push(binding.roomId)}
+
+  return writeLocalBotMeta(key, true, { hiddenRooms })
 }
 
 /** The bot's `hermes-bots` metadata as its own backend holds it now; null when it does not answer. */
@@ -508,7 +521,7 @@ export async function saveBotMeta(
 ): Promise<BotMetaSaveResult> {
   const { bot, key, name, route } = botOwner(owner)
   const prevMeta = $botMeta.get()[key] || {}
-  const localPersistence = writeLocalBotMeta(key, route, patch)
+  const localPersistence = writeLocalBotMeta(key, Boolean(route), patch)
 
   // Server-side (source of truth when supported): profile.yaml ui_meta,
   // namespaced under this plugin's id — every client machine sees the same
