@@ -135,7 +135,7 @@ export function prepareNodeDependencies({ source, workspaces, env = process.env,
       && !/^p?npm_config_(cache|cache_dir|store_dir|state_dir|offline|prefer_offline)$/i.test(key))
       .map(([key, value]) => [key.toLowerCase(), value]).sort(),
   }))
-  const files = ['pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', ...projects.map(path => join(path, 'package.json'))].sort()
+  const files = ['pnpm-lock.yaml', 'pnpm-workspace.yaml', '.pnpmfile.cjs', '.npmrc', ...projects.map(path => join(path, 'package.json'))].sort()
   for (const file of files) {
     inputs.update(file).update('\0').update(existsSync(join(source, file)) ? readFileSync(join(source, file)) : '<missing>').update('\0')
   }

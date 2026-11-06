@@ -233,7 +233,7 @@ test('pnpm configuration name casing does not invalidate a completed install', (
   expect(installs(source)).toBe(2)
 }, 30000)
 
-test('the receipt is keyed on the lockfile and the workspace settings', () => {
+test('the receipt is keyed on the lockfile, workspace settings and package hook', () => {
   const { source, env } = fixture()
   const options = { source, workspaces: ['web'], reuse: true, env }
   prepareNodeDependencies(options)
@@ -245,6 +245,8 @@ test('the receipt is keyed on the lockfile and the workspace settings', () => {
   expect(() => prepareNodeDependencies({ ...options, install: false })).toThrow(/disabled/)
   prepareNodeDependencies(options)
   expect(installs(source)).toBe(3)
+  writeFileSync(join(source, '.pnpmfile.cjs'), 'module.exports = {}\n')
+  expect(() => prepareNodeDependencies({ ...options, install: false })).toThrow(/disabled/)
 }, 30000)
 
 test('an npm-installed tree is removed before the first pnpm install', () => {

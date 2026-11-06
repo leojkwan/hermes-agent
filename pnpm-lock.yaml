@@ -25,6 +25,8 @@ overrides:
   vitest: 4.1.12
   '@vitest/mocker': 4.1.12
 
+pnpmfileChecksum: sha256-Zk58+xUiMUoUz0AThP6tY4E7ZbOHo2lQWB+kmSTuiUE=
+
 importers:
 
   .:
@@ -4152,6 +4154,7 @@ packages:
   get-windows@9.3.0:
     resolution: {integrity: sha512-DrOfQSmIcsFax28FfSUjbLTfeOkAG7yeh6NCb/9zzRkDuClXaqYqHuQBPUqcqd1uYS70ygYERSooacMAwvbyVw==}
     engines: {node: '>=18.18'}
+    os: [darwin, linux, win32]
 
   glob-parent@6.0.2:
     resolution: {integrity: sha512-XxwI8EOhVQgWp6iDL+3b0r86f4d6AX6zSU55HfB4ydCEuXLXc5FcYeOu+nnGftS4TEju/11rt4KJPTMgbfmv4A==}
