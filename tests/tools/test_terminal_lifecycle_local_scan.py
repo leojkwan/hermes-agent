@@ -41,6 +41,8 @@ def test_nonlocal_or_unknown_backend_retains_bounded_fallback(supervised, tmp_pa
 
     def absent(command):
         calls.append(command)
+        if "app.cjs" in command:
+            return {"returncode": 0, "output": "\n".join(f"./missing{i}" for i in range(65))}
         return {"returncode": 1, "output": ""}
 
     env = SimpleNamespace(cwd=str(tmp_path), execute=absent)
@@ -85,4 +87,23 @@ def test_local_magic_prefixed_text_helper_is_scanned_without_backend(supervised,
     (tmp_path / "restart").write_text("MZ=1\nhermes gateway restart\n")
     result = json.loads(_block(tmp_path, env, "local", "./restart"))
     assert "cannot restart, stop, or uninstall the gateway" in result["error"]
+    assert calls == []
+
+
+def test_local_node_fact_and_unknown_context_never_execute(supervised, tmp_path):
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("local preflight dispatched a backend command")
+
+    (tmp_path / "entry.cjs").write_text("const value = 1;\n")
+    (tmp_path / "helper.cjs").write_text("require('node:child_process').execSync('hermes gateway restart');\n")
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden)
+    result = json.loads(_block(tmp_path, env, "local", "node entry.cjs"))
+    assert "execution context" in result["error"]
+    assert _block(tmp_path, env, "local", "NODE_OPTIONS='' node entry.cjs") is None
+    env.lifecycle_node_options = "--require ./helper.cjs"
+    result = json.loads(_block(tmp_path, env, "local", "node entry.cjs"))
+    assert "cannot restart, stop, or uninstall" in result["error"]
     assert calls == []

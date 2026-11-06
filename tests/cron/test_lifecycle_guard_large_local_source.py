@@ -2,7 +2,7 @@
 
 import pytest
 
-from cron import lifecycle_guard
+from cron import lifecycle_guard, lifecycle_guard_lex
 
 
 def test_twenty_thousand_line_node_source_is_scanned(tmp_path):
@@ -21,7 +21,7 @@ def test_default_line_boundary_and_plus_one_before_shlex(monkeypatch):
         calls.append(args)
         raise AssertionError("over-budget root reached shlex")
 
-    monkeypatch.setattr(lifecycle_guard.shlex, "shlex", forbidden)
+    monkeypatch.setattr(lifecycle_guard_lex, "_lex", forbidden)
     unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle("\n" * 32768)
     assert unsafe and "budget" in refusal
     assert calls == []

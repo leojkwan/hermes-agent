@@ -13,7 +13,7 @@ from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_reference
 
 def _big_file(tmp_path):
     path = tmp_path / "big_blob.bin"
-    path.write_bytes(b"\0" * (2 * 1024 * 1024))
+    path.write_bytes(b"\0" * (9 * 1024 * 1024))
     return path
 
 

@@ -596,7 +596,8 @@ class TestTerminalToolGatewayLifecycleGuard:
         def explode_if_tokenized(*args, **kwargs):
             raise AssertionError("over-budget root reached shlex")
 
-        monkeypatch.setattr(lifecycle_guard.shlex, "shlex", explode_if_tokenized)
+        from cron import lifecycle_guard_lex
+        monkeypatch.setattr(lifecycle_guard_lex, "_lex", explode_if_tokenized)
 
         result = json.loads(tt.terminal_tool(command="x" * 9))
 
@@ -834,6 +835,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         script.write_text("#!/usr/bin/env bash\nprintf 'healthy\\n'\n", encoding="utf-8")
 
         class _FakeEnv:
+            env_type = "local"
             env = {}
             def execute(self, command, **kwargs):
                 calls.append(command)
@@ -1268,25 +1270,18 @@ class TestLifecycleGuardModule:
             )
             assert verdict is False
 
-    def test_walk_crash_falls_back_to_direct_scan_verdict(self, monkeypatch):
-        """If the best-effort walk itself crashes, the guard logs and falls
-        back to the direct-scan verdict instead of propagating — a guard
-        crash breaks every terminal command until gateway restart (#77780),
-        strictly worse than either verdict."""
+    def test_walk_crash_refuses_incomplete_inspection(self, monkeypatch):
+        """A supported walk failure is a named refusal, never a silent clean result."""
         import cron.lifecycle_guard as lg
+        from cron.lifecycle_guard_references import ReferenceScanner
 
-        def _boom(*args, **kwargs):
-            raise RuntimeError("sibling site nobody found yet")
+        def broken(*args, **kwargs):
+            raise RuntimeError("synthetic inspection failure")
 
-        monkeypatch.setattr(lg, "_contains_unsafe_gateway_action", _boom)
-        # Direct scan still blocks a literal lifecycle command...
-        assert lg.contains_gateway_lifecycle_command_or_referenced_script(
-            "hermes gateway restart"
-        ) is True
-        # ...and a benign command fails open instead of crashing.
-        assert lg.contains_gateway_lifecycle_command_or_referenced_script(
-            "echo hello"
-        ) is False
+        monkeypatch.setattr(ReferenceScanner, "scan", broken)
+        for command in ("hermes gateway restart", "echo hello"):
+            unsafe, refusal = lg.scan_gateway_lifecycle(command)
+            assert unsafe and "incomplete inspection" in refusal
 
     def test_cron_guard_total_when_home_unresolvable(self, monkeypatch):
         """`get_hermes_home()` falls back to Path.home(), which raises
@@ -1712,6 +1707,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         conn = connect_tracked(db)
 
         class _LocalEnv:
+            env_type = "local"
             env = {}
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
