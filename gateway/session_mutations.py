@@ -352,11 +352,16 @@ def _project_committed(authority, ref, operation, result):
         authority.runner._set_session_reasoning_override(authority.sessions[ref.session_id].route, None)
         authority.sessions[ref.session_id].pending_reasoning = None
     if operation == 'service_tier':
-        from agent.fast_mode import parse_service_tier
+        from gateway.session_policy import policy_for_source
         live = authority.sessions[ref.session_id]
-        authority.runner._set_session_service_tier_override(live.route, None, clear=True)
+        state = authority.runner._peek_session_state(live.route)
+        revision = state.conversation.service_tier_revision if state is not None else 0
+        # A retry repairs publication, but never discards a later transient choice.
+        if result['tier_control_stamp'] == [authority.epoch, revision]:
+            authority.runner._set_session_service_tier_override(live.route, None, clear=True)
         if (agent := authority.agent(ref)) is not None:
-            agent.service_tier = parse_service_tier(result['tier'])
+            policy = policy_for_source(authority.runner, live.source)
+            agent.service_tier = policy.current_service_tier(authority.runner, live.route)
     if operation in {'model', 'reasoning', 'service_tier', 'workspace', 'edit_policy'}:
         # Every viewer repaints its model, reasoning pill or workspace from the published policy,
         # as main's _emit_session_info did after the live change.

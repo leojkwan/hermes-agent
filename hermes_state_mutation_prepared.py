@@ -116,7 +116,8 @@ def service_tier_in_transaction(db, conn, session_id, payload, prepared):
     require_idle(db, conn, list({session_id, snapshot['target']}))
     snapshot, generation = _commit_policy(db, conn, session_id, prepared)
     tier = json.loads(prepared['policy']['config_json'])['agent']['service_tier']
-    return {session_id, snapshot['target']}, {'tier': tier, 'execution_generation': generation}
+    return {session_id, snapshot['target']}, {'tier': tier, 'execution_generation': generation,
+                                            'tier_control_stamp': prepared['tier_control_stamp']}
 
 
 POLICY_HANDLERS = {'model': model_in_transaction, 'reasoning': reasoning_in_transaction,
