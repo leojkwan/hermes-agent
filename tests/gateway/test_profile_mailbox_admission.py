@@ -208,6 +208,45 @@ async def test_retired_metadata_is_checked_without_claiming_payload_proof(tmp_pa
     db.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('damage', ['forged_retry_without_intent', 'retry_list', 'retry_list_with_intent',
+    'retry_null', 'retry_empty', 'payload_list', 'payload_null', 'payload_invalid_json', 'principal_blob',
+    'retired_principal_number'])
+async def test_malformed_producer_binding_has_typed_atomic_refusal(tmp_path, monkeypatch, damage):
+    from hermes_state_terminal import ADMISSION_PREFIX
+    bot = await producer(tmp_path, monkeypatch)
+    db, key = bot.authority.db, 'a' * 32
+    path = mailbox._root(bot.home) / (key + '.json')
+    record = mailbox._read(path)
+    retry_values = {'forged_retry_without_intent': 'forged', 'retry_list': [1],
+                    'retry_list_with_intent': [1], 'retry_null': None, 'retry_empty': ''}
+    if damage in retry_values:
+        record['retry_admission_id'] = retry_values[damage]
+        if damage == 'retry_list_with_intent':
+            record['retry'] = {'identity': 'bot:' + key + ':retry'}
+        mailbox._write(path, record)
+    elif damage == 'retired_principal_number':
+        row = dict(db._read_one('SELECT * FROM session_admissions'))
+        row.update(principal_id=7, payload_json='{}')
+        db._write_sql('INSERT INTO state_meta(key,value) VALUES(?,?)',
+                      (ADMISSION_PREFIX + row['admission_id'], json.dumps(row)))
+        db._write_sql('DELETE FROM session_admissions')
+    else:
+        column, value = {
+            'payload_list': ('payload_json', '[]'),
+            'payload_null': ('payload_json', 'null'),
+            'payload_invalid_json': ('payload_json', '{'),
+            'principal_blob': ('principal_id', b'automation:invalid'),
+        }[damage]
+        db._write_sql(f'UPDATE session_admissions SET {column}=?', (value,))
+    before_db, before_files = snapshot(db), files(bot.home)
+    with pytest.raises(RuntimeStoreError, match='admission_conflict|permission_denied'):
+        db.rekey_profile_state('watchdog', 'studio')
+    assert snapshot(db) == before_db
+    assert files(bot.home) == before_files
+    db.close()
+
+
 def test_historic_route_accepts_only_canonical_namespace_and_same_logical_conversation():
     from gateway.session_detached import detached_key
     from gateway.session_profile_mailbox import _historical_route

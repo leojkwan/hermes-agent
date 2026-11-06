@@ -568,6 +568,8 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
 def local_automation_mismatch(row, owner, admitted):
     """Immutable producer binding, independent of the conversation's current route."""
     payload = row['payload']
+    if not isinstance(payload, dict):
+        return True
     descriptor = payload.get('local_automation_v1')
     return (not admitted or set(payload) != {'text', 'local_automation_v1'}
             or not isinstance(descriptor, dict)
