@@ -42,6 +42,24 @@ class Invocation:
 
 
 @dataclass(frozen=True)
+class NodeOptions:
+    value: str | None
+    reason: str = "execution-affecting Node options unavailable from actual execution context"
+
+    def assignment(self, token: str) -> NodeOptions:
+        name, _, value = token.partition("=")
+        if name in {"npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL"}:
+            raise ScanRefused("unsupported npm shell selection")
+        if name == "NODE_OPTIONS+":
+            return NodeOptions(None, "unresolved appended NODE_OPTIONS assignment")
+        if name != "NODE_OPTIONS":
+            return self
+        if _DYNAMIC.search(value):
+            return NodeOptions(None, "unresolved execution-affecting NODE_OPTIONS")
+        return NodeOptions(value)
+
+
+@dataclass(frozen=True)
 class Reference:
     path: str
     required: bool = False
@@ -117,6 +135,8 @@ def read_local_source(path: Path, *, max_bytes: int, checkpoint=lambda: None) ->
         return SourceRead("refused", reason=f"source read failed ({type(exc).__name__})")
 
 
+_SHELL_OPTION_SETTERS = frozenset({"export", "unset", "declare", "readonly", "typeset", "local"})
+_SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 _DYNAMIC = re.compile(r"[$`*?{}\x00]")
 _NPM_SHORTCUTS = frozenset({"test", "start", "stop", "restart"})
 _NPM_FLAGS = frozenset({"-s", "--silent", "--ignore-scripts", "--no-ignore-scripts",
@@ -171,7 +191,7 @@ class ReferenceScanner:
         self.budget = budget
         self.remote_reader = remote_reader
         self.remote_namespace = remote_namespace
-        self.execution_options = execution_options
+        self.options = NodeOptions(execution_options)
         self.reads: dict[str, SourceRead] = {}
         self.remote_paths: set[str] = set()
         self.completed: set[tuple] = set()
@@ -260,22 +280,14 @@ class ReferenceScanner:
                 return False
             identity = result.identity or reference.path
             # A completed mention is not a completed executed inspection.
-            key = (identity, cwd, package_root, reference.executed)
+            key = (identity, cwd, package_root, reference.executed, self.options)
             if key in self.completed or key in self.active_files:
                 return False
             self.active_files.add(key)
             try:
                 actual = reference.path if self.remote_namespace else str(guard._resolve_lenient(Path(reference.path)))
                 source = Path(actual).suffix in {".js", ".cjs", ".mjs", ".ts", ".py"}
-                first_line = (result.text or "").partition("\n")[0]
-                source = source or (first_line.startswith("#!") and bool(re.search(r"\b(?:node|python[0-9.]*)\b", first_line)))
-                if first_line.startswith("#!") and re.search(r"\bnode\b", first_line):
-                    shebang = _shlex_tokens(first_line[2:])
-                    node_index = next(i for i, token in enumerate(shebang) if guard._executable_name(token) == "node")
-                    if self.node(Invocation(("node", *shebang[node_index + 1:], "-e", "1"), cwd, package_root), depth):
-                        return True
-                unsafe = self.scan(result.text or "", str(Path(actual).parent), depth, package_root,
-                                   source=source, execution_cwd=cwd)
+                unsafe = self.file_text(result.text or "", actual, cwd, depth, package_root, source)
             finally:
                 self.active_files.remove(key)
             self.completed.add(key)
@@ -284,6 +296,30 @@ class ReferenceScanner:
             if reference.executed:
                 raise
             return False
+
+    def file_text(self, text, actual, cwd, depth, package_root, source) -> bool:
+        from cron import lifecycle_guard as guard
+
+        previous = self.options
+        try:
+            first_line = text.partition("\n")[0]
+            if first_line.startswith("#!"):
+                raw = first_line[2:]
+                if "\\" in raw:
+                    raise ScanRefused("unsupported shebang escaping")
+                shebang, self.options = self.invocation_context(_shlex_tokens(raw))
+                if not shebang:
+                    raise ScanRefused("unsupported empty shebang invocation")
+                name = guard._executable_name(shebang[0])
+                source = source or name in {"node", "nodejs"} or bool(re.fullmatch(r"python[0-9.]*", name))
+                if name in {"node", "nodejs"}:
+                    if self.node(Invocation((*shebang, "-e", "1"), cwd, package_root), depth):
+                        return True
+                elif _DYNAMIC.search(name):
+                    raise ScanRefused("unresolved shebang interpreter")
+            return self.scan(text, str(Path(actual).parent), depth, package_root, source=source, execution_cwd=cwd)
+        finally:
+            self.options = previous
 
     def metadata(self, path: str) -> dict | None:
         result = self.read(path, metadata=True)
@@ -309,6 +345,8 @@ class ReferenceScanner:
         raise ScanRefused("required package.json not found by bounded upward lookup")
 
     def npm(self, invocation: Invocation, depth: int) -> bool:
+        if self.node(Invocation(("node", "-e", "1"), invocation.cwd, invocation.package_root), depth):
+            return True
         args = list(invocation.argv[1:])
         cwd, selected, forwarded, index = invocation.cwd, None, [], 0
         while index < len(args):
@@ -421,12 +459,12 @@ class ReferenceScanner:
 
     def node(self, invocation: Invocation, depth: int, *, injected=False) -> bool:
         args, index, inline = list(invocation.argv[1:]), 0, False
-        if not injected and self.execution_options is None:
-            raise ScanRefused("execution-affecting Node options unavailable from actual execution context")
-        if not injected and self.execution_options:
-            if not self.budget.charge_text(self.execution_options):
+        if not injected and self.options.value is None:
+            raise ScanRefused(self.options.reason)
+        if not injected and self.options.value:
+            if not self.budget.charge_text(self.options.value):
                 raise ScanRefused("Node execution options source budget exhausted")
-            options = _shlex_tokens(self.execution_options)
+            options = _shlex_tokens(self.options.value)
             if self.node(Invocation(("node", *options), invocation.cwd, invocation.package_root), depth, injected=True):
                 return True
         while index < len(args):
@@ -516,9 +554,15 @@ class ReferenceScanner:
         if guard._direct_lifecycle_scan(text):
             return True
         walk = strip_inert_heredoc_bodies(text)
-        for payload in guard._iter_shell_command_payloads(walk):
-            if self.nested(payload, cwd, depth, package_root):
-                return True
+        previous = self.options
+        try:
+            return self.scan_walk(walk, text, cwd, depth, package_root, source, execution_cwd or cwd)
+        finally:
+            self.options = previous
+
+    def scan_walk(self, walk, text, cwd, depth, package_root, source, execution_cwd) -> bool:
+        from cron import lifecycle_guard as guard
+
         # Expand only actual command positions. Source literal reference discovery below is
         # deliberately additive and retains dynamicImport/require wrappers without eval.
         previous = ""
@@ -541,27 +585,43 @@ class ReferenceScanner:
 
         original = guard._command_token_index(segment)
         index = guard._executed_command_index(segment)
-        if original is None:
-            return False
-        previous = self.execution_options
-        options = self.invocation_options(segment[:index] if index is not None else segment)
-        if options is not None:
-            self.execution_options = options
+        previous = self.options
+        if source:
+            argv = segment if literal_commands else segment[index:] if index is not None else []
+        else:
+            argv, options = self.invocation_context(segment)
+            if self.inline_options_mutation(segment, argv, depth):
+                previous = NodeOptions(None, "unresolved inline NODE_OPTIONS shell mutation")
+            self.options = previous if options == self.options else options
         try:
-            if index is not None:
-                invocation = Invocation(tuple(segment[index:]), execution_cwd if source else cwd, package_root, literal_commands)
-                if self.scan_invocation(invocation, segment, index, depth, source):
+            if argv:
+                invocation = Invocation(tuple(argv), execution_cwd if source else cwd, package_root, literal_commands)
+                if not source:
+                    payloads = dict.fromkeys(
+                        payload for tokens in (segment, argv)
+                        for payload in guard._iter_shell_command_payloads(shlex.join(tokens))
+                    )
+                    for payload in payloads:
+                        if self.nested(payload, cwd, depth, package_root):
+                            return True
+                    if guard._executable_name(argv[0]) == "eval":
+                        if self.nested(" ".join(argv[1:]), cwd, depth, package_root):
+                            return True
+                if self.scan_invocation(invocation, segment, depth, source):
                     return True
-            for position in dict.fromkeys((original, index if index is not None else original)):
-                for path in guard._references_at(segment, position, cwd):
+            positions = [(segment, position) for position in dict.fromkeys((original, index)) if position is not None]
+            if not source and argv:
+                positions.append((argv, 0))
+            for tokens, position in positions:
+                for path in guard._references_at(tokens, position, cwd):
                     required = "/node_modules/.bin/" in str(path)
                     if self.file(Reference(str(path), required=required), execution_cwd if source else cwd, depth + 1, package_root):
                         return True
             return False
         finally:
-            self.execution_options = previous
+            self.options = previous
 
-    def scan_invocation(self, invocation: Invocation, segment, index: int, depth: int, source: bool) -> bool:
+    def scan_invocation(self, invocation: Invocation, segment, depth: int, source: bool) -> bool:
         from cron import lifecycle_guard as guard
 
         name = guard._executable_name(invocation.argv[0])
@@ -597,17 +657,111 @@ class ReferenceScanner:
         token = head.group(1)
         name = guard._executable_name(token)
         supported = (name in guard._SHELL_EXECUTABLES or name in guard._TRANSPARENT_COMMAND_PREFIXES
-                     or name in {"npm", "node", "nodejs", "source", "."}
+                     or name in {"npm", "node", "nodejs", "source", ".", "eval"}
+                     or name in _SHELL_OPTION_SETTERS or _SHELL_ASSIGNMENT.match(token)
                      or re.fullmatch(r"python[0-9.]*", name) or "/" in token)
         return bool(supported) and self.nested(literal, invocation.cwd, depth, invocation.package_root)
 
-    def invocation_options(self, prefixes: list[str]) -> str | None:
-        selected = None
-        for token in prefixes:
-            if token.startswith("NODE_OPTIONS="):
-                selected = token.partition("=")[2]
-                if _DYNAMIC.search(selected):
-                    raise ScanRefused("unresolved execution-affecting NODE_OPTIONS")
-            if token.startswith(("npm_config_script_shell=", "NPM_CONFIG_SCRIPT_SHELL=")):
-                raise ScanRefused("unsupported npm shell selection")
-        return selected
+    def invocation_context(self, segment: list[str]) -> tuple[list[str], NodeOptions]:
+        from cron import lifecycle_guard as guard
+
+        tokens, index, options = list(segment), 0, self.options
+        for _ in range(guard._MAX_PREFIX_PEELS):
+            while index < len(tokens) and _SHELL_ASSIGNMENT.match(tokens[index]):
+                options = options.assignment(tokens[index])
+                index += 1
+            if index == len(tokens):
+                return [], options
+            name = guard._executable_name(tokens[index])
+            if name not in guard._TRANSPARENT_COMMAND_PREFIXES:
+                return tokens[index:], options
+            index += 1
+            if name == "env":
+                tokens, index, options = self.env_context(tokens, index, options)
+            else:
+                index = self.wrapper_operand(tokens, index, name)
+        raise ScanRefused("invocation wrapper depth budget exhausted")
+
+    def wrapper_operand(self, tokens: list[str], index: int, name: str) -> int:
+        from cron import lifecycle_guard as guard
+
+        values = guard._TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, ())
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                index += 1
+                break
+            if token in values:
+                if index + 1 >= len(tokens):
+                    raise ScanRefused("wrapper option value missing")
+                index += 2
+            elif token.startswith("-"):
+                index += 1
+            else:
+                break
+        return min(len(tokens), index + guard._TRANSPARENT_PREFIX_OPERANDS.get(name, 0))
+
+    def env_context(self, tokens, index, options) -> tuple[list[str], int, NodeOptions]:
+        operations = {"-u": "unset", "--unset": "unset", "-S": "split", "--split-string": "split"}
+        splits = 0
+        while index < len(tokens):
+            self.budget.checkpoint()
+            token = tokens[index]
+            index += 1
+            if token == "--":
+                break
+            if token in {"-i", "--ignore-environment", "-"}:
+                options = NodeOptions("")
+                continue
+            if not token.startswith("-"):
+                index -= 1
+                break
+            option, equals, value = token.partition("=")
+            if option not in operations and token[:2] in {"-u", "-S"}:
+                option, equals, value = token[:2], "=", token[2:]
+            if option not in operations:
+                raise ScanRefused(f"unsupported env invocation option: {option}")
+            if not equals:
+                if index == len(tokens):
+                    raise ScanRefused("env option value missing")
+                value, index = tokens[index], index + 1
+            if operations[option] == "unset":
+                if _DYNAMIC.search(value):
+                    options = NodeOptions(None, "unresolved env unset selector for NODE_OPTIONS")
+                elif value == "NODE_OPTIONS":
+                    options = NodeOptions("")
+            else:
+                splits += 1
+                if splits > 8:
+                    raise ScanRefused("env split-string depth budget exhausted")
+                if _DYNAMIC.search(value) or "\\" in value or "#" in value:
+                    raise ScanRefused("unsupported dynamic or escaped env split-string")
+                tokens = [*tokens[:index], *_shlex_tokens(value), *tokens[index:]]
+        return tokens, index, options
+
+    def inline_options_mutation(self, segment, argv, depth: int) -> bool:
+        from cron import lifecycle_guard as guard
+
+        if not argv:
+            return any(token.startswith(("NODE_OPTIONS=", "NODE_OPTIONS+=")) for token in segment)
+        name = guard._executable_name(argv[0])
+        if name in _SHELL_OPTION_SETTERS:
+            return any(re.match(r"^NODE_OPTIONS(?:[=+\[]|$)", token)
+                       or _DYNAMIC.search(token.partition("=")[0]) for token in argv[1:])
+        if name != "eval":
+            return False
+        if depth >= guard._MAX_REFERENCED_SCRIPT_DEPTH:
+            raise ScanRefused("eval mutation inspection depth budget exhausted")
+        payload = " ".join(argv[1:])
+        if _DYNAMIC.search(payload):
+            return True
+        if not self.budget.charge_text(payload):
+            raise ScanRefused("eval mutation inspection source budget exhausted")
+        for child in _iter_command_segments(payload):
+            child_argv, _ = self.invocation_context(child)
+            if self.inline_options_mutation(child, child_argv, depth + 1):
+                return True
+        for child in guard._iter_shell_command_payloads(payload):
+            if self.inline_options_mutation([], ["eval", child], depth + 1):
+                return True
+        return False
