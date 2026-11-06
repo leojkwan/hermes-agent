@@ -175,6 +175,54 @@ async def test_allowed_human_stays_human(authorized_adapter):
     assert adapter.handle_message.await_args.args[0].source.is_bot is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_adapter", ["callback", "fallback"], indirect=True)
+@pytest.mark.parametrize("mode", ["mentions", "all"])
+@pytest.mark.parametrize("lookup", ["human", "missing", "error", "bot"])
+async def test_ambiguous_api_sender_requires_verified_bot_identity(
+        authorized_adapter, monkeypatch, mode, lookup):
+    adapter, runner = authorized_adapter
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", mode)
+    adapter._app.client.users_info.return_value = (
+        {} if lookup == "missing" else {"user": {"is_bot": lookup == "bot"}})
+    if lookup == "error":
+        adapter._app.client.users_info.side_effect = RuntimeError("synthetic lookup failure")
+    await adapter._handle_slack_message(_event(user="U_UNALLOWLISTED_HUMAN", app_id="A_FRONTEND"))
+    if lookup == "bot":
+        adapter.handle_message.assert_awaited_once()
+        source = adapter.handle_message.await_args.args[0].source
+        assert source.is_bot is True
+        assert runner._is_user_authorized(source) is True
+    else:
+        adapter.handle_message.assert_not_awaited()
+        adapter._hydrate_thread_context.assert_not_awaited()
+        adapter._collect_inbound_media.assert_not_awaited()
+    adapter._app.client.users_info.assert_awaited_once_with(user="U_UNALLOWLISTED_HUMAN")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_adapter", ["callback", "fallback"], indirect=True)
+@pytest.mark.parametrize("mode", ["none", "mentions", "all"])
+@pytest.mark.parametrize("override", [True, False])
+async def test_authorized_api_human_preserves_filter_policy_without_bot_exemption(
+        authorized_adapter, monkeypatch, mode, override):
+    from dataclasses import replace
+
+    adapter, runner = authorized_adapter
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", mode)
+    adapter.config.extra["api_human_users"] = ["U_OWNER"] if override else []
+    adapter._app.client.users_info.return_value = {"user": {"is_bot": False}}
+    await adapter._handle_slack_message(_event(user="U_OWNER", app_id="A_FRONTEND"))
+    if mode == "none" and not override:
+        adapter.handle_message.assert_not_awaited()
+    else:
+        adapter.handle_message.assert_awaited_once()
+        source = adapter.handle_message.await_args.args[0].source
+        assert source.is_bot is False
+        assert runner._is_user_authorized(source) is True
+        assert runner._is_user_authorized(replace(source, user_id="U_UNAUTHORIZED")) is False
+
+
 def test_legacy_three_argument_callback_keeps_human_semantics(smoke_adapter):
     smoke_adapter.set_authorization_check(lambda user, chat_type, chat_id: user == "U_OWNER")
     assert smoke_adapter._early_reject_unauthorized("U_OWNER", "C_SMOKE", False) is False
