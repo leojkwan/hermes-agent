@@ -312,7 +312,7 @@ def gateway_lifecycle_block(
         command,
         cwd=guard_cwd,
         read_remote_script=(
-            None if env_type == "local" else
+            None if env_type == "local" and getattr(env, "env_type", None) == "local" else
             lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
         ),
     )

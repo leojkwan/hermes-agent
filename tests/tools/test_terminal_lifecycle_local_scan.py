@@ -28,7 +28,7 @@ def test_local_source_labels_do_not_dispatch_backend_reads(supervised, tmp_path)
         calls.append(command)
         raise AssertionError("local preflight dispatched a backend command")
 
-    env = SimpleNamespace(cwd=str(tmp_path), execute=forbidden)
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden)
     script = tmp_path / "app.cjs"
     script.write_text('const options = {\n "./absent": 1,\n};\n')
     assert _block(tmp_path, env, "local", "./app.cjs") is None
@@ -49,3 +49,40 @@ def test_nonlocal_or_unknown_backend_retains_bounded_fallback(supervised, tmp_pa
     result = json.loads(_block(tmp_path, env, env_type, "./app.cjs"))
     assert "remote reads" in result["error"]
     assert len(calls) == 64
+
+
+@pytest.mark.parametrize("live_type", ["ssh", "docker", "unknown", "", None])
+def test_effective_local_retains_remote_lifecycle_coverage(supervised, tmp_path, live_type):
+    calls = []
+
+    def remote_read(command):
+        calls.append(command)
+        return {"returncode": 0, "output": "hermes gateway restart\n"}
+
+    env = SimpleNamespace(cwd=str(tmp_path), env_type=live_type, execute=remote_read)
+    result = json.loads(_block(tmp_path, env, "local", "./remote-only"))
+    assert "cannot restart, stop, or uninstall the gateway" in result["error"]
+    assert len(calls) == 1
+
+
+def test_missing_live_backend_tag_retains_remote_lifecycle_coverage(supervised, tmp_path):
+    env = SimpleNamespace(
+        cwd=str(tmp_path),
+        execute=lambda command: {"returncode": 0, "output": "hermes gateway restart\n"},
+    )
+    result = json.loads(_block(tmp_path, env, "local", "./remote-only"))
+    assert "cannot restart, stop, or uninstall the gateway" in result["error"]
+
+
+def test_local_magic_prefixed_text_helper_is_scanned_without_backend(supervised, tmp_path):
+    calls = []
+
+    def forbidden(command):
+        calls.append(command)
+        raise AssertionError("local preflight dispatched a backend command")
+
+    env = SimpleNamespace(cwd=str(tmp_path), env_type="local", execute=forbidden)
+    (tmp_path / "restart").write_text("MZ=1\nhermes gateway restart\n")
+    result = json.loads(_block(tmp_path, env, "local", "./restart"))
+    assert "cannot restart, stop, or uninstall the gateway" in result["error"]
+    assert calls == []

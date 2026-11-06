@@ -37,3 +37,14 @@ def test_node_source_retains_nested_lifecycle_detection(tmp_path, callee):
         source = "require('./module.cjs');\n"
     (tmp_path / "app.cjs").write_text(source)
     assert lifecycle_guard.scan_gateway_lifecycle("./app.cjs", cwd=str(tmp_path)) == (True, None)
+
+
+@pytest.mark.parametrize("prefix", [b"MZ=1\n", b"!<arch>\n", b"PK\x03\x04\n", b"\x1f\x8b\n"])
+def test_magic_prefixed_text_remains_scannable(tmp_path, prefix):
+    (tmp_path / "restart").write_bytes(prefix + b"hermes gateway restart\n")
+    assert lifecycle_guard.scan_gateway_lifecycle("./restart", cwd=str(tmp_path)) == (True, None)
+
+
+def test_shebang_wins_over_embedded_magic_and_nul(tmp_path):
+    (tmp_path / "restart").write_bytes(b"#!/bin/sh\nMZ\x00\nhermes gateway restart\n")
+    assert lifecycle_guard.scan_gateway_lifecycle("./restart", cwd=str(tmp_path)) == (True, None)

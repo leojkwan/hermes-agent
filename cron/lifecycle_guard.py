@@ -955,13 +955,13 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
 # --- referenced-script reading ----------------------------------------------------------------
 
 def _has_binary_magic(data: bytes) -> bool:
-    """True when *data* starts with a known compiled-binary signature. Deliberately narrower than
-    "contains a NUL": ``bash`` still executes a NUL-bearing script, so a padded script must not
-    bypass the scan. A shebang always wins (interpreted, never binary). Extensions are not
-    consulted: a suffixless script must still be scanned and fail closed if oversized."""
+    """Require both a known binary signature and a NUL in the read bytes. Signature-prefixed
+    text can still be a shell script (for example ``MZ=1``). A NUL alone must not bypass the
+    scan either: ``bash`` executes padded text scripts. A shebang always wins. Extensions
+    are not consulted: suffixless text must still be scanned and fail closed if oversized."""
     if data.startswith(b"#!"):
         return False
-    return data.startswith(_BINARY_MAGICS)
+    return data.startswith(_BINARY_MAGICS) and b"\x00" in data
 
 
 def _read_referenced_script(
