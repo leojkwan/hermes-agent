@@ -36,13 +36,14 @@ import {
   useRoster
 } from './data'
 import { $groupChats, $groupChatWorkspace, $groupClarify, $groupNeedsYou } from './group-chat'
-import { GroupChatWorkspace, openGroupChat } from './group-chat-view'
+import { GroupChatWorkspace } from './group-chat-view'
 import { groupChatMemberBots } from './group-membership'
 import { $groupMainTabsRev, groupOpenOrigin, shouldRenderGroupChatInPane } from './group-panes'
 import { $activeGroupMemberKeys } from './group-presence'
 import { $showHiddenBots, isBotHidden } from './hidden-bots'
 import { useBots } from './i18n'
 import { $activityToasts } from './roster-actions'
+import { openRosterGroup } from './roster-navigation'
 import { renderRosterContent } from './roster-pane-content'
 import { deriveRosterPresentation, deriveRosterRows, type RosterGroupRow, sortRosterBots } from './roster-pane-derivation'
 import { renderRosterDialogs } from './roster-pane-dialogs'
@@ -449,7 +450,7 @@ export function BotsPane() {
     <CanonicalGroupRow
       active={groupChatName === gateway.key}
       key={gateway.key}
-      onOpen={() => openGroupChat(bindGatewayGroupRoom(gateway), 'key')}
+      onOpen={() => openRosterGroup(bindGatewayGroupRoom(gateway), 'key')}
       room={gateway}
     />
   ) : (
@@ -464,7 +465,7 @@ export function BotsPane() {
       members={row.members}
       onDisband={setDeletingGroup}
       onNewSection={target => setSectionDialog({ group: target, mode: 'create' })}
-      onOpen={group => openGroupChat(group, 'name')}
+      onOpen={group => openRosterGroup(group, 'name')}
       sortedGroupRows={desktopGroupRows}
     />
   )

@@ -4,6 +4,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { $narrowOverlayPaneIds } from '@/components/pane-shell/narrow-overlay-state'
 import { registry } from '@/contrib/registry'
+import { openGroupChat } from '@/plugins/hermes-bots/group-chat-view'
+import { openRosterGroup } from '@/plugins/hermes-bots/roster-navigation'
 import { $paneStates, setPaneWidthOverride } from '@/store/panes'
 import { $connection } from '@/store/session'
 import { stubResizeObserver } from '@/test/jsdom'
@@ -12,6 +14,8 @@ import { group, split } from '../model'
 import { $hiddenTreePanes, $layoutTree, $narrowViewport, declareDefaultTree } from '../store'
 
 import { NarrowOverlays, narrowOverlayWidth } from './narrow-overlays'
+
+vi.mock('@/plugins/hermes-bots/group-chat-view', () => ({ openGroupChat: vi.fn(() => true) }))
 
 // Ground truth for "the Bots tab is still visible when the sessions sidebar
 // collapses on a narrow window". A collapsible pane DOCKED into the sessions
@@ -109,8 +113,42 @@ describe('narrow overlay in native Desktop', () => {
     )
     expect(queryByTestId('bots-body')).toBeTruthy()
 
-    act(() => window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'bots', mode: 'close' } })))
+    act(() =>
+      window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'bots', mode: 'close' } }))
+    )
     expect(queryByTestId('bots-body')).toBeNull()
+  })
+})
+
+describe('opening a group from the Bots roster', () => {
+  const revealBots = () => {
+    registerPane('hermes-bots:pane', 'Bots roster', { collapsible: true, placement: 'left' }, 'real bot roster')
+    declareDefaultTree(split('row', [group(['sessions', 'hermes-bots:pane']), group(['workspace'])]))
+    render(<NarrowOverlays />)
+    revealPane('hermes-bots:pane')
+    expect(globalThis.document.querySelector('[data-narrow-overlay="hermes-bots:pane"]')).not.toBeNull()
+  }
+
+  it('reveals the room by dismissing the narrow browser overlay', () => {
+    asBrowserHost()
+    revealBots()
+    act(() => openRosterGroup('Team', 'name'))
+    expect(globalThis.document.querySelector('[data-narrow-overlay]')).toBeNull()
+  })
+
+  it('leaves the native pinned overlay open', () => {
+    asNativeDesktop()
+    revealBots()
+    act(() => openRosterGroup('Team', 'name'))
+    expect(globalThis.document.querySelector('[data-narrow-overlay="hermes-bots:pane"]')).not.toBeNull()
+  })
+
+  it('keeps the roster visible if the room must open inside it', () => {
+    asBrowserHost()
+    revealBots()
+    vi.mocked(openGroupChat).mockReturnValueOnce(false)
+    act(() => openRosterGroup('Team', 'name'))
+    expect(globalThis.document.querySelector('[data-narrow-overlay="hermes-bots:pane"]')).not.toBeNull()
   })
 })
 
