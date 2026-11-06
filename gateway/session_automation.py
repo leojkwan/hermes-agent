@@ -565,6 +565,17 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
     return {'text': event.text, 'local_automation_v1': descriptor}, entry
 
 
+def local_automation_mismatch(row, owner, admitted):
+    """Immutable producer binding, independent of the conversation's current route."""
+    payload = row['payload']
+    descriptor = payload.get('local_automation_v1')
+    return (not admitted or set(payload) != {'text', 'local_automation_v1'}
+            or not isinstance(descriptor, dict)
+            or row['principal_id'] != 'automation:' + admitted
+            or descriptor.get('owner') != owner or descriptor.get('route') != admitted
+            or descriptor.get('identity') != row['request_id'])
+
+
 def check_local_automation(authority, ref, row, *, route=None):
     live = authority.sessions.get(ref.session_id)
     route = route or (live.route if live is not None else None)
@@ -573,10 +584,7 @@ def check_local_automation(authority, ref, row, *, route=None):
     from gateway.session_detached import own_detached_key, route_entry
     # Admitted while its chat was elsewhere: the conversation's own key, whichever route it is on now.
     admitted = descriptor.get('route') if own_detached_key(descriptor.get('route'), ref.session_id) else route
-    if (not route or set(payload) != {'text', 'local_automation_v1'}
-            or row['principal_id'] != 'automation:' + admitted
-            or descriptor['owner'] != ref.session_id or descriptor['route'] != admitted
-            or descriptor['identity'] != row['request_id']):
+    if not route or local_automation_mismatch(row, ref.session_id, admitted):
         raise RuntimeStoreError('permission_denied')
     entry = route_entry(authority, route)
     if (entry is None or entry.suspended or (entry.session_id != descriptor['target']

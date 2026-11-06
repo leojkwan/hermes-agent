@@ -40,6 +40,42 @@ def _owners(conn):
     return owners
 
 
+def _historical_route(route, sid):
+    from gateway.session_detached import own_detached_key
+    from hermes_constants import PROFILE_ID_RE
+    if not isinstance(route, str):
+        return False
+    parts = route.split(':')
+    return (len(parts) >= 2 and parts[0] == 'agent'
+            and (parts[1] == 'main~' or PROFILE_ID_RE.fullmatch(parts[1]) is not None)
+            and (parts[2:] == ['local', 'dm', sid] or own_detached_key(route, sid)))
+
+
+def _check_admission(conn, admission_id, record, receipt, identity):
+    from gateway.session_automation import local_automation_mismatch
+    from hermes_state_keys import admission_fingerprint
+    from hermes_state_terminal import terminal_admission
+    row = conn.execute('SELECT * FROM session_admissions WHERE admission_id=?', (admission_id,)).fetchone()
+    retired = row is None
+    row = terminal_admission(conn, admission_id) if retired else dict(row)
+    if row is None:
+        return  # Historical missing-row compatibility; no payload proof remains.
+    sid = record['session_id']
+    route = row['principal_id'].removeprefix('automation:')
+    if (row['status'] != 'terminal' or row['target_session_id'] != sid or row['request_id'] != identity
+            or not row['principal_id'].startswith('automation:') or not _historical_route(route, sid)):
+        raise RuntimeStoreError('admission_conflict')
+    if retired:
+        return  # Retirement erased the payload; only retained identity metadata is provable.
+    payload = json.loads(row['payload_json'])
+    row['payload'] = payload
+    if (local_automation_mismatch(row, sid, route) or payload['text'] != record['message']
+            or payload['local_automation_v1'].get('target') not in receipt.get('lineage', [receipt['session_id']])
+            or row['payload_digest'] != admission_fingerprint(canonical_target=sid,
+                payload={'input': payload, 'intent': row['intent']})):
+        raise RuntimeStoreError('admission_conflict')
+
+
 def _check_record(conn, path, record, owners, old_home):
     from gateway.session_bot import _record_shape_error
     if _record_shape_error(path, record) or record['status'] not in {'settled', 'failed', 'cancelled'}:
@@ -56,10 +92,20 @@ def _check_record(conn, path, record, owners, old_home):
         if 'principal_id' in pin and pin['principal_id'] != receipt['principal_id']:
             raise RuntimeStoreError('permission_denied')
     if admission_id := record.get('admission_id'):
-        row = conn.execute('SELECT * FROM session_admissions WHERE admission_id=?', (admission_id,)).fetchone()
-        if row is not None and (row['status'] != 'terminal' or row['target_session_id'] != record['session_id']
-                                or row['principal_id'] != record['principal_id']):
+        from gateway.session_bot import bot_request_identity, _retry_identity
+        receipt = owners[record['session_id']]
+        _check_admission(conn, admission_id, record, receipt, bot_request_identity(record['delivery_id']))
+        identity = _retry_identity(record['delivery_id'])
+        retry = record.get('retry')
+        if retry is not None and (not isinstance(retry, dict) or retry.get('identity') != identity):
             raise RuntimeStoreError('admission_conflict')
+        rows = conn.execute('SELECT admission_id FROM session_admissions WHERE target_session_id=? AND request_id=?',
+                            (record['session_id'], identity)).fetchall()
+        retry_id = record.get('retry_admission_id')
+        if len(rows) > 1 or (retry_id and rows and retry_id != rows[0][0]):
+            raise RuntimeStoreError('admission_conflict')
+        if rows or retry_id:
+            _check_admission(conn, rows[0][0] if rows else retry_id, record, receipt, identity)
 
 
 def _validated_journal(conn, journal, old_home, new_home):
