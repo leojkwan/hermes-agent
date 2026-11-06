@@ -388,12 +388,11 @@ in
     writeShellScript "pnpm-dev-hook" ''
       REPO_ROOT=$(git rev-parse --show-toplevel)
 
-      # Stamp all workspace package.jsons, and pnpm-workspace.yaml (its
-      # overrides, catalog and allowBuilds shape the lock too), into one file.
+      # Stamp workspace manifests, settings and the package hook into one file.
       STAMP_DIR=".nix-stamps"
       STAMP="$STAMP_DIR/npm-package-jsons"
       STAMP_VALUE=$(
-        ${coreutils}/bin/sha256sum "$REPO_ROOT/pnpm-workspace.yaml" ${
+        ${coreutils}/bin/sha256sum "$REPO_ROOT/pnpm-workspace.yaml" "$REPO_ROOT/.pnpmfile.cjs" ${
           lib.concatMapStringsSep " " (p: "\"$REPO_ROOT/${p}\"") packageJsonPaths
         } 2>/dev/null | ${coreutils}/bin/sort | ${coreutils}/bin/sha256sum | awk '{print $1}'
       )
@@ -401,7 +400,7 @@ in
       PKG_CHANGED=false
       if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$STAMP_VALUE" ]; then
         PKG_CHANGED=true
-        echo "pnpm: package.json or pnpm-workspace.yaml changed, updating lockfile..."
+        echo "pnpm: workspace dependency inputs changed, updating lockfile..."
         ( cd "$REPO_ROOT" && ${lib.getExe' pnpm "pnpm"} install --lockfile-only --silent 2>/dev/null )
         mkdir -p "$STAMP_DIR"
         echo "$STAMP_VALUE" > "$STAMP"
