@@ -27,6 +27,7 @@ import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import { syncWorkspaceRoute } from '@/app/routes'
 import type { ClientSessionState } from '@/app/types'
+import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import {
   $newSessionTabAction,
   $paneVisible,
@@ -47,6 +48,7 @@ import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
+import { hostHas } from '@/lib/host-capabilities'
 import { traceIdentityChange } from '@/lib/identity-trace'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
 import {
@@ -1222,6 +1224,13 @@ export const host = {
     revealTreePane(paneId)
 
     return close
+  },
+
+  /** After explicit navigation, uncover a main workspace on narrow Webapp screens. */
+  dismissNarrowOverlay: (paneId: string): void => {
+    if (hostHas('tapOutsideDismiss')) {
+      window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: paneId, mode: 'close' } }))
+    }
   },
 
   /** Name a workspace owner on its tabs (a bot's display name). A canonical

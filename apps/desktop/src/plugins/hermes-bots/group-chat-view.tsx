@@ -1796,7 +1796,7 @@ function GroupChatMainView({ group, origin }: GroupChatMainViewProps) {
  *  in-pane fallback painted alongside the main tab, and because the map
  *  write itself repaints nothing, the duplicate stuck until an unrelated
  *  re-render. */
-export function openGroupChat(group: string, origin: CanonicalGroupOrigin): void {
+export function openGroupChat(group: string, origin: CanonicalGroupOrigin): boolean {
   // A room selection supersedes any bot-open transition still hydrating.
   // The in-flight host navigation may complete underneath this workspace,
   // but it may not later close or visually steal the room the user chose.
@@ -1836,7 +1836,7 @@ export function openGroupChat(group: string, origin: CanonicalGroupOrigin): void
       // highlight; shouldRenderGroupChatInPane stays false throughout.
       $groupChatWorkspace.set(group)
 
-      return
+      return true
     } catch {
       // Fall through to the in-panel room below.
     }
@@ -1845,4 +1845,6 @@ export function openGroupChat(group: string, origin: CanonicalGroupOrigin): void
   // No main-window door (older desktop) or it threw: select the group so
   // the in-panel room renders as the fallback surface.
   $groupChatWorkspace.set(group)
+
+  return false
 }
