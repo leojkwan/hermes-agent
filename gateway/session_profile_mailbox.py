@@ -139,8 +139,12 @@ class MailboxTransfer:
                 _write(path, change['after'])
             if _read(path) != change['after']:
                 raise RuntimeStoreError('storage_unavailable')
-        self.db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=? AND value=?',
-                                                         (JOURNAL, _json(self.journal))))
+        def clear_journal(conn):
+            row = conn.execute('SELECT value FROM state_meta WHERE key=?', (JOURNAL,)).fetchone()
+            if row is None or json.loads(row[0]) != self.journal:
+                raise RuntimeStoreError('admission_conflict')
+            conn.execute('DELETE FROM state_meta WHERE key=?', (JOURNAL,))
+        self.db._execute_write(clear_journal)
 
 
 @contextmanager

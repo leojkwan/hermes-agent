@@ -203,10 +203,16 @@ def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) ->
         else:
             if isinstance(answer, dict) and answer.get("ok") is True:
                 return _migrate_checkpoint_identity(old_canon, new_canon)
+            if isinstance(answer, dict) and answer.get("pending") is True:
+                _migrate_checkpoint_identity(old_canon, new_canon)
+                print(
+                    "⚠ Profile identity migration is still running. Check its result by running:\n"
+                    f"    hermes profile migrate-identity {old_canon} {new_canon}",
+                    file=sys.stderr)
+                return False
             reason = _control_answer_failure(answer)
-            if answer is None and _gateway_accepts_profile_identity_verb(root):
-                reason += (" — the gateway is running but does not implement "
-                           "'migrate-profile-identity' (an older process than this CLI)")
+            if answer is None:
+                reason += " (the request may still be running, or the gateway may not support it)"
         print(
             "⚠ Profile was renamed, but the live gateway could not migrate session identity"
             f" ({reason}). Restart the gateway, then run:\n"
