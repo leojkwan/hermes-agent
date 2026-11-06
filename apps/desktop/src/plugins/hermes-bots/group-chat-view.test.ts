@@ -61,6 +61,39 @@ beforeEach(() => {
 })
 
 describe('opening a room', () => {
+  it('does not dismiss a roster overlay for background room navigation', async () => {
+    const room = await loadRoom()
+    host.openWorkspace = () => () => undefined
+    host.dismissNarrowOverlay = vi.fn()
+
+    room.view.openGroupChat('Core', 'name')
+
+    expect(room.chat.$groupChatWorkspace.get()).toBe('Core')
+    expect(host.dismissNarrowOverlay).not.toHaveBeenCalled()
+  })
+
+  it('dismisses after an explicit roster open only when the main workspace opens', async () => {
+    const room = await loadRoom()
+    const { openRosterGroup } = await import('./roster-navigation')
+    const dismiss = vi.fn()
+    host.dismissNarrowOverlay = dismiss
+    host.openWorkspace = () => () => undefined
+
+    openRosterGroup('Core', 'name')
+    expect(room.chat.$groupChatWorkspace.get()).toBe('Core')
+    expect(dismiss).toHaveBeenCalledOnce()
+
+    dismiss.mockClear()
+
+    host.openWorkspace = () => {
+      throw new Error('workspace unavailable')
+    }
+
+    openRosterGroup('Ops', 'name')
+    expect(room.panes.shouldRenderGroupChatInPane('Ops')).toBe(true)
+    expect(host.dismissNarrowOverlay).not.toHaveBeenCalled()
+  })
+
   it('uses the canonical room name for the main tab instead of its registry key', async () => {
     const room = await loadRoom()
     const { registerCanonicalGroup } = await import('./canonical-group-registry')
