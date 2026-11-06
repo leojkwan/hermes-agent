@@ -11,10 +11,10 @@ from tests.gateway.test_slack_peer_agent_smoke import (
     PEER_USER_ID,
     TEAM_ID,
     _make_event,
+    smoke_adapter as peer_smoke_adapter,
 )
-from tests.gateway import test_slack_peer_agent_smoke as smoke_helpers
 
-smoke_adapter = smoke_helpers.smoke_adapter
+smoke_adapter = peer_smoke_adapter
 
 
 @pytest.fixture
@@ -60,6 +60,10 @@ async def test_allowed_bot_identity_survives_auth_and_loop_guards(authorized_ada
     adapter, runner = authorized_adapter
     event = _event(**({"bot_id": "B_PEER"} if declared else {}))
     await adapter._handle_slack_message(event)
+    if declared:
+        adapter._app.client.users_info.assert_not_awaited()
+    else:
+        adapter._app.client.users_info.assert_awaited_once_with(user=PEER_USER_ID)
     adapter.handle_message.assert_awaited_once()
     message = adapter.handle_message.await_args.args[0]
     assert message.source.is_bot is True
@@ -133,6 +137,32 @@ async def test_unauthorized_ordinary_human_rejected_without_lookup(authorized_ad
     adapter.handle_message.assert_not_awaited()
     adapter._hydrate_thread_context.assert_not_awaited()
     adapter._collect_inbound_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_adapter", ["callback", "fallback"], indirect=True)
+@pytest.mark.parametrize("mode,mentioned", [("none", True), ("mentions", False), ("mentions", True)])
+async def test_allowlisted_client_message_bot_obeys_filters_and_loop_guards(
+        authorized_adapter, monkeypatch, mode, mentioned):
+    adapter, runner = authorized_adapter
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", mode)
+    event = _event(user="U_OWNER", client_msg_id="client-message",
+                   text=f"<@{BOT_USER_ID}> hello" if mentioned else "hello",
+                   _hermes_force_process=True)
+    await adapter._handle_slack_message(event)
+    if mode == "none" or not mentioned:
+        adapter.handle_message.assert_not_awaited()
+        adapter._hydrate_thread_context.assert_not_awaited()
+        adapter._collect_inbound_media.assert_not_awaited()
+    else:
+        adapter.handle_message.assert_awaited_once()
+        message = adapter.handle_message.await_args.args[0]
+        assert message.source.is_bot is True
+        assert runner._admit_bot_chain(message) is True
+        assert runner._admit_bot_chain(message) is False
+        assert runner._admit_bot_message(message.source) is True
+        assert runner._admit_bot_message(message.source) is False
+    adapter._app.client.users_info.assert_awaited_once_with(user="U_OWNER")
 
 
 @pytest.mark.asyncio

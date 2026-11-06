@@ -4601,9 +4601,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Reject unauthorized users before the expensive lookups/downloads;
         # the runner's own auth check only runs after MessageEvent is built.
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
-        # Retain the declaration or workspace-verified identity across both auth seams and the
-        # final source. Only unlabeled candidates without client_msg_id need a bot probe;
-        # ordinary humans must reach early authorization without a credentialed lookup.
+        # Probe unlabeled candidates before auth only without client_msg_id; ordinary humans
+        # must reach early authorization without a credentialed lookup.
         # A failed/unknown lookup stays human for authorization purposes.
         sender_is_bot = self._event_declares_bot_sender(event)
         if not sender_is_bot and user_id and not event.get("client_msg_id"):
@@ -4612,6 +4611,11 @@ class SlackAdapter(BasePlatformAdapter):
         if self._early_reject_unauthorized(
                 user_id, channel_id, is_dm, thread_id=thread_ts, is_bot=sender_is_bot):
             return
+        # Allowlisted client messages can still come from bots. Resolve the skipped probe
+        # after auth so bot filters and the final source retain the verified classification.
+        if not sender_is_bot and user_id and event.get("client_msg_id"):
+            sender_is_bot = await self._resolve_user_is_bot(
+                user_id, chat_id=channel_id, team_id=team_id)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Mentions may live only in Block Kit blocks.
         # See #52387.
