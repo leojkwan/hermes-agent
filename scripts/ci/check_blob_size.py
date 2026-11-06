@@ -33,6 +33,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,9 +143,16 @@ def _sniff_binary(path: Path) -> bool:
 def _sizes(repo: Path, blobs: list[str]) -> dict[str, int]:
     if not blobs:
         return {}
-    proc = subprocess.run(["git", "cat-file", "--batch-check=%(objectname) %(objectsize)"], cwd=repo,
-                          input="\n".join(blobs) + "\n", capture_output=True, text=True,
-                          encoding="utf-8", timeout=300, check=False)
+    # A regular-file stdin avoids bidirectional pipe backpressure on large batches.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as query:
+        query.write("\n".join(blobs) + "\n")
+        query.seek(0)
+        try:
+            proc = subprocess.run(["git", "cat-file", "--batch-check=%(objectname) %(objectsize)"], cwd=repo,
+                                  stdin=query, capture_output=True, text=True,
+                                  encoding="utf-8", timeout=300, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise GitError("git cat-file --batch-check: timed out after 300 seconds") from exc
     if proc.returncode != 0:
         raise GitError(f"git cat-file --batch-check: {proc.stderr.strip()}")
     sizes: dict[str, int] = {}

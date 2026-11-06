@@ -199,6 +199,53 @@ def test_cli_fails_with_fix_text_and_writes_step_summary(repo, tmp_path):
     assert clean.returncode == 0, clean.stdout + clean.stderr
 
 
+def test_many_unique_blob_sizes_and_oversized_verdict(repo):
+    # FBL-370: both query and response exceed pipe buffers; no blob may be dropped.
+    base = _git(repo, "rev-parse", "HEAD")
+    files = {f"batch/{i}.txt": f"{i}:".encode() + b"x" * (i % 127) for i in range(2048)}
+    files["batch/oversized.bin"] = _binary(cbs.MAX_BYTES + 1)
+    for rel, data in files.items():
+        path = repo / rel
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(data)
+    _git(repo, "add", "batch")
+    expected = {}
+    for line in _git(repo, "ls-files", "--stage", "--", "batch").splitlines():
+        meta, rel = line.split("\t", 1)
+        expected[meta.split()[1]] = len(files[rel])
+    assert len(expected) == len(files)
+    assert cbs._sizes(repo, list(expected)) == expected
+    head = _commit(repo, {})
+    assert cbs.find_offenders(repo, base, head) == [
+        cbs.Offender("batch/oversized.bin", cbs.MAX_BYTES + 1, "binary", "A"),
+    ]
+    assert cbs.main(["--repo", str(repo), "--base", base, "--head", head]) == 1
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero"])
+def test_batch_failure_is_cli_error_and_closes_query(repo, monkeypatch, capsys, failure):
+    base = _git(repo, "rev-parse", "HEAD")
+    head = _commit(repo, {"new.txt": b"new content\n"})
+    run = subprocess.run
+    queries = []
+
+    def fail_batch(args, **kwargs):
+        if args[:2] != ["git", "cat-file"] or not args[2].startswith("--batch-check"):
+            return run(args, **kwargs)
+        queries.append(kwargs.get("stdin"))
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return subprocess.CompletedProcess(args, 1, "", "batch failed")
+
+    monkeypatch.setattr(cbs.subprocess, "run", fail_batch)
+    assert cbs.main(["--repo", str(repo), "--base", base, "--head", head]) == 2
+    captured = capsys.readouterr()
+    assert "check_blob_size: git cat-file --batch-check:" in captured.err
+    assert "no added or modified file" not in captured.out
+    assert len(queries) == 1
+    assert queries[0].closed
+
+
 def test_bad_revision_is_a_usage_error_not_a_pass(repo):
     proc = subprocess.run([sys.executable, str(SCRIPT), "--base", "no-such-rev", "--head", "HEAD"], cwd=repo,
                           env=_env(), capture_output=True, text=True, encoding="utf-8", timeout=60, check=False)
