@@ -4145,20 +4145,22 @@ class SlackAdapter(BasePlatformAdapter):
         return getattr(runner, "_is_user_authorized", None)
 
     def _early_reject_unauthorized(
-            self, user_id: str, channel_id: str, is_dm: bool, *, thread_id: Optional[str] = None) -> bool:
+            self, user_id: str, channel_id: str, is_dm: bool, *, thread_id: Optional[str] = None,
+            is_bot: bool = False) -> bool:
         """True (logged) when the sender is definitively unauthorized. Injected profile-bound check
         first (works under multiplex, where the handler has no ``__self__``), then runner
         introspection. Unknown (None) is NOT a rejection. ``thread_id``: thread-scoped profile_routes."""
         chat_type = "dm" if is_dm else "group"
         decision = (
-            self._is_sender_authorized(user_id, chat_type, channel_id, thread_id=thread_id)
+            self._is_sender_authorized(
+                user_id, chat_type, channel_id, thread_id=thread_id, is_bot=is_bot)
             if user_id and getattr(self, "_authorization_check", None) is not None
             else None)
         auth_fn = self._runner_auth_fn()
         if decision is None and user_id and callable(auth_fn):
             source = self.build_source(
                 chat_id=channel_id, chat_name="", chat_type=chat_type, user_id=user_id, user_name="",
-                thread_id=thread_id)
+                thread_id=thread_id, is_bot=is_bot)
             decision = bool(auth_fn(source))
         if decision is False:
             logger.warning(
@@ -4428,7 +4430,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "so a retry or edit can re-drive the turn", self.name, _ts)
             raise
 
-    async def _drop_bot_sender(self, event: dict) -> bool:
+    async def _drop_bot_sender(self, event: dict, *, team_id: str = "") -> bool:
         """allow_bots gate: ``none`` drops all bot posts (default), ``mentions`` those not
         @mentioning us, ``all`` accepts — own posts always drop (echo loops). Unlabeled events
         without ``client_msg_id`` are probed via users.info (humans carry it, stray bots don't)."""
@@ -4437,7 +4439,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not sender_is_bot and msg_user and not event.get("client_msg_id"):
             sender_is_bot = await self._resolve_user_is_bot(
                 msg_user, chat_id=event.get("channel", ""),
-                team_id=str(event.get("team") or event.get("team_id") or ""))
+                team_id=team_id or self._event_team_id(event))
         if not sender_is_bot:
             return False
         allow_bots = self._slack_allow_bots()
@@ -4488,7 +4490,7 @@ class SlackAdapter(BasePlatformAdapter):
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return None
-        if await self._drop_bot_sender(event):
+        if await self._drop_bot_sender(event, team_id=dedup_team_id):
             return None
         # Edits were normalized above so an @mention added by edit can wake the bot once;
         # the normalized event retains the edited message's own subtype.
@@ -4515,19 +4517,11 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         return event, dedup_team_id, channel_id
 
-    async def _peer_bot_drop(
-        self, event: dict, user_id: str, bot_uid: Optional[str], channel_id: str, team_id: str,
-        is_mentioned: bool) -> bool:
-        """True when a bot *user* post (peer agent: no bot_id/subtype) must be dropped.
-        Such posts would otherwise re-trigger via old thread mentions or active sessions and cause
-        agent-agent loops. Under ``mentions`` only the current text counts as a summons."""
-        if not user_id or user_id == bot_uid:
-            return False
-        sender_is_bot_user = self._event_declares_bot_sender(event)
-        if not sender_is_bot_user:
-            sender_is_bot_user = await self._resolve_user_is_bot(
-                user_id, chat_id=channel_id, team_id=team_id)
-        if not sender_is_bot_user:
+    def _peer_bot_drop(
+        self, sender_is_bot: bool, user_id: str, bot_uid: Optional[str], is_mentioned: bool) -> bool:
+        """True when a peer bot must drop rather than re-trigger via old thread mentions or active
+        sessions. Under ``mentions`` only the current text counts as a summons."""
+        if not sender_is_bot or not user_id or user_id == bot_uid:
             return False
         allow_bots = self._slack_allow_bots()
         return allow_bots == "none" or (allow_bots == "mentions" and not is_mentioned)
@@ -4607,7 +4601,14 @@ class SlackAdapter(BasePlatformAdapter):
         # Reject unauthorized users before the expensive lookups/downloads;
         # the runner's own auth check only runs after MessageEvent is built.
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
-        if self._early_reject_unauthorized(user_id, channel_id, is_dm, thread_id=thread_ts):
+        # Retain the declaration or workspace-verified identity across both auth seams and the
+        # final source. A failed/unknown lookup stays human for authorization purposes.
+        sender_is_bot = self._event_declares_bot_sender(event)
+        if not sender_is_bot and user_id:
+            sender_is_bot = await self._resolve_user_is_bot(
+                user_id, chat_id=channel_id, team_id=team_id)
+        if self._early_reject_unauthorized(
+                user_id, channel_id, is_dm, thread_id=thread_ts, is_bot=sender_is_bot):
             return
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Mentions may live only in Block Kit blocks.
@@ -4621,7 +4622,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Internal triggers (reactions) skip the mention requirement but NOT
         # allowed_channels or user authorization.
         force_process = bool(event.get("_hermes_force_process"))
-        if await self._peer_bot_drop(event, user_id, bot_uid, channel_id, team_id, is_mentioned):
+        if self._peer_bot_drop(sender_is_bot, user_id, bot_uid, is_mentioned):
             return
         if (
             not is_one_to_one_dm and bot_uid and not await self._channel_gate_allows(
@@ -4654,7 +4655,7 @@ class SlackAdapter(BasePlatformAdapter):
         msg_event = await self._build_message_event(
             event, text=text, original_text=original_text, command_probe_text=command_probe_text,
             is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
-            user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
+            user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, is_bot=sender_is_bot, media_urls=media_urls,
             media_types=media_types, media_text_inlined=media_text_inlined, channel_context=channel_context,
             reply_expected=self._slack_reply_expected(
                 routing_text, bot_uid, channel_id=channel_id, opens_own_session=thread_ts == ts,
@@ -4679,7 +4680,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, *, text: str, original_text: str, command_probe_text: str,
         is_command_text: bool, channel_id: str, team_id: str, ts: str, user_id: str,
         thread_ts: Optional[str], is_dm: bool, media_urls: list[str], media_types: list[str],
-        media_text_inlined: list[bool], channel_context: Optional[str], reply_expected: Optional[bool] = None) -> MessageEvent:
+        media_text_inlined: list[bool], channel_context: Optional[str], reply_expected: Optional[bool] = None,
+        is_bot: bool = False) -> MessageEvent:
         """Resolve names, title the DM thread, and build the ``MessageEvent``. Commands are restored
         from canonical input: the parser needs the token at char zero and enrichment (blocks,
         unfurls, file text, history) must never mutate arguments."""
@@ -4701,9 +4703,7 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_ts,
             scope_id=str(team_id) if team_id else None,
             message_id=ts,
-            # Workflow/app posts have user=None; flag them so the SLACK_ALLOW_BOTS bypass can
-            # authorize them. Same predicate as the drop gate (api_human_users stay human).
-            is_bot=self._event_declares_bot_sender(event))
+            is_bot=is_bot)
         from gateway.platforms.base import resolve_channel_skills
         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
         # above); render as ``@DisplayName`` so the agent knows who is addressed.
