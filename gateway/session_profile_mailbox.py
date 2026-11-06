@@ -51,7 +51,7 @@ def _historical_route(route, sid):
             and (parts[2:] == ['local', 'dm', sid] or own_detached_key(route, sid)))
 
 
-def _check_admission(conn, admission_id, record, receipt, identity):
+def _check_admission(conn, admission_id, record, receipt, identity) -> bool:
     from gateway.session_automation import local_automation_mismatch
     from hermes_state_keys import admission_fingerprint
     from hermes_state_terminal import terminal_admission
@@ -59,7 +59,7 @@ def _check_admission(conn, admission_id, record, receipt, identity):
     retired = row is None
     row = terminal_admission(conn, admission_id) if retired else dict(row)
     if row is None:
-        return  # Historical missing-row compatibility; no payload proof remains.
+        return False  # Original-admission compatibility only; no retained proof remains.
     sid = record['session_id']
     if not isinstance(row['principal_id'], str):
         raise RuntimeStoreError('admission_conflict')
@@ -68,7 +68,7 @@ def _check_admission(conn, admission_id, record, receipt, identity):
             or not row['principal_id'].startswith('automation:') or not _historical_route(route, sid)):
         raise RuntimeStoreError('admission_conflict')
     if retired:
-        return  # Retirement erased the payload; only retained identity metadata is provable.
+        return True  # Retirement erased the payload; only retained identity metadata is provable.
     try:
         payload = json.loads(row['payload_json'])
     except (TypeError, ValueError) as exc:
@@ -79,6 +79,7 @@ def _check_admission(conn, admission_id, record, receipt, identity):
             or row['payload_digest'] != admission_fingerprint(canonical_target=sid,
                 payload={'input': payload, 'intent': row['intent']})):
         raise RuntimeStoreError('admission_conflict')
+    return True
 
 
 def _check_record(conn, path, record, owners, old_home):
@@ -99,6 +100,7 @@ def _check_record(conn, path, record, owners, old_home):
     if admission_id := record.get('admission_id'):
         from gateway.session_bot import bot_request_identity, _retry_identity
         receipt = owners[record['session_id']]
+        # A missing original admission remains compatible; a retry below requires retained proof.
         _check_admission(conn, admission_id, record, receipt, bot_request_identity(record['delivery_id']))
         identity = _retry_identity(record['delivery_id'])
         retry = record.get('retry')
@@ -113,7 +115,8 @@ def _check_record(conn, path, record, owners, old_home):
         if len(rows) > 1 or (retry_id and rows and retry_id != rows[0][0]):
             raise RuntimeStoreError('admission_conflict')
         if rows or retry_id:
-            _check_admission(conn, rows[0][0] if rows else retry_id, record, receipt, identity)
+            if not _check_admission(conn, rows[0][0] if rows else retry_id, record, receipt, identity):
+                raise RuntimeStoreError('admission_conflict')
 
 
 def _validated_journal(conn, journal, old_home, new_home):

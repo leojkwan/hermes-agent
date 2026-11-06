@@ -247,6 +247,47 @@ async def test_malformed_producer_binding_has_typed_atomic_refusal(tmp_path, mon
     db.close()
 
 
+@pytest.mark.asyncio
+async def test_forged_retry_with_matching_intent_requires_retained_proof(tmp_path, monkeypatch):
+    bot = await producer(tmp_path, monkeypatch)
+    db, key = bot.authority.db, 'a' * 32
+    path = mailbox._root(bot.home) / (key + '.json')
+    record = mailbox._read(path)
+    record['retry'] = {'identity': 'bot:' + key + ':retry'}
+    record['retry_admission_id'] = 'forged-retry-id'
+    mailbox._write(path, record)
+    before_db, before_files = snapshot(db), files(bot.home)
+    with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+        db.rekey_profile_state('watchdog', 'studio')
+    assert snapshot(db) == before_db
+    assert files(bot.home) == before_files
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_retained_terminal_retry_binding_survives_migration(tmp_path, monkeypatch):
+    from hermes_state_terminal import ADMISSION_PREFIX
+    bot = await producer(tmp_path, monkeypatch, retry=True)
+    db, key = bot.authority.db, 'a' * 32
+    path = mailbox._root(bot.home) / (key + '.json')
+    record = mailbox._read(path)
+    retry_id = record['retry_admission_id']
+    row = dict(db._read_one('SELECT * FROM session_admissions WHERE admission_id=?', (retry_id,)))
+    row['payload_json'] = '{}'  # Only retained identity, not erased payload, is provable.
+    tombstone = json.dumps(row)
+    db._write_sql('INSERT INTO state_meta(key,value) VALUES(?,?)', (ADMISSION_PREFIX + retry_id, tombstone))
+    db._write_sql('DELETE FROM session_admissions WHERE admission_id=?', (retry_id,))
+    admissions, history = rows(db, 'session_admissions'), rows(db, 'messages')
+    db.rekey_profile_state('watchdog', 'studio')
+    db.rekey_profile_state('watchdog', 'studio')
+    assert rows(db, 'session_admissions') == admissions
+    assert rows(db, 'messages') == history
+    assert db._read_one('SELECT value FROM state_meta WHERE key=?', (ADMISSION_PREFIX + retry_id,))[0] == tombstone
+    assert mailbox._read(path) == {**record, 'profile_home': str(bot.home.with_name('studio'))}
+    assert not db._read_all('SELECT * FROM state_meta WHERE key IN (?,?)', (JOURNAL, PENDING))
+    db.close()
+
+
 def test_historic_route_accepts_only_canonical_namespace_and_same_logical_conversation():
     from gateway.session_detached import detached_key
     from gateway.session_profile_mailbox import _historical_route
