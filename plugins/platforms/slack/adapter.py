@@ -2865,12 +2865,17 @@ class SlackAdapter(BasePlatformAdapter):
                 str(p).strip() for p in parts if str(p).strip())
         return cached
 
-    def _event_declares_bot_sender(self, event: dict) -> bool:
-        """Return True when the Slack event itself identifies a bot sender."""
+    @staticmethod
+    def _event_has_bot_markers(event: dict) -> bool:
+        """Explicit Slack bot identity, unlike the app-origin filtering heuristic."""
         if event.get("bot_id") or event.get("bot_profile") or event.get("subtype") == "bot_message":
             return True
         profile = event.get("user_profile")
-        if isinstance(profile, dict) and bool(profile.get("is_bot")):
+        return isinstance(profile, dict) and bool(profile.get("is_bot"))
+
+    def _event_declares_bot_sender(self, event: dict) -> bool:
+        """Bot filtering policy, including app-origin heuristics; not authorization proof."""
+        if self._event_has_bot_markers(event):
             return True
         # App-originated events may lack bot_id/subtype but carry app_id and no client_msg_id
         # (humans have one) → bot-authored unless the user is in _slack_api_human_users
@@ -4604,7 +4609,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Probe unlabeled candidates before auth only without client_msg_id; ordinary humans
         # must reach early authorization without a credentialed lookup.
         # A failed/unknown lookup stays human for authorization purposes.
-        sender_is_bot = self._event_declares_bot_sender(event)
+        # User-bearing app events need explicit bot markers or users.info verification:
+        # app_id alone also appears on human Web API posts. Userless workflow posts retain
+        # their existing classification; they cannot borrow a human user's authorization.
+        sender_is_bot = self._event_has_bot_markers(event) or (
+            not user_id and self._event_declares_bot_sender(event))
         if not sender_is_bot and user_id and not event.get("client_msg_id"):
             sender_is_bot = await self._resolve_user_is_bot(
                 user_id, chat_id=channel_id, team_id=team_id)
