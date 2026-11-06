@@ -508,10 +508,10 @@ class AuthorityConnection:
             if 'skills' in params:
                 # Skill files are read off the owner loop, once per NEW session (a retried
                 # request_id resumes the frozen policy and never re-renders).
-                from gateway.session_local_recovery import local_identity
                 from gateway.session_policy import render_launch_skills
                 params.setdefault('request_id', uuid.uuid4().hex)
-                sid = local_identity(self.authority.profile_id, self.actor.subject, params['request_id'])
+                from hermes_state_local_identity import resolve_creation_id
+                sid = resolve_creation_id(self.authority.db, self.authority.profile_id, self.actor.subject, params['request_id'])
                 if self.authority.db.get_session(sid) is None:
                     skills_prompt = await asyncio.to_thread(render_launch_skills, params, sid)
             # Host-bound client values apply only over the gateway's own ticketed attach (run_api).

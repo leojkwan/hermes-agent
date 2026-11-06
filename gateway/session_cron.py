@@ -103,7 +103,8 @@ def _actor(authority, actor):
 
 def _create(authority, actor, params):
     from cron.jobs import get_job
-    from gateway.session_local_recovery import local_identity, restore_local_session
+    from gateway.session_local_recovery import restore_local_session
+    from hermes_state_local_identity import resolve_creation_id
     from gateway.session_policy import build_policy, bind_launch_key
     from gateway.run import _load_gateway_config
     from cron.scheduler import _load_cron_job_config
@@ -118,7 +119,7 @@ def _create(authority, actor, params):
             or not request_id or len(request_id) > 256 or (extra is not None and not isinstance(extra, str))):
         raise RuntimeStoreError('invalid_params')
     execution_id, request_id = request_id, cron_request_id(jid, request_id)
-    sid = local_identity(authority.profile_id, actor.subject, request_id)
+    sid = resolve_creation_id(authority.db, authority.profile_id, actor.subject, request_id)
     if authority.db.get_session(sid) is not None:
         return restore_local_session(authority, sid), request_id
     if ':' in execution_id:
@@ -166,13 +167,13 @@ async def operation(authority, name, params, actor=None):
     # already admitted, which the drain is waiting for: refusing them makes the firer give up
     # (CronExecutionUnknown pauses the job) on every restart that overlaps a cron run.
     if name == 'recover':
-        from gateway.session_local_recovery import local_identity
+        from hermes_state_local_identity import resolve_creation_id
         if (set(params) != {'job_id', 'request_id', 'extra_prompt'}
                 or any(not isinstance(params[k], str) or not params[k] for k in ('job_id', 'request_id'))
                 or (params['extra_prompt'] is not None and not isinstance(params['extra_prompt'], str))):
             raise RuntimeStoreError('invalid_params')
         request_id = cron_request_id(params['job_id'], params['request_id'])
-        sid = local_identity(authority.profile_id, actor.subject, request_id)
+        sid = resolve_creation_id(authority.db, authority.profile_id, actor.subject, request_id)
         from hermes_state_runtime import list_session_admissions
         rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
         from gateway.owner_identity import same_owner

@@ -1450,6 +1450,8 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # yielding, so no other task observes a half-registered authority.
     from pathlib import Path
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
+    from gateway.session_profile_mailbox import require_identity_ready
+    await asyncio.to_thread(require_identity_ready, db)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)

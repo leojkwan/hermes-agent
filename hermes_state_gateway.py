@@ -670,7 +670,7 @@ class SessionGatewayMixin:
             return
         self._write_sql("DELETE FROM gateway_hygiene_state WHERE session_key = ?", (session_key,))
 
-    def rekey_profile_state(self, old_name: str, new_name: str) -> dict[str, int]:
+    def rekey_profile_state(self, old_name: str, new_name: str, *, validate_only=False) -> dict[str, int]:
         """Atomically rewrite exact profile identity in this state database."""
         old, new = (old_name or "").strip(), (new_name or "").strip()
         counts: dict[str, int] = {}
@@ -708,6 +708,10 @@ class SessionGatewayMixin:
                     "WHERE old.profile_name = ? LIMIT 1", (new, old)).fetchone()
                 if collision is not None:
                     raise ValueError(f"profile identity collision in {table}")
+
+            transfer.stage(conn)
+            from gateway.session_profile_identity import rekey_local_receipts
+            counts["local_receipts"] = len(rekey_local_receipts(self, conn, old, new))
 
             counts["sessions_profile_name"] = conn.execute(
                 "UPDATE sessions SET profile_name = ? WHERE profile_name = ?", (new, old)).rowcount
@@ -776,7 +780,23 @@ class SessionGatewayMixin:
                     (new_session_key, new_json, rowid))
             counts["gateway_routing"] = len(routing)
 
-        self._execute_write(_do)
+        class Validated(Exception):
+            pass
+
+        def validate(conn):
+            _do(conn)
+            raise Validated()
+
+        from gateway.session_profile_mailbox import mailbox_transfer
+        with mailbox_transfer(self, old, new) as transfer:
+            if validate_only:
+                try:
+                    self._execute_write(validate)
+                except Validated:
+                    pass
+            else:
+                self._execute_write(_do)
+                transfer.finish()
         return counts
 
     def purge_profile_state(self, profile: str) -> dict[str, int]:

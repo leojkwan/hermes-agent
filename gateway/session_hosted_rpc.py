@@ -33,9 +33,9 @@ class HostedRoomAuthorityRPC:
         self.callbacks = {}
         binding = json.dumps([room_id, member_id, profile], separators=(',', ':'))
         self.creation_id = 'hosted:' + hashlib.sha256(binding.encode()).hexdigest()
-        from gateway.session_local_recovery import local_identity
-        self.ref = SessionRef(authority.profile_id, local_identity(
-            authority.profile_id, principal.subject, self.creation_id))
+        from hermes_state_local_identity import resolve_creation_id
+        self.ref = SessionRef(authority.profile_id, resolve_creation_id(
+            authority.db, authority.profile_id, principal.subject, self.creation_id))
 
     def _call(self, operation, **params):
         try:

@@ -111,11 +111,13 @@ def _checked_entry(authority, receipt, source, route):
 
 def owned_receipt(authority, sid):
     """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's."""
+    from gateway.session_profile_mailbox import require_identity_ready
+    require_identity_ready(authority.db)
     receipt = local_receipt(authority.db, sid)
     if receipt['profile_id'] != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
     chat_id = (receipt['legacy_session_id'] if 'legacy_session_id' in receipt else
-               local_identity(receipt['profile_id'], receipt['principal_id'], receipt['request_id']))
+               local_identity(receipt.get('creation_profile_id', receipt['profile_id']), receipt['principal_id'], receipt['request_id']))
     if receipt['session_id'] != sid or sid != chat_id:
         raise ValueError('identity mismatch')
     source = local_source(authority, chat_id, receipt['principal_id'])
