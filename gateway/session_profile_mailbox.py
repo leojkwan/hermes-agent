@@ -61,13 +61,18 @@ def _check_admission(conn, admission_id, record, receipt, identity):
     if row is None:
         return  # Historical missing-row compatibility; no payload proof remains.
     sid = record['session_id']
+    if not isinstance(row['principal_id'], str):
+        raise RuntimeStoreError('admission_conflict')
     route = row['principal_id'].removeprefix('automation:')
     if (row['status'] != 'terminal' or row['target_session_id'] != sid or row['request_id'] != identity
             or not row['principal_id'].startswith('automation:') or not _historical_route(route, sid)):
         raise RuntimeStoreError('admission_conflict')
     if retired:
         return  # Retirement erased the payload; only retained identity metadata is provable.
-    payload = json.loads(row['payload_json'])
+    try:
+        payload = json.loads(row['payload_json'])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeStoreError('admission_conflict') from exc
     row['payload'] = payload
     if (local_automation_mismatch(row, sid, route) or payload['text'] != record['message']
             or payload['local_automation_v1'].get('target') not in receipt.get('lineage', [receipt['session_id']])
@@ -102,6 +107,9 @@ def _check_record(conn, path, record, owners, old_home):
         rows = conn.execute('SELECT admission_id FROM session_admissions WHERE target_session_id=? AND request_id=?',
                             (record['session_id'], identity)).fetchall()
         retry_id = record.get('retry_admission_id')
+        if 'retry_admission_id' in record and (not isinstance(retry_id, str) or not retry_id
+                                               or not isinstance(retry, dict) or retry.get('identity') != identity):
+            raise RuntimeStoreError('admission_conflict')
         if len(rows) > 1 or (retry_id and rows and retry_id != rows[0][0]):
             raise RuntimeStoreError('admission_conflict')
         if rows or retry_id:
