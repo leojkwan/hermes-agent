@@ -6,7 +6,8 @@ import type { $groupChats } from './group-chat'
 import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-membership'
 import { sortGroupRosterRows } from './group-order'
 import { isBotPinned } from './hidden-bots'
-import { isBotHidden, isRoomHidden } from './hidden-bots'
+import { isBotHidden } from './hidden-bots'
+import { type HiddenRooms, isRoomHidden } from './hidden-rooms'
 import { filterBotsByGateway, groupMatchesRosterFilters, rosterGatewaySections } from './roster-sections'
 import type { rosterGatewayOptions } from './roster-sections'
 import { botRosterMeta } from './routing'
@@ -65,6 +66,7 @@ function gatewayRoomActive(room: GatewayGroupRoom, live: CanonicalRoomLive | und
 interface RosterRowsInput {
   roster: RosterRow[]
   allMeta: Record<string, BotMeta>
+  hiddenRooms?: HiddenRooms
   gatewayFilter: string
   query: string
   activityFilter: RosterActivityFilter
@@ -82,6 +84,7 @@ export function deriveRosterRows(input: RosterRowsInput) {
   const {
   roster,
   allMeta,
+  hiddenRooms = {},
   gatewayFilter,
   query,
   activityFilter,
@@ -124,8 +127,8 @@ export function deriveRosterRows(input: RosterRowsInput) {
 
   const groupNames = groupChatNames(allMeta, groupRooms)
   const gatewayRows = gatewayGroupRows(input)
-  const hiddenGroupRows = gatewayRows.filter(row => row.gateway && isRoomHidden(row.gateway.binding, allMeta))
-  const hiddenGroupCount = gatewayRooms.filter(room => isRoomHidden(room.binding, allMeta)).length
+  const hiddenGroupRows = gatewayRows.filter(row => row.gateway && isRoomHidden(row.gateway.binding, hiddenRooms))
+  const hiddenGroupCount = gatewayRooms.filter(room => isRoomHidden(room.binding, hiddenRooms)).length
 
   const groupRows = groupNames
     .map(name => ({
@@ -146,7 +149,7 @@ export function deriveRosterRows(input: RosterRowsInput) {
         ) || row.members.some(member => activeRosterKeys.has(botRosterKey(member)))
     }))
     .filter(row => rowKindFilter !== 'bots' && rosterActivityMatches(row, activityFilter))
-    .concat(gatewayRows.filter(row => row.gateway && !isRoomHidden(row.gateway.binding, allMeta)))
+    .concat(gatewayRows.filter(row => row.gateway && !isRoomHidden(row.gateway.binding, hiddenRooms)))
 
   const botRows =
     rowKindFilter === 'groups'

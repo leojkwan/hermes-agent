@@ -49,7 +49,8 @@ import { $canonicalGroupBindings } from '@/plugins/hermes-bots/canonical-group-r
 import { $botMeta, migrateBotMeta } from '@/plugins/hermes-bots/data'
 import { $groupChatWorkspace } from '@/plugins/hermes-bots/group-chat'
 import { dropGroupMainTab, recordGroupMainTab } from '@/plugins/hermes-bots/group-panes'
-import { $showHiddenBots, isRoomHidden } from '@/plugins/hermes-bots/hidden-bots'
+import { $showHiddenBots } from '@/plugins/hermes-bots/hidden-bots'
+import { $hiddenRooms, HIDDEN_ROOMS_KEY, isRoomHidden } from '@/plugins/hermes-bots/hidden-rooms'
 import { BotsPane } from '@/plugins/hermes-bots/roster-pane'
 import { setPluginCtx } from '@/plugins/hermes-bots/shared'
 
@@ -85,6 +86,7 @@ async function rowAction(action: string) {
 beforeEach(() => {
   localStorage.clear()
   $botMeta.set({})
+  $hiddenRooms.set({})
   $canonicalGroupBindings.set({})
   $groupChatWorkspace.set(null)
   $showHiddenBots.set(false)
@@ -150,7 +152,9 @@ it('hides and restores in the existing Hidden section without disbanding or clos
   recordGroupMainTab(key, close)
   renderRoster()
 
+  const appearance = $botMeta.get()
   await rowAction('Hide')
+  expect($botMeta.get()).toBe(appearance)
   await waitFor(() => expect(screen.queryByRole('button', { name: room.name })).toBeNull())
   fireEvent.click(screen.getByRole('button', { name: /Hidden/ }))
   const hiddenSection = screen.getByRole('button', { name: /Hidden/ }).parentElement!
@@ -169,12 +173,13 @@ it('hides and restores in the existing Hidden section without disbanding or clos
 it('reloads the saved hidden state and the saved restore from existing plugin storage', async () => {
   const view = renderRoster()
   await rowAction('Hide')
-  await waitFor(() => expect(context.storage.get('bot-meta-v2-migrated', false)).toBe(true))
+  await waitFor(() => expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual($hiddenRooms.get()))
   view.unmount()
 
   const reload = async () => {
     setPluginCtx(createPluginContext('hermes-bots'))
     $botMeta.set({})
+    $hiddenRooms.set({})
     $showHiddenBots.set(false)
     await migrateBotMeta(context.storage)
   }
@@ -186,10 +191,10 @@ it('reloads the saved hidden state and the saved restore from existing plugin st
   fireEvent.click(screen.getByRole('button', { name: /Hidden/ }))
   await rowAction('Restore')
   await waitFor(() =>
-    expect(context.storage.get('bot-meta-v2', {})).toMatchObject({ 'local::default': { hiddenRooms: [] } })
+    expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toMatchObject({ 'local::default': { 'room-1': false } })
   )
-  // The commit marker must also be back before simulating termination.
-  await waitFor(() => expect(context.storage.get('bot-meta-v2-migrated', false)).toBe(true))
+  // The separate visibility state must be durable before simulating termination.
+  await waitFor(() => expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual($hiddenRooms.get()))
   restarted.unmount()
 
   await act(reload)
@@ -202,8 +207,8 @@ it('isolates the same room ID by connection and profile and leaves other room ID
   renderRoster()
   await rowAction('Hide')
   const binding = { connectionId: 'local', profile: 'default', roomId: room.room_id }
-  expect(isRoomHidden(binding, $botMeta.get())).toBe(true)
-  expect(isRoomHidden({ ...binding, roomId: 'other-room' }, $botMeta.get())).toBe(false)
+  expect(isRoomHidden(binding, $hiddenRooms.get())).toBe(true)
+  expect(isRoomHidden({ ...binding, roomId: 'other-room' }, $hiddenRooms.get())).toBe(false)
 
   await act(async () => setConnection('remote'))
   expect(await screen.findByRole('button', { name: room.name })).toBeTruthy()
@@ -243,7 +248,9 @@ it('searches and opens a hidden room through the real workspace and reads its ex
   const log = requestProfile.mock.calls.find(([, method]) => method === 'groups.log')
   expect(log?.[0]).toMatchObject({ connectionId: 'local', profile: 'default' })
   expect(log?.[2]).toMatchObject({ room_id: room.room_id })
-  expect(isRoomHidden({ connectionId: 'local', profile: 'default', roomId: room.room_id }, $botMeta.get())).toBe(true)
+  expect(isRoomHidden({ connectionId: 'local', profile: 'default', roomId: room.room_id }, $hiddenRooms.get())).toBe(
+    true
+  )
   expect(requestProfile.mock.calls.map(([, method]) => method)).not.toContain('groups.disband')
   expect(requestProfile.mock.calls.map(([, method]) => method)).not.toContain('groups.create')
 })
@@ -292,8 +299,8 @@ it('finds and opens a hidden-only match in a Groups-only search', async () => {
 it('retains stored hides through empty and partial lists and reconnect loading until explicit Restore', async () => {
   const view = renderRoster()
   await rowAction('Hide')
-  await waitFor(() => expect(context.storage.get('bot-meta-v2-migrated', false)).toBe(true))
-  const saved = context.storage.get('bot-meta-v2', {})
+  await waitFor(() => expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual($hiddenRooms.get()))
+  const saved = context.storage.get(HIDDEN_ROOMS_KEY, {})
   const binding = { connectionId: 'local', profile: 'default', roomId: room.room_id }
   const roomQuery = { queryKey: ['hermes-bots', 'gateway-group-rooms'] }
 
@@ -302,8 +309,8 @@ it('retains stored hides through empty and partial lists and reconnect loading u
     await view.client.refetchQueries(roomQuery)
   })
   expect(screen.queryByRole('button', { name: room.name })).toBeNull()
-  expect(isRoomHidden(binding, $botMeta.get())).toBe(true)
-  expect(context.storage.get('bot-meta-v2', {})).toEqual(saved)
+  expect(isRoomHidden(binding, $hiddenRooms.get())).toBe(true)
+  expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual(saved)
 
   const other = { ...room, room_id: 'other-room', name: 'Other crew' }
   listedRooms = [other]
@@ -311,15 +318,15 @@ it('retains stored hides through empty and partial lists and reconnect loading u
     await view.client.refetchQueries(roomQuery)
   })
   expect(await screen.findByRole('button', { name: other.name })).toBeTruthy()
-  expect(context.storage.get('bot-meta-v2', {})).toEqual(saved)
+  expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual(saved)
 
   const reconnect = Promise.withResolvers<RoomList>()
   await act(async () => setGateway('closed'))
   pendingRoomList = reconnect.promise
   await act(async () => setGateway('open'))
   await waitFor(() => expect(view.client.isFetching(roomQuery)).toBe(1))
-  expect(isRoomHidden(binding, $botMeta.get())).toBe(true)
-  expect(context.storage.get('bot-meta-v2', {})).toEqual(saved)
+  expect(isRoomHidden(binding, $hiddenRooms.get())).toBe(true)
+  expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual(saved)
 
   listedRooms = [room, other]
   await act(async () => {
@@ -328,14 +335,14 @@ it('retains stored hides through empty and partial lists and reconnect loading u
   })
   await waitFor(() => expect(view.client.isFetching(roomQuery)).toBe(0))
   expect(screen.queryByRole('button', { name: room.name })).toBeNull()
-  expect(context.storage.get('bot-meta-v2', {})).toEqual(saved)
+  expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual(saved)
   fireEvent.click(await screen.findByRole('button', { name: /Hidden/ }))
   expect(screen.getByRole('button', { name: room.name })).toBeTruthy()
   await rowAction('Restore')
   await waitFor(() =>
-    expect(context.storage.get('bot-meta-v2', {})).toMatchObject({ 'local::default': { hiddenRooms: [] } })
+    expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toMatchObject({ 'local::default': { 'room-1': false } })
   )
-  expect(isRoomHidden(binding, $botMeta.get())).toBe(false)
+  expect(isRoomHidden(binding, $hiddenRooms.get())).toBe(false)
   expect(screen.getByRole('button', { name: room.name })).toBeTruthy()
   expect(requestProfile.mock.calls.map(([, method]) => method)).not.toContain('groups.disband')
 })
@@ -350,19 +357,20 @@ it('hides, restores and reopens same-name rooms by exact ID and history after st
   expect(rows).toHaveLength(2)
   fireEvent.contextMenu(rows[1])
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Hide' }))
-  expect($botMeta.get()['local::default']?.hiddenRooms).toEqual(['room-old'])
+  expect($hiddenRooms.get()['local::default']).toEqual({ 'room-old': true })
   fireEvent.contextMenu(screen.getByRole('button', { name: old.name }))
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Hide' }))
   await waitFor(() =>
-    expect(context.storage.get('bot-meta-v2', {})).toMatchObject({
-      'local::default': { hiddenRooms: expect.arrayContaining(['room-old', 'room-new']) }
+    expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toMatchObject({
+      'local::default': { 'room-old': true, 'room-new': true }
     })
   )
-  await waitFor(() => expect(context.storage.get('bot-meta-v2-migrated', false)).toBe(true))
+  await waitFor(() => expect(context.storage.get(HIDDEN_ROOMS_KEY, {})).toEqual($hiddenRooms.get()))
   view.unmount()
 
   await act(async () => {
     $botMeta.set({})
+    $hiddenRooms.set({})
     $canonicalGroupBindings.set({})
     $showHiddenBots.set(false)
     setPluginCtx(createPluginContext('hermes-bots'))
@@ -374,7 +382,7 @@ it('hides, restores and reopens same-name rooms by exact ID and history after st
   const hiddenRows = within(hidden).getAllByRole('button', { name: old.name })
   fireEvent.contextMenu(hiddenRows[0])
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Restore' }))
-  expect($botMeta.get()['local::default']?.hiddenRooms).toEqual(['room-old'])
+  expect($hiddenRooms.get()['local::default']).toEqual({ 'room-old': true, 'room-new': false })
   expect(within(hidden).getAllByRole('button', { name: old.name })).toHaveLength(1)
 
   fireEvent.click(within(hidden).getByRole('button', { name: old.name }))

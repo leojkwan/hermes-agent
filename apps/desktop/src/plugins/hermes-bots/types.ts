@@ -73,6 +73,7 @@ export interface BotMeta {
    *  the name with the membership lets another desktop on the same backend
    *  rebuild a section it never created instead of drawing a flat list. */
   sectionName?: null | string
+  /** Empty string explicitly selects "Match the name"; absence inherits an alias. */
   color?: string
   /** Set when the user has customized the avatar, so defaults stop applying. */
   custom?: boolean

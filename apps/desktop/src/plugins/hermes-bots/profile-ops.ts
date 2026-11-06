@@ -33,7 +33,7 @@ import {
   ROSTER_KEY,
   saveBotMeta
 } from './data'
-import { botConnectionRoute, botRouteKey, requestForBot } from './routing'
+import { aliasIdentityFor, botConnectionRoute, botRouteKey, requestForBot } from './routing'
 import { getPluginCtx } from './shared'
 import type { BotMeta, RosterRow } from './types'
 
@@ -265,6 +265,9 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
     const raw = bot.ui_meta?.['hermes-bots']
     const server = raw && typeof raw === 'object' ? raw : null
     const title = serverReportedTitle(bot, server)
+
+    // A thin backend heading is not an authored override of the Desktop alias.
+    if (!server && !Object.hasOwn(bot, 'ui_meta_revisions') && aliasIdentityFor(bot)) {continue}
 
     if (server || title !== undefined) {
       const key = botMetaKey(bot)

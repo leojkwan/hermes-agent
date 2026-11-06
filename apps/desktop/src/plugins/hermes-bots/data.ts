@@ -8,7 +8,7 @@
 
 import { atom, host, queryClient, useQuery, useValue } from '@hermes/plugin-sdk'
 
-import type { CanonicalGroupBinding } from './canonical-groups'
+import { loadHiddenRooms } from './hidden-rooms'
 import { botsText } from './i18n'
 import { displayName } from './labels'
 import {
@@ -171,7 +171,7 @@ export function clearBotAttention(key: string) {
  *  presentation fields that never belong in server profile metadata. */
 interface StoredBotMeta extends BotMeta {
   chat?: unknown
-  /** Local roster presentation only, keyed by room ID on this connection/profile. */
+  /** Legacy room visibility, moved out of appearance metadata on load. */
   hiddenRooms?: string[]
   pet?: unknown
 }
@@ -486,18 +486,6 @@ export function setLocalBotMeta(owner: RosterRow | string, patch: StoredBotMeta)
   return writeLocalBotMeta(key, Boolean(route), patch)
 }
 
-/** Reuse local display metadata; hiding never writes to a profile or room. */
-export function setLocalRoomHidden(binding: CanonicalGroupBinding, hidden: boolean): Promise<void> {
-  const key = botRouteKey(binding)
-  const stored = $botMeta.get()[key]?.hiddenRooms
-  const current = Array.isArray(stored) ? stored.filter(id => typeof id === 'string') : []
-  const hiddenRooms = current.filter(id => id !== binding.roomId)
-
-  if (hidden) {hiddenRooms.push(binding.roomId)}
-
-  return writeLocalBotMeta(key, true, { hiddenRooms })
-}
-
 /** The bot's `hermes-bots` metadata as its own backend holds it now; null when it does not answer. */
 export async function readBotMetaFromServer(owner: RosterRow | string): Promise<null | StoredBotMeta> {
   const { bot, name, route } = botOwner(owner)
@@ -631,6 +619,51 @@ function hydrateBotMeta(snapshot: BotMetaSnapshot, remap: Map<string, string> | 
   return next
 }
 
+async function separateRoomMeta(storage: BotMetaStorage | undefined, snapshot: BotMetaSnapshot, scoped: boolean) {
+  const hasLegacyHides = Object.entries(snapshot).some(
+    ([scope, meta]) => scope.includes('::') && Array.isArray(meta?.hiddenRooms)
+  )
+
+  if (!hasLegacyHides) {
+    return snapshot
+  }
+
+  try {
+    await loadHiddenRooms(storage, snapshot)
+    const appearance = { ...snapshot }
+
+    // A user or roster edit may have landed while visibility storage was pending.
+    for (const [scope, meta] of Object.entries($botMeta.get())) {
+      appearance[scope] = { ...appearance[scope], ...meta }
+    }
+
+    for (const [scope, meta] of Object.entries(appearance)) {
+      if (!scope.includes('::') || !Array.isArray(meta?.hiddenRooms)) {
+        continue
+      }
+
+      const { hiddenRooms: _hiddenRooms, ...look } = meta
+
+      if (Object.keys(look).length) {
+        appearance[scope] = look
+      } else {
+        delete appearance[scope]
+      }
+    }
+
+    if (scoped) {
+      await commitBotMetaV2(storage, appearance)
+    } else {
+      await storage?.set(BOT_META_V1_KEY, appearance)
+    }
+
+    return appearance
+  } catch {
+    // Never discard the old hides until their separate persistence is durable.
+    return snapshot
+  }
+}
+
 export async function migrateBotMeta(storage: BotMetaStorage | undefined = getPluginCtx()?.storage) {
   let v1: BotMetaSnapshot | null = null
   let v2: BotMetaSnapshot | null = null
@@ -646,11 +679,18 @@ export async function migrateBotMeta(storage: BotMetaStorage | undefined = getPl
     return false
   }
 
+  await loadHiddenRooms(storage).catch(() => undefined)
+
   if (v2Committed === true && v2 && typeof v2 === 'object' && !Array.isArray(v2)) {
+    v2 = await separateRoomMeta(storage, v2, true)
     hydrateBotMeta(v2)
     botMetaV2Active = true
 
     return true
+  }
+
+  if (v1 && typeof v1 === 'object' && !Array.isArray(v1)) {
+    v1 = await separateRoomMeta(storage, v1, false)
   }
 
   if (!v1 || typeof v1 !== 'object' || Array.isArray(v1) || typeof host.agents !== 'function') {
