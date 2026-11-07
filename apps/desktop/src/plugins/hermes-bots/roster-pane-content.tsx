@@ -44,6 +44,20 @@ interface RosterContentProps {
   renderHiddenGatewaySection: ReturnType<typeof rosterSectionRenderers>['renderHiddenGatewaySection']
 }
 
+function noRosterMatchDescription({
+  b,
+  query,
+  selectedGateway
+}: Pick<RosterContentProps, 'b' | 'query' | 'selectedGateway'>) {
+  return query.trim()
+    ? selectedGateway
+      ? b.roster.noMatchQueryOn(query.trim(), String(selectedGateway.label))
+      : b.roster.noMatchQuery(query.trim())
+    : selectedGateway
+      ? b.roster.noMatchFiltersOn(String(selectedGateway.label))
+      : b.roster.noMatchFilters
+}
+
 export function renderRosterContent({
   b,
   staleNotice,
@@ -119,18 +133,7 @@ export function renderRosterContent({
         </div>
       ) : rosterRows.length === 0 && matchingHiddenBots.length === 0 && hiddenGroupRows.length === 0 ? (
         <div aria-live="polite" className="flex min-h-0 flex-1 flex-col" role="status">
-          <PanelEmpty
-            description={
-              query.trim()
-                ? selectedGateway
-                  ? b.roster.noMatchQueryOn(query.trim(), String(selectedGateway.label))
-                  : b.roster.noMatchQuery(query.trim())
-                : selectedGateway
-                  ? b.roster.noMatchFiltersOn(String(selectedGateway.label))
-                  : b.roster.noMatchFilters
-            }
-            icon="search"
-          />
+          <PanelEmpty description={noRosterMatchDescription({ b, query, selectedGateway })} icon="search" />
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain" data-slot="bots-roster">

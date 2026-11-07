@@ -33,6 +33,7 @@ import {
   ROSTER_KEY,
   saveBotMeta
 } from './data'
+import type { BotMetaSnapshot } from './data'
 import { aliasIdentityFor, botConnectionRoute, botRouteKey, requestForBot } from './routing'
 import { getPluginCtx } from './shared'
 import type { BotMeta, RosterRow } from './types'
@@ -233,6 +234,57 @@ function serverReportedTitle(bot: RosterRow, server: BotMeta | null): string | u
   return typeof bot.title === 'string' ? bot.title.trim() : undefined
 }
 
+function overlayServerMeta(
+  mine: BotMetaSnapshot[string],
+  server: BotMeta | null,
+  title: string | undefined
+): BotMetaSnapshot[string] {
+  const merged = {
+    ...mine,
+    ...server
+  }
+
+  // Room visibility is this renderer's choice, never server profile metadata.
+  if (mine.hiddenRooms) {
+    merged.hiddenRooms = mine.hiddenRooms
+  } else {
+    delete merged.hiddenRooms
+  }
+
+  // The name is the backend's: a local title it does not carry is stale or
+  // another bot's (a restored record, a legacy name-keyed one), never this
+  // bot's identity.
+  if (title) {
+    merged.title = title
+  } else {
+    delete merged.title
+  }
+
+  // Local-only fields survive the server overlay.
+  if (mine.image) {
+    merged.image = mine.image
+  }
+
+  // Legacy canonical-chat pointers (meta.chat) are dead: identity is the
+  // profile's "Bot Chat" registry row, resolved by name. Drop the key on
+  // sight so old ui_meta can never look meaningful again.
+  delete merged.chat
+
+  // Canonical multi-group metadata is authoritative for the compatibility
+  // scalar too. A server-side `group: null` is represented by omission,
+  // so retaining the local scalar would resurrect a membership that another
+  // desktop just removed.
+  if (
+    Array.isArray(server?.groups) &&
+    Object.prototype.hasOwnProperty.call(mine, 'group') &&
+    !Object.prototype.hasOwnProperty.call(server, 'group')
+  ) {
+    delete merged.group
+  }
+
+  return merged
+}
+
 /** Server ui_meta (per roster row) beats local storage for the compact
  *  fields it carries; local-only fields (avatar image data URL, extracted
  *  pet icon) are PRESERVED — the server copy never includes them, so a
@@ -267,7 +319,9 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
     const title = serverReportedTitle(bot, server)
 
     // A thin backend heading is not an authored override of the Desktop alias.
-    if (!server && !Object.hasOwn(bot, 'ui_meta_revisions') && aliasIdentityFor(bot)) {continue}
+    if (!server && !Object.hasOwn(bot, 'ui_meta_revisions') && aliasIdentityFor(bot)) {
+      continue
+    }
 
     if (server || title !== undefined) {
       const key = botMetaKey(bot)
@@ -285,45 +339,7 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
 
       const mine = next[key] || {}
 
-      const merged = {
-        ...mine,
-        ...server
-      }
-
-      // Room visibility is this renderer's choice, never server profile metadata.
-      if (mine.hiddenRooms) {merged.hiddenRooms = mine.hiddenRooms}
-      else {delete merged.hiddenRooms}
-
-      // The name is the backend's: a local title it does not carry is stale or
-      // another bot's (a restored record, a legacy name-keyed one), never this
-      // bot's identity.
-      if (title) {
-        merged.title = title
-      } else {
-        delete merged.title
-      }
-
-      // Local-only fields survive the server overlay.
-      if (mine.image) {
-        merged.image = mine.image
-      }
-
-      // Legacy canonical-chat pointers (meta.chat) are dead: identity is the
-      // profile's "Bot Chat" registry row, resolved by name. Drop the key on
-      // sight so old ui_meta can never look meaningful again.
-      delete merged.chat
-
-      // Canonical multi-group metadata is authoritative for the compatibility
-      // scalar too. A server-side `group: null` is represented by omission,
-      // so retaining the local scalar would resurrect a membership that another
-      // desktop just removed.
-      if (
-        Array.isArray(server?.groups) &&
-        Object.prototype.hasOwnProperty.call(mine, 'group') &&
-        !Object.prototype.hasOwnProperty.call(server, 'group')
-      ) {
-        delete merged.group
-      }
+      const merged = overlayServerMeta(mine, server, title)
 
       if (JSON.stringify(next[key] || null) !== JSON.stringify(merged)) {
         next[key] = merged
