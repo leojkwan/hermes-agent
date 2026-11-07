@@ -47,7 +47,7 @@ def test_supported_npm_spellings_inspect_actual_test_hook(tmp_path, command):
         "s",
         "unknown",
         "--help",
-        "--version",
+        "--versions",
     ],
 )
 def test_unmodeled_npm_commands_never_fall_through_clean(tmp_path, command):

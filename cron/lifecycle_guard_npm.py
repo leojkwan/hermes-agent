@@ -1,4 +1,4 @@
-"""Private npm 11.19.0 execution projection, without running npm or decoding secrets.
+"""Private npm 11.19.0/11.19.1 projection, without running npm or decoding secrets.
 
 Only a neutral configuration plus a literal builtin/CLI prefix is supported.
 The generic source reader must continue denying credential-bearing files.
@@ -17,7 +17,8 @@ from typing import Literal
 from hermes_platform.resolver.core import LookupContext, locate_command
 from tools.environments.local_execution_context import ExecutionContext
 
-SUPPORTED_NPM_VERSION = "11.19.0"
+# Qualified against npm/cli v11.19.0...v11.19.1: config and run-script unchanged.
+SUPPORTED_NPM_VERSIONS = ("11.19.0", "11.19.1")
 _KEY = re.compile(rb"[A-Za-z0-9_:/@.-]+", re.ASCII)
 _PATH = re.compile(r"/[A-Za-z0-9_./+@ -]+", re.ASCII)
 _RELEVANT = frozenset(
@@ -88,7 +89,7 @@ class NpmExecutionFacts:
 
 @dataclass(frozen=True)
 class NpmSelection:
-    script: str
+    script: str | None
     forwarded: tuple[str, ...]
     prefix: str | None = None
 
@@ -110,6 +111,8 @@ def normalize_key(key: str) -> str:
 def parse_selection(argv: tuple[str, ...], cwd: str) -> NpmSelection:
     from cron.lifecycle_guard_references import ScanRefused, anchored, static_selector
 
+    if argv[1:] in {("-v",), ("--version",)}:
+        return NpmSelection(None, ())
     args, selected, prefix, forwarded, index = argv[1:], None, None, [], 0
     while index < len(args):
         token = args[index]
@@ -360,9 +363,11 @@ class NpmProjection:
         if (
             not metadata
             or metadata.get("name") != "npm"
-            or metadata.get("version") != SUPPORTED_NPM_VERSION
+            or metadata.get("version") not in SUPPORTED_NPM_VERSIONS
         ):
-            _fail("unsupported npm version (requires 11.19.0)")
+            _fail(
+                "unsupported npm version; reviewed versions: 11.19.0, 11.19.1; review this version before use"
+            )
         if guard._on_cloud_path(node_path):
             _fail("cloud node executable")
         # Scripts and version-manager shims cannot attest process.execPath.
@@ -416,6 +421,8 @@ class NpmProjection:
                     _fail("node_modules boundary lacks package metadata")
                 found = parent
         if found is None:
+            if self.selection.script is None:
+                return str(candidate)
             _fail("required package metadata missing")
         return str(found)
 
