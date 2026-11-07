@@ -12,6 +12,12 @@ import { loadHiddenRooms } from './hidden-rooms'
 import { botsText } from './i18n'
 import { displayName } from './labels'
 import {
+  activeRosterAgent,
+  rememberedActiveRosterIdentity,
+  retainRosterRows,
+  type UnionAgentRow
+} from './roster-alias-identity'
+import {
   aliasIdentityFor,
   beginAliasRouteIndex,
   botConnectionRoute,
@@ -817,6 +823,7 @@ export let serverInjectsProtocol = false
  *  types.ts: this is the query-cache envelope around RosterRow, not a domain
  *  object. */
 interface RosterSnapshot {
+  install_id?: string
   /** Newer backends inject the teammate protocol into the system prompt. */
   bot_mode_protocol?: boolean
   /** Time the request was ISSUED, the conservative bound mergeServerMeta wants. */
@@ -824,22 +831,6 @@ interface RosterSnapshot {
   primaryConnectionId?: string
   profiles?: RosterRow[]
   sources?: GatewaySource[]
-}
-
-/** One row of the desktop-wide union agent roster (`host.agents`). */
-interface UnionAgentRow {
-  connectionId?: string
-  connectionKind?: string
-  connectionLabel?: string
-  handle?: string
-  profile?: string
-  /** Credential-free metadata Electron enumerates alongside the name — the
-   *  only source of a REMOTE row's title, since profiles.list is asked of the
-   *  active gateway alone. */
-  profileMetadata?: Pick<RosterRow, 'description' | 'display_name' | 'has_avatar' | 'title' | 'ui_meta'>
-  /** False when the source lists the profile but does not serve it. */
-  reachable?: boolean
-  targetProfile?: string
 }
 
 /** A source can be up and still not serve a profile it lists. Only an explicit
@@ -1155,7 +1146,7 @@ export function mergeMultiSourceRoster(
 
     if (!activeByName.has(name)) {
       activeByName.set(name, {
-        ...profile,
+        ...(!union ? rememberedActiveRosterIdentity(profile, activeId, previous, local?.install_id) : profile),
         name
       })
     }
@@ -1168,7 +1159,8 @@ export function mergeMultiSourceRoster(
   // identities even after the core roster deduplicates them.
   const seenSources = new Set<string>()
 
-  for (const agent of agents) {
+  for (const candidate of agents) {
+    const agent = activeRosterAgent(candidate, activeId, activeByName.get(String(candidate.profile || '').trim()))
     const profile = String(agent?.profile || '').trim()
     const connectionId = String(agent?.connectionId || '').trim()
     const sourceKey = `${connectionId}::${profile || 'default'}`
@@ -1196,6 +1188,7 @@ export function mergeMultiSourceRoster(
       row.connectionKind = agent.connectionKind
       row.connectionLabel = agent.connectionLabel
       row.targetProfile = agent.targetProfile || profile
+      row.equivalentConnections = agent.equivalentConnections
       row.route = {
         connectionId,
         mode: agent.connectionKind === 'local' ? 'local' : 'remote',
@@ -1225,6 +1218,7 @@ export function mergeMultiSourceRoster(
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
       targetProfile: agent.targetProfile || profile,
+      equivalentConnections: agent.equivalentConnections,
       route: {
         connectionId,
         mode: agent.connectionKind === 'local' ? 'local' : 'remote',
@@ -1237,50 +1231,7 @@ export function mergeMultiSourceRoster(
     })
   }
 
-  // SSH sources drop to connect-on-demand the moment their tunnel is not
-  // the live gateway. Keep previously painted remote rows so clicking the
-  // local agent does not empty Bot Mode.
-  if (Array.isArray(previous) && previous.length > 0) {
-    const present = new Set(profiles.map(row => `${row.connectionId || ''}::${row.name}`))
-    const unionSourceIds = new Set(agents.map(agent => String(agent?.connectionId || '').trim()).filter(Boolean))
-
-    const omitted = new Set(
-      (Array.isArray(union?.sources) ? union.sources : [])
-        .filter(source => source?.error === 'connect-on-demand' || source?.reachable === false)
-        .map(source => String(source.connectionId || '').trim())
-        .filter(Boolean)
-    )
-
-    const registered = new Set(
-      (Array.isArray(union?.sources) ? union.sources : [])
-        .map(source => String(source?.connectionId || '').trim())
-        .filter(Boolean)
-    )
-
-    for (const row of previous) {
-      const connectionId = String(row?.connectionId || '').trim()
-      const name = String(row?.name || '').trim()
-      const key = `${connectionId}::${name || 'default'}`
-
-      if (!row?.remoteSource || !connectionId || !name || present.has(key)) {
-        continue
-      }
-
-      if (registered.size > 0 && !registered.has(connectionId)) {
-        continue
-      }
-
-      if (omitted.has(connectionId) || !unionSourceIds.has(connectionId)) {
-        profiles.push({
-          ...row,
-          remoteSource: true,
-          retained: true,
-          sourceScoped: true
-        })
-        present.add(key)
-      }
-    }
-  }
+  retainRosterRows(profiles, agents, union?.sources, previous)
 
   return {
     ...local,

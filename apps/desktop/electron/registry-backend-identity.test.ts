@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { connectionInstallIds } from './connection-caches'
+import { connectionInstallIds, evictConnectionCaches } from './connection-caches'
 import {
   boundedInstallId,
   createPrimaryInstallIdResolver,
@@ -74,4 +74,32 @@ test('a connection install id is cached, and a failed re-probe keeps the known i
     'abc'
   )
   connectionInstallIds.clear()
+})
+
+test('a removed or repointed connection cannot recover an old in-flight identity', async () => {
+  for (const rejects of [false, true]) {
+    connectionInstallIds.set('moving', { id: 'old-install', ts: 0 })
+    let settle!: (body: unknown) => void
+    let fail!: (error: Error) => void
+
+    const pending = probeCachedConnectionInstallId(
+      'moving',
+      () =>
+        new Promise((resolve, reject) => {
+          settle = resolve
+          fail = reject
+        })
+    )
+
+    evictConnectionCaches('moving')
+
+    if (rejects) {
+      fail(new Error('old target down'))
+    } else {
+      settle({ install_id: 'old-install' })
+    }
+
+    assert.equal(await pending, undefined)
+    assert.equal(connectionInstallIds.has('moving'), false)
+  }
 })

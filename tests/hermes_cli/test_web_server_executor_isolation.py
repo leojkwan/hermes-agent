@@ -71,16 +71,17 @@ async def _request_with_wedged_default_executor(path: str, *, warm: bool = False
 
 
 def test_profiles_route_survives_default_executor_starvation(monkeypatch):
-    from hermes_cli import profiles
+    from hermes_cli import install_identity, profiles
 
     # The route passes ``lazy_skill_count=True`` (#114041); a positional-only stub would TypeError
     # into the directory-scan fallback and return the real profile list instead.
     monkeypatch.setattr(profiles, "list_profiles", lambda **_: [])
+    monkeypatch.setattr(install_identity, "get_install_id", lambda: "test-install")
 
     response = asyncio.run(_request_with_wedged_default_executor("/api/profiles"))
 
     assert response.status_code == 200
-    assert response.json() == {"profiles": []}
+    assert response.json() == {"profiles": [], "install_id": "test-install"}
 
 
 def test_toolsets_route_survives_default_executor_starvation(monkeypatch):
