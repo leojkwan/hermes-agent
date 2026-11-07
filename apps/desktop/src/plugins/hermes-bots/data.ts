@@ -434,7 +434,9 @@ async function settleServerOutcome(
       return 'persisted'
     }
 
-    return result && typeof result === 'object' && result.applied && typeof result.applied === 'object' ? 'failed' : 'unsupported'
+    return result && typeof result === 'object' && result.applied && typeof result.applied === 'object'
+      ? 'failed'
+      : 'unsupported'
   } catch (error) {
     // The pooled local backend keeps the documented fallback: its local copy is the save.
     if (!routed || rpcMethodMissing(error)) {
@@ -580,7 +582,9 @@ export async function saveBotMeta(
   //                   unchanged ui_meta wins again on reconnect.
   // A routed row that answered the read but whose write then failed for any
   // reason other than a missing method is 'failed', never 'unsupported'.
-  const serverOutcome = serverRequest ? await settleServerOutcome(serverRequest, Boolean(route), progress) : 'unsupported'
+  const serverOutcome = serverRequest
+    ? await settleServerOutcome(serverRequest, Boolean(route), progress)
+    : 'unsupported'
 
   if (serverRequest) {
     // Re-stamp now that the server write settled: a roster snapshot fetched
@@ -601,12 +605,16 @@ export async function saveBotMeta(
  * there is one local source. A v1 name cannot identify a machine in a
  * multi-source desktop, so the conservative result there is to retain v1 as
  * rollback data and leave remote rows unpainted. */
-function hydrateBotMeta(snapshot: BotMetaSnapshot, remap: Map<string, string> | null = null): BotMetaSnapshot {
+function mergeBotMetaSnapshot(
+  snapshot: BotMetaSnapshot,
+  local: BotMetaSnapshot,
+  remap: Map<string, string> | null
+): BotMetaSnapshot {
   const next = {
     ...snapshot
   }
 
-  for (const [key, meta] of Object.entries($botMeta.get())) {
+  for (const [key, meta] of Object.entries(local)) {
     const target = remap?.get(key) || key
     next[target] = {
       ...(next[target] || {}),
@@ -614,6 +622,11 @@ function hydrateBotMeta(snapshot: BotMetaSnapshot, remap: Map<string, string> | 
     }
   }
 
+  return next
+}
+
+function hydrateBotMeta(snapshot: BotMetaSnapshot, remap: Map<string, string> | null = null): BotMetaSnapshot {
+  const next = mergeBotMetaSnapshot(snapshot, $botMeta.get(), remap)
   $botMeta.set(next)
 
   return next
@@ -769,17 +782,7 @@ export async function migrateBotMeta(storage: BotMetaStorage | undefined = getPl
 
   const remap = new Map([...pendingLocalRoutes].map(([name, route]) => [name, botRouteKey(route)]))
 
-  const hydrated = {
-    ...migrated
-  }
-
-  for (const [key, meta] of Object.entries($botMeta.get())) {
-    const target = remap.get(key) || key
-    hydrated[target] = {
-      ...(hydrated[target] || {}),
-      ...meta
-    }
-  }
+  const hydrated = mergeBotMetaSnapshot(migrated, $botMeta.get(), remap)
 
   try {
     await commitBotMetaV2(storage, hydrated)

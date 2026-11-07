@@ -830,6 +830,10 @@ Every terminal command on the **local** and **SSH** backends runs in a fresh `ba
 
 The working directory always carries over because the file tools resolve relative paths against it. To make a variable stick in either mode, `export` it (setting on) or put it in your shell profile or `terminal.env_passthrough`.
 
+On macOS and Linux, local background commands also start from the current saved Bash environment. This includes explicit `background=true`, a converted trailing `&`, and foreground commands promoted because their requested timeout exceeds the foreground cap. They use Bash even when your login shell is zsh. Each job gets a private copy of the saved state and does not save its exports back into the foreground session.
+
+A foreground command moved to the background while running keeps the same process and can still save its final exported state. While that process owns publication, another foreground command reads the last saved state without publishing its own changes. Its result explains that its exports will not persist. If a missing snapshot is rebuilt before a command starts, the result reports that earlier shell state may have been reset.
+
 The SSH backend reads `terminal.persistent_shell`; the local backend has its own switch. Both default to on. To make each command start from the login environment:
 
 ```bash

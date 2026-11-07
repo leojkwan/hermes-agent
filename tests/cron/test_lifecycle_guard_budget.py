@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 import shlex
+from cron import lifecycle_guard_lex
 from pathlib import Path
 
 from cron import lifecycle_guard
@@ -32,7 +33,7 @@ def test_root_byte_limit_allows_exact_and_rejects_plus_one(monkeypatch):
 
     assert guard("x" * 8) is False
 
-    monkeypatch.setattr(lifecycle_guard.shlex, "shlex", _explode)
+    monkeypatch.setattr(lifecycle_guard_lex, "_lex", _explode)
     assert guard("x" * 9) is True
 
 
@@ -46,7 +47,7 @@ def test_root_line_limit_allows_exact_and_rejects_plus_one(monkeypatch):
 def test_single_giant_line_rejected_before_shlex(monkeypatch):
     """One enormous token is the quadratic shlex case."""
     monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINE_BYTES", 8)
-    monkeypatch.setattr(lifecycle_guard.shlex, "shlex", _explode)
+    monkeypatch.setattr(lifecycle_guard_lex, "_lex", _explode)
 
     assert guard("xxxxxxxxx\necho ok") is True
 
@@ -115,7 +116,7 @@ def test_cumulative_text_budget_bounds_recursive_scan(monkeypatch, tmp_path):
 
     Relative references keep the root command short so the budget arithmetic
     is about the scripts, not the tmp_path length."""
-    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_BYTES", 48)
+    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SOURCE_BYTES", 24)
     (tmp_path / "a.sh").write_text("echo " + "a" * 10 + "\n", encoding="utf-8")  # 16
     (tmp_path / "b.sh").write_text("echo " + "b" * 10 + "\n", encoding="utf-8")  # 16
     cwd = str(tmp_path)
@@ -141,19 +142,19 @@ def test_remote_script_sanitizer_honours_remaining_budget():
 def test_line_budget_fails_closed_before_tokenizing_every_line(
     monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 4)
+    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SOURCE_LINES", 4)
     script = tmp_path / "many.sh"
     script.write_text("echo ok\n" * 10, encoding="utf-8")
 
     lexers = 0
-    real_shlex = lifecycle_guard.shlex.shlex
+    real_shlex = lifecycle_guard_lex._lex
 
     def counting(*args, **kwargs):
         nonlocal lexers
         lexers += 1
         return real_shlex(*args, **kwargs)
 
-    monkeypatch.setattr(lifecycle_guard.shlex, "shlex", counting)
+    monkeypatch.setattr(lifecycle_guard_lex, "_lex", counting)
     root = f"bash {shlex.quote(str(script))}"
     assert guard(root) is True
     # Only the one-line root was tokenized (a handful of lexers across the
@@ -186,7 +187,7 @@ def test_check_gateway_lifecycle_python_path_charges_masker(monkeypatch, tmp_pat
     small.write_text("x = 1\n", encoding="utf-8")
     lifecycle_guard.check_gateway_lifecycle("run report", str(small))
 
-    monkeypatch.setattr(lifecycle_guard.shlex, "shlex", _explode)
+    monkeypatch.setattr(lifecycle_guard_lex, "_lex", _explode)
     long_line = tmp_path / "long.py"
     long_line.write_text("x = 1\n" + "y" * 40 + "\n", encoding="utf-8")
     with pytest.raises(lifecycle_guard.GatewayLifecycleBlocked):

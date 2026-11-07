@@ -299,6 +299,8 @@ class BaseEnvironment(ABC):
 
     # Per-session PIPESTATUS marker set in __init__; empty means the wrapper emits none.
     _pipe_marker: str = ""
+    _restore_marker: str = ""
+    _snapshot_recovery_pending: str | None = None
 
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
@@ -323,7 +325,9 @@ class BaseEnvironment(ABC):
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._pipe_marker = _pipe_marker(self._session_id)
+        self._restore_marker = f"__HERMES_RESTORE_{self._session_id}__"
         self._snapshot_ready = False
+        self._snapshot_recovery_pending: str | None = None
         self._snapshot_passthrough_names: set[str] = set()
         # True when login bash is unusable (e.g. broken Git-for-Windows startup)
         # so execute() must fall back to non-login ``bash -c``, not ``bash -l``.
@@ -384,7 +388,7 @@ class BaseEnvironment(ABC):
         """Return backend-specific names that must not persist in snapshots."""
         return ()
 
-    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+    def _snapshot_excluded_passthrough_names(self, *, strict: bool = False) -> tuple[str, ...]:
         """Profile-scoped names that must not persist in the snapshot. Monotonic for the
         environment lifetime: an allowlist can be cleared after a value was captured, and
         retaining the exclusion keeps that old value from leaking to a later profile."""
@@ -393,11 +397,21 @@ class BaseEnvironment(ABC):
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():
+                if strict:
+                    from hermes_cli.config import get_config_path, read_config_doc
+                    from hermes_cli.config_backend import config_exists
+                    config_path = get_config_path()
+                    if config_exists(config_path):
+                        config_doc = read_config_doc(config_path)
+                        if config_doc is not None and not isinstance(config_doc, dict):
+                            raise ValueError("snapshot-exclusions-config-unsupported")
                 from tools.env_passthrough import get_all_passthrough
                 names = (*get_all_passthrough(), *self._additional_profile_scoped_passthrough_names())
                 self._snapshot_passthrough_names.update(
                     name for name in names if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name))
         except Exception:
+            if strict:
+                raise RuntimeError("snapshot-exclusions-unavailable") from None
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
         return tuple(sorted(self._snapshot_passthrough_names))
 
@@ -424,6 +438,7 @@ class BaseEnvironment(ABC):
             if int(result.get("returncode") or 0) != 0:
                 raise RuntimeError(f"snapshot bootstrap failed with exit code {result.get('returncode')}")
             self._snapshot_ready = True
+            self._snapshot_recovery_pending = None
             self._update_cwd(result)
             logger.info("Session snapshot created (session=%s, cwd=%s)", self._session_id, self.cwd)
         except Exception as exc:
@@ -470,14 +485,15 @@ class BaseEnvironment(ABC):
         rewrite native/mixed Windows paths to ``/c/...``; remote backends are POSIX."""
         return shlex.quote(path)
 
-    def _wrap_command(self, command: str, cwd: str) -> str:
+    def _wrap_command(self, command: str, cwd: str, *, persist_env: bool | None = None) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
             snapshot_ready=self._snapshot_ready,
-            persist_env=self._persist_env,
+            persist_env=self._persist_env if persist_env is None else persist_env,
             pipe_marker=self._pipe_marker,
+            restore_marker=self._restore_marker,
             **self._snapshot_script_kwargs(cwd))
 
     @staticmethod
@@ -675,7 +691,8 @@ class BaseEnvironment(ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
+        yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+        _prepared_launch=None) -> dict:
         """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
         tool may set it — internal full-fidelity consumers (file-op ``cat`` reads feeding the
@@ -687,28 +704,55 @@ class BaseEnvironment(ABC):
         is drained (head/tail window) instead of holding the full output in memory (#64435).
         See #94285.
         """
-        self._before_execute()
+        recovered_snapshot = restore_retry = False
+        raw_publication = None
+        raw_state_not_persisted = False
+        if _prepared_launch is not None:
+            wrapped, login = _prepared_launch.script, False
+            effective_stdin = _prepared_launch.stdin_data
+            effective_timeout = _prepared_launch.remaining()
+        else:
+            self._before_execute()
 
-        exec_command, sudo_stdin = self._prepare_command(command)
-        # Guard against the `A && B &` subshell-wait trap by default; callers
-        # that already produce shell-safe wrappers (spawn_via_env) pass False.
-        if rewrite_compound_background:
-            from tools.terminal_tool_sudo import _rewrite_compound_background
-            exec_command = _rewrite_compound_background(exec_command)
-        effective_timeout = timeout or self.timeout
-        effective_cwd = cwd or self.cwd
+            exec_command, sudo_stdin = self._prepare_command(command)
+            # Guard against the `A && B &` subshell-wait trap by default; callers
+            # that already produce shell-safe wrappers (spawn_via_env) pass False.
+            if rewrite_compound_background:
+                from tools.terminal_tool_sudo import _rewrite_compound_background
+                exec_command = _rewrite_compound_background(exec_command)
+            effective_timeout = timeout or self.timeout
+            if self._snapshot_recovery_pending and getattr(self, "is_local", False):
+                from tools.environments.local_prepared import PREPARATION_ERROR, prepare_raw_snapshot
+                restore_retry = self._snapshot_recovery_pending == "unavailable"
+                try:
+                    effective_timeout = prepare_raw_snapshot(self, effective_timeout)
+                    recovered_snapshot = True
+                except (OSError, RuntimeError, ValueError):
+                    return {"output": PREPARATION_ERROR, "returncode": 126}
+            effective_cwd = cwd or self.cwd
 
-        # Merge sudo stdin with caller stdin.
-        effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
-        if effective_stdin and self._stdin_mode == "heredoc":
-            exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
-            effective_stdin = None
+            # Merge sudo stdin with caller stdin.
+            effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
+            if effective_stdin and self._stdin_mode == "heredoc":
+                exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
+                effective_stdin = None
 
-        wrapped = self._wrap_command(exec_command, effective_cwd)
+            claim = getattr(self, "_claim_raw_publication", None)
+            if claim is not None:
+                raw_publication = None if restore_retry else claim()
+                raw_state_not_persisted = self._persist_env and not restore_retry and raw_publication is None
+            try:
+                wrapped = self._wrap_command(
+                    exec_command, effective_cwd,
+                    **({"persist_env": raw_publication is not None} if claim is not None else {}))
+            except Exception:
+                if raw_publication is not None:
+                    raw_publication.close()
+                raise
 
-        # Login shell if the snapshot failed (so the user's profile still
-        # loads), unless login itself is broken — then non-login is the only path.
-        login = not self._snapshot_ready and not self._prefer_nonlogin
+            # Login shell if the snapshot failed (so the user's profile still
+            # loads), unless login itself is broken — then non-login is the only path.
+            login = not self._snapshot_ready and not self._prefer_nonlogin
 
         parent_tid = threading.current_thread().ident
         # The activity callback is thread-local and the wait runs on the
@@ -721,11 +765,22 @@ class BaseEnvironment(ABC):
             if parent_activity_cb is not None:
                 set_activity_callback(parent_activity_cb)
             if not _enter_foreground_spawn():
+                if raw_publication is not None:
+                    raw_publication.close()
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
+                if _prepared_launch is not None:
+                    spawned = self._spawn_prepared(_prepared_launch)
+                    _prepared_launch.attach(spawned)
+                else:
+                    spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
+                    if raw_publication is not None:
+                        raw_publication.process = spawned
+                        spawned._hermes_publication = raw_publication
             finally:
+                if raw_publication is not None and spawned is None:
+                    raw_publication.close()
                 fenced = _leave_foreground_spawn(self, spawned)
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
@@ -738,6 +793,8 @@ class BaseEnvironment(ABC):
                     watch_interrupt_tid=parent_tid, output=output,
                     **({"yield_handler": yield_handler} if yield_handler is not None else {}))
             finally:
+                if raw_publication is not None:
+                    raw_publication.close_if_finished()
                 with _live_foreground_cond:
                     _live_foreground.pop(id(spawned), None)
 
@@ -776,10 +833,21 @@ class BaseEnvironment(ABC):
             result["hermes_timed_out"] = True
         else:
             result = bounded.value
+        if raw_state_not_persisted:
+            result["state_not_persisted"] = True
+        if recovered_snapshot and not result.get("hermes_timed_out"):
+            result["snapshot_recovery"] = "ready"
+        if _prepared_launch is not None:
+            if _prepared_launch.environment_recreated:
+                result["environment_recreated"] = "local_snapshot"
+            if _prepared_launch.state_not_persisted:
+                result["state_not_persisted"] = True
         self._update_cwd(result)
+        from tools.environments.base_session_recovery import finish_snapshot_restore
+        finish_snapshot_restore(self, result)
         if getattr(self, "_recreated_notice_pending", False):
+            result["environment_recreated"] = self._recreated_notice_pending
             self._recreated_notice_pending = False
-            result["environment_recreated"] = True
         return result
 
     def _kill_spawned_tree(self, spawned) -> None:

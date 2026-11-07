@@ -13,7 +13,6 @@ import json
 import logging
 import re
 import shlex
-import stat
 from pathlib import Path
 from typing import Any, Optional
 
@@ -219,37 +218,47 @@ def trailing_amp_background_command(command: str) -> str | None:
 
 
 def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes: int) -> Optional[str]:
-    """Best-effort script read: host filesystem first, then a bounded
-    ``env.execute('head -c ... < path')`` for remote backends. Binary content
-    (NUL byte) is not a script: feeding it to the guard tokenizes machine code
-    into bogus paths and crashes the scanner, so it yields None."""
+    """Legacy backend-only bounded read; never satisfy a remote path on this host."""
     if env is None:
         return None
-    try:
-        local_path = Path(script_path).expanduser()
-        if not local_path.is_absolute():
-            local_path = Path(guard_cwd) / local_path
-        if local_path.is_file():
-            metadata = local_path.stat()
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= max_bytes:
-                data = local_path.read_bytes()
-                if len(data) <= max_bytes:
-                    return None if b"\x00" in data else data.decode("utf-8", errors="replace")
-    except Exception:
-        pass
-    # Remote backend: bound the read at the source with `head -c` so an
-    # oversized binary never crosses the wire (an unbounded `cat` once
-    # pinned the gateway's tool thread for 30+ min on a shlex scan). One
-    # byte over budget is enough for lifecycle_guard to fail closed. The
-    # `< path` redirect keeps leading-dash paths out of argv.
-    try:
-        result = env.execute(f"head -c {max_bytes + 1} < {shlex.quote(script_path)}")
-        if result.get("returncode", -1) == 0:
-            output = result.get("output", "")
-            return None if output and "\x00" in output else output
-    except Exception:
-        pass
+    result = env.execute(f"head -c {max_bytes + 1} < {shlex.quote(script_path)}")
+    if result.get("returncode", -1) == 0:
+        return result.get("output", "")
     return None
+
+
+class _BackendSourceReader:
+    """Typed reads are optional; legacy backends cannot attest package metadata."""
+
+    def __init__(self, env: Any, cwd: str):
+        self.env, self.cwd = env, cwd
+        self.supports_metadata = callable(getattr(env, "read_lifecycle_source", None))
+
+    def __call__(self, path: str) -> Optional[str]:
+        from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES
+
+        return _read_script_for_guard(self.env, self.cwd, path, _MAX_REFERENCED_SCRIPT_BYTES)
+
+    def read_source(self, path: str, *, max_bytes: int, timeout: float):
+        from cron.lifecycle_guard_references import ScanRefused, SourceRead
+
+        reader = getattr(self.env, "read_lifecycle_source", None)
+        if callable(reader):
+            result = reader(path, max_bytes=max_bytes, timeout=timeout)
+        else:
+            import inspect
+
+            execute = self.env.execute
+            parameters = inspect.signature(execute).parameters
+            kwargs = {"timeout": min(timeout, getattr(self.env, "timeout", timeout))} if "timeout" in parameters else {}
+            reply = execute(f"head -c {max_bytes + 1} < {shlex.quote(path)}", **kwargs)
+            if reply.get("returncode", -1) != 0:
+                return SourceRead("missing")
+            result = SourceRead("text", reply.get("output", ""))
+        if not isinstance(result, SourceRead):
+            raise ScanRefused("invalid backend lifecycle source result")
+        return result
+
 
 
 def gateway_lifecycle_block(
@@ -260,6 +269,8 @@ def gateway_lifecycle_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
+    background: bool = False,
+    prepared_launch=None,
 ) -> Optional[str]:
     """Refuse gateway lifecycle commands issued from inside the supervised gateway.
 
@@ -280,7 +291,6 @@ def gateway_lifecycle_block(
     if not _is_supervised_gateway_process():
         return None
     from cron.lifecycle_guard import (
-        _MAX_REFERENCED_SCRIPT_BYTES,
         HOST_INTERPRETER_KILL_REJECTION,
         contains_host_interpreter_kill,
         contains_launchctl_submit_command,
@@ -300,21 +310,27 @@ def gateway_lifecycle_block(
             "not by switching launchctl verbs to bypass this rejection.",
             "error",
         )
-    guard_cwd_base = get_session_cwd(session_key)
-    if guard_cwd_base is None:
-        guard_cwd_base = getattr(env, "cwd", None) or cwd
-    guard_cwd = _resolve_command_cwd(
-        workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
-        mounted_host=getattr(env, "host_cwd", None),
-        env=env,
-    )
+    if prepared_launch is not None:
+        guard_cwd = prepared_launch.cwd
+    else:
+        guard_cwd_base = get_session_cwd(session_key)
+        if guard_cwd_base is None:
+            guard_cwd_base = getattr(env, "cwd", None) or cwd
+        guard_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
+            mounted_host=getattr(env, "host_cwd", None),
+            env=env,
+        )
+    effective_local = env_type == "local" and getattr(env, "env_type", None) == "local"
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
         read_remote_script=(
-            None if env_type == "local" and getattr(env, "env_type", None) == "local" else
-            lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
+            None if effective_local else _BackendSourceReader(env, guard_cwd)
         ),
+        remote_namespace=not effective_local,
+        execution_context=(prepared_launch.context if prepared_launch is not None else env.execution_context() if effective_local and not background
+                           and callable(getattr(env, "execution_context", None)) else None),
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
@@ -323,7 +339,7 @@ def gateway_lifecycle_block(
         return _blocked_json(
             f"Blocked: the lifecycle guard could not scan this command or referenced script: {refusal}. "
             "Nothing in the command is known to contain a gateway lifecycle command, but a "
-            "script the command executes must be scannable (a regular text file under 1 MiB) "
+            "script the command executes must be scannable (a regular text file within the reported scan bounds) "
             "before it can run inside the gateway process.",
             "error",
         )

@@ -783,7 +783,7 @@ def _make_run_env(env: dict) -> dict:
     from agent.session_client_env import toolchain_environ
     run_env = _scrubbed_env(
         [(dict(toolchain_environ(strip_launch_profile_env(os.environ.copy())) | env), True)],
-        frozenset(),
+        _plugin_terminal_env_strip_keys(),
         lambda p: _user_tools_first(_append_missing_sane_path_entries(p)),
     )
     # While this profile's Bot Desktop is running, its DISPLAY/XAUTHORITY/DBUS ride along so GUI
@@ -1062,7 +1062,36 @@ class LocalEnvironment(BaseEnvironment):
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None, persistent: bool = True):
         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env, persist_env=persistent)
+        self._execution_context_lock = threading.RLock()
+        self._snapshot_publisher = None
         self.init_session()
+
+    def prepare_local_launch(self, command, cwd="", *, timeout=None, background=False):
+        from tools.environments.local_prepared import prepare_local_launch
+        return prepare_local_launch(self, command, cwd, timeout=timeout, background=background)
+
+    def execute_prepared(self, launch, **kwargs):
+        from tools.environments.local_prepared import execute_prepared
+        return execute_prepared(self, launch, **kwargs)
+
+    def _recover_local_snapshot(self, deadline):
+        from tools.environments.local_prepared import recover_local_snapshot
+        return recover_local_snapshot(self, deadline)
+
+    def _claim_raw_publication(self):
+        from tools.environments.local_prepared import claim_raw_publication
+        return claim_raw_publication(self)
+
+    def _spawn_prepared(self, launch):
+        launch.remaining()
+        return self._popen_bash(
+            [launch.bash, "--noprofile", "--norc", "-c", launch.script],
+            launch.spawn_env, launch.cwd, launch.stdin_data)
+
+    def execution_context(self):
+        from tools.environments.local_execution_context import execution_context
+
+        return execution_context(self)
 
     def get_temp_dir(self) -> str:
         """Shell-safe writable temp dir. Precedence: ``TERMINAL_TEMP_DIR``, TMPDIR/TMP/TEMP
@@ -1142,6 +1171,9 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        return self._popen_bash(args, run_env, self.cwd, stdin_data)
+
+    def _popen_bash(self, args, run_env, cwd, stdin_data):
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
         proc = subprocess.Popen(
@@ -1149,7 +1181,7 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             # detached-spawn: ok — owned via own_process_groups right below
-            start_new_session=True, cwd=self.cwd,
+            start_new_session=True, cwd=cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             # The command dies with this process however it dies: a SIGKILLed / OOM-killed host left a
@@ -1225,6 +1257,9 @@ class LocalEnvironment(BaseEnvironment):
         (``snap.tmp.<bashpid>``) a failed/interrupted mv could leave behind."""
         # See #38249.
         import glob
+        publisher = getattr(self, "_snapshot_publisher", None)
+        if publisher is not None and publisher.process is None:
+            publisher.close()
         try:
             stale = glob.glob(f"{self._snapshot_path}.tmp.*")
         except Exception:
