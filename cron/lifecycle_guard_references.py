@@ -329,6 +329,8 @@ class ReferenceScanner:
         facts = projection.project()
         if facts.status == "refused":
             raise ScanRefused(facts.reason)
+        if selection.script is None:
+            return False
         if self.argument_references(list(selection.forwarded), invocation, depth):
             return True
         previous, exports = self.options, self.npm_exports
@@ -433,6 +435,9 @@ class ReferenceScanner:
         args, index, inline = list(invocation.argv[1:]), 0, False
         if not injected and self.scan_ambient_node_options(invocation, depth):
             return True
+        # Only standalone inspection: other argv still follows the routing scanner.
+        if not injected and args in (["-v"], ["--version"]):
+            return False
         while index < len(args):
             token = args[index]
             index += 1
