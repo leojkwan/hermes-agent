@@ -29,6 +29,7 @@
 
 // Relative, not `@hermes/shared`: esbuild bundles electron/ without tsconfig paths.
 import { HERMES_CLOUD_MANAGED, isHermesCloudUrl } from '../../shared/src/hermes-cloud'
+import type { RosterEquivalentConnection, RosterProfileMetadata } from '../../shared/src/roster'
 
 import {
   hostLabelFromBaseUrl,
@@ -640,14 +641,9 @@ export interface RosterAgent {
   handle: string
   /** Rich metadata for this exact connection + profile, when enumerated. */
   profileMetadata?: RosterProfileMetadata
-}
-
-export interface RosterProfileMetadata {
-  display_name?: string
-  description?: string
-  title?: string
-  ui_meta?: Record<string, unknown>
-  has_avatar?: boolean
+  /** Proven same-install/profile routes for presentation only. Each route
+   * retains its own authentication, permissions and session ownership. */
+  equivalentConnections?: RosterEquivalentConnection[]
 }
 
 /** Project credential-free `/api/profiles` fields into the metadata carried by
@@ -706,10 +702,11 @@ export function profileMetadataFromApiProfiles(profiles: unknown[]): Record<stri
  * an unreachable URL is not evidence a backend exists there.
  */
 export function rememberSshEnumeration(
-  enumeration: Pick<ConnectionAgents, 'error' | 'profiles'>,
+  enumeration: Pick<ConnectionAgents, 'error' | 'installId' | 'profiles'>,
   cached: null | string[] | undefined,
-  kind: ConnectionKind
-): Pick<ConnectionAgents, 'error' | 'profiles'> {
+  kind: ConnectionKind,
+  cachedInstallId?: string
+): Pick<ConnectionAgents, 'error' | 'installId' | 'profiles'> {
   if (enumeration.profiles && enumeration.profiles.length > 0) {
     return enumeration
   }
@@ -719,7 +716,9 @@ export function rememberSshEnumeration(
   }
 
   if (cached && cached.length > 0) {
-    return { profiles: cached, error: enumeration.error }
+    const installId = enumeration.installId || cachedInstallId
+
+    return { profiles: cached, error: enumeration.error, ...(installId ? { installId } : {}) }
   }
 
   if (kind === 'ssh' && enumeration.error === 'connect-on-demand') {
@@ -828,7 +827,8 @@ export function buildAgentRoster(
   >()
 
   for (const { connection, installId, order: rank, profile, profileMetadata } of identities.values()) {
-    const key = installId ? `id:${installId}\0${profile}` : `conn:${connection.id}\0${profile}`
+    const target = connection.remoteProfile || profile
+    const key = installId ? `id:${installId}\0${profile}\0${target}` : `conn:${connection.id}\0${profile}`
     const group = backends.get(key)
 
     if (group) {
@@ -838,7 +838,15 @@ export function buildAgentRoster(
     }
   }
 
-  const rows = [...backends.values()].map(group => pickCanonicalConnection(group, opts.primaryConnectionId))
+  const rows = [...backends.values()].map(group => ({
+    ...pickCanonicalConnection(group, opts.primaryConnectionId),
+    equivalentConnections: group.map(({ connection, profile }) => ({
+      connectionId: connection.id,
+      connectionKind: connection.kind,
+      connectionLabel: connection.label,
+      targetProfile: connection.remoteProfile || profile
+    }))
+  }))
 
   // The @name-device duplicate-handle rule runs AFTER the collapse, so a
   // profile that only *looked* duplicated (one box, two addresses) keeps its
@@ -851,7 +859,7 @@ export function buildAgentRoster(
 
   const roster: RosterAgent[] = []
 
-  for (const { connection, profile, profileMetadata } of rows) {
+  for (const { connection, profile, profileMetadata, equivalentConnections } of rows) {
     roster.push({
       connectionId: connection.id,
       connectionKind: connection.kind,
@@ -859,6 +867,7 @@ export function buildAgentRoster(
       profile,
       targetProfile: connection.remoteProfile || profile,
       handle: agentHandle(profile, connection.label, (counts.get(profile) || 0) > 1),
+      ...(equivalentConnections.length > 1 ? { equivalentConnections } : {}),
       ...(profileMetadata ? { profileMetadata } : {})
     })
   }

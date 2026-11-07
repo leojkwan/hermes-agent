@@ -9,7 +9,9 @@
  * required is a claim that every one of those paths supplies it.
  */
 
-import type { ProfileSessionPreview } from '@hermes/plugin-sdk'
+import type { host, ProfileSessionPreview } from '@hermes/plugin-sdk'
+
+export type UnionRosterAgent = Awaited<ReturnType<typeof host.agents>>['agents'][number]
 
 /**
  * The compact age suffixes the sidebar's session rows render ("now", "m", "h",
@@ -100,6 +102,8 @@ export interface RosterRow {
   connectionId?: string
   connectionKind?: string
   connectionLabel?: string
+  /** Proven presentation aliases, independent of this row's explicit route. */
+  equivalentConnections?: UnionRosterAgent['equivalentConnections']
   description?: string
   display_name?: string
   /** An offline twin of a selected bot, kept visible so the row doesn't vanish. */

@@ -42,6 +42,8 @@ import {
 } from 'electron'
 import type { Session } from 'electron'
 
+import type { RosterProfileMetadata } from '../../shared/src/roster'
+
 import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime-state'
 import { HERMES_API_EXPECTED_404 } from './api-expected-404'
 import {
@@ -138,6 +140,7 @@ import { composerImageTimestamp } from './composer-image-name'
 import { writeComposerPaste } from './composer-paste'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
+  captureConnectionCacheValidity,
   connectionInstallIds,
   evictConnectionCaches,
   rosterSourceErrors,
@@ -213,7 +216,6 @@ import {
   upsertConnection
 } from './connection-registry'
 import type { RegistryConnection } from './connection-registry'
-import type { RosterProfileMetadata } from './connection-registry'
 import { liveWindowState, overlayWindowState } from './connection-window-state'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
@@ -545,7 +547,7 @@ import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle
 import { applyLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
-import { fetchRosterSourceData } from './roster-source-fetch'
+import { assertRosterConnectionCurrent, cacheSshProfileInventory, fetchRosterSourceData } from './roster-source-fetch'
 import { rosterSourceStatus } from './roster-source-status'
 import { registerSaveDialogIpc } from './save-text-file'
 import {
@@ -8678,10 +8680,10 @@ async function saveRegistryConnection(input: any = {}) {
   // connection's pooled backends/tunnels and tell renderers to dispose+redial
   // their secondaries for this connection id.
   if (existing && connectionDialFieldsChanged(existing, entry)) {
-    await stopRegistryConnectionBackends(entry.id)
     // The id now names a different machine: its cached roster/identity describe the old one,
     // and a cached ssh inventory is never retried (`shouldRetrySshInventory`).
     evictConnectionCaches(entry.id)
+    await stopRegistryConnectionBackends(entry.id)
     broadcastConnectionsChanged({ connectionId: entry.id, reason: 'updated' })
   } else {
     // Every OTHER successful save (a brand-new connection, a label rename)
@@ -14609,12 +14611,10 @@ ipcMain.handle('hermes:connections:remove', async (_event, id) => {
   managedConnectionUpdateGate.assertCanMutate(key)
   const registry = removeConnection(readDesktopConnectionsRegistry(), key)
   writeDesktopConnectionsRegistry(registry)
+  evictConnectionCaches(key)
   // Tear down anything the removed connection still had running: pooled
   // backends under its composite keys and any ssh tunnel scopes it owned.
   await stopRegistryConnectionBackends(key)
-  // …and everything cached ABOUT it. Ids are recycled label slugs, so re-adding "Mac mini"
-  // gets `mac-mini` back — with the removed machine's profile list still cached under it.
-  evictConnectionCaches(key)
   // And the renderer side: without this push, secondaries scoped to the
   // removed connection keep their WebSocket open (remote/cloud have no local
   // process to kill) and stream ghost events until page reload.
@@ -14651,6 +14651,8 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     throw new Error(`No connection with id "${String(id || '')}".`)
   }
 
+  const identityIsCurrent = captureConnectionCacheValidity(entry.id)
+
   // The ssh probe path in testDesktopConnectionConfig never consults v1
   // connection state, so mapping the entry onto it is safe.
   if (entry.kind === 'ssh') {
@@ -14664,6 +14666,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     })
 
     if (result?.reachable) {
+      assertRosterConnectionCurrent(identityIsCurrent)
       sshInventoryAttemptedAt.delete(entry.id)
       sshRosterCache.delete(entry.id)
       await probeSshProfileInventory(entry)
@@ -14705,8 +14708,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
 
   const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders)) as any
 
-  // The Test button is the cheapest moment to (re)learn this backend's stable
-  // identity for the same-backend roster collapse + Settings hint.
+  assertRosterConnectionCurrent(identityIsCurrent)
   rememberConnectionInstallId(entry.id, status)
 
   // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
@@ -14731,25 +14733,16 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
 
 // ── Union agent roster + registry ws-url + fan-out updates (phase 3-5) ─────
 
-// Enumerate every registered connection's profiles concurrently and flatten
-// into the union roster. Eager REST enumeration, lazy sockets: local + already
-// -dialed sources answer instantly; unreachable ones return an error entry
-// instead of failing the whole roster. ssh sources that have never been dialed
-// are SKIPPED (connect-on-demand — dialing every ssh box just to list agents
-// would spawn tunnels the user never asked for); once dialed, their pooled
-// descriptor serves the enumeration like any remote. Last-known SSH profile
-// lists are reused so switching the window back to local does not empty Bot Mode.
-// Connection caches live in ./connection-caches, which states (and tests) the invariant they share:
-// each is keyed by connection id and is only valid while that id names the same machine, so
-// removing a connection or re-pointing it must evict them (`evictConnectionCaches`).
+// Concurrent REST enumeration, lazy sockets: never dial undialed SSH sources.
+// Reuse known profile lists and identity through transient read failures.
 const SSH_INVENTORY_RETRY_MS = 60_000
 
-// Stable backend identity per registered connection: the `install_id` its /api/status reports,
-// TTL-cached in `connectionInstallIds` (see registry-backend-identity.ts).
 const probeConnectionInstallId = (connectionId: string, descriptor: any) =>
   probeCachedConnectionInstallId(connectionId, () => getJsonForBackend(descriptor, '/api/status', { timeoutMs: 8_000 }))
 
 async function probeSshProfileInventory(connection) {
+  const isCurrent = captureConnectionCacheValidity(connection.id)
+
   if (
     !shouldRetrySshInventory(
       sshRosterCache.has(connection.id),
@@ -14783,19 +14776,12 @@ async function probeSshProfileInventory(connection) {
 
   try {
     const platform = await ssh.open().then(() => detectRemotePlatform(ssh, sshConfig.remoteHermesPath || ''))
-    const profiles = await remoteLifecycle.listRemoteHermesProfiles(ssh, platform)
-
-    if (profiles.length > 0) {
-      sshRosterCache.set(connection.id, profiles)
-    }
-
-    // Backend identity, on the session we already have open: without it an ssh connection has no
-    // install id at all, so two addresses for one machine never collapse into one roster row
-    // (#88828 wired this for remote/local only, through /api/status).
-    connectionInstallIds.set(connection.id, {
-      id: await remoteLifecycle.readRemoteInstallId(ssh, platform),
-      ts: Date.now()
-    })
+    await cacheSshProfileInventory(
+      connection.id,
+      isCurrent,
+      () => remoteLifecycle.listRemoteHermesProfiles(ssh, platform),
+      () => remoteLifecycle.readRemoteInstallId(ssh, platform)
+    )
   } catch (error: any) {
     sshRememberLog(`[ssh] profile inventory failed for ${connection.id}: ${error?.message || error}`)
   } finally {
@@ -14834,6 +14820,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
   return withoutInteractiveOauthLogin(() =>
     Promise.all(
       registry.connections.map(async connection => {
+        const isCurrent = captureConnectionCacheValidity(connection.id)
         let sourceFailureDetail = ''
 
         let raw: {
@@ -14893,13 +14880,13 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
               rosterSourceEnumerationTimeoutMs(connection)
             )
 
+            assertRosterConnectionCurrent(isCurrent)
+
             const { body, installId } = await fetchRosterSourceData(
               () => getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 }),
-              () => probeConnectionInstallId(connection.id, descriptor)
+              () => probeConnectionInstallId(connection.id, descriptor),
+              connection.id
             )
-
-            // The install-id probe is TTL-cached, so the 5s roster poll usually
-            // pays zero extra requests; on a miss it runs beside /api/profiles.
 
             const profiles = Array.isArray(body?.profiles)
               ? body.profiles.map(p => String(p?.name || '').trim()).filter(Boolean)
@@ -14909,8 +14896,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
               ? profileMetadataFromApiProfiles(body.profiles)
               : undefined
 
-            // The root HERMES_HOME is an agent too; enumerations that omit it
-            // (older backends list only named profiles) still get a default row.
+            // Older enumerators omit the root profile.
             if (!profiles.includes('default')) {
               profiles.unshift('default')
             }
@@ -14933,6 +14919,10 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           }
         }
 
+        if (!isCurrent()) {
+          return { connection, profiles: null, error: 'connection changed during enumeration' }
+        }
+
         if (raw.error && raw.error !== 'connect-on-demand') {
           const diagnostic = redactSecrets([raw.error, sourceFailureDetail].filter(Boolean).join(' | '))
             .replace(/[\r\n]+/g, ' ')
@@ -14950,13 +14940,17 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           sshRosterCache.set(connection.id, raw.profiles)
         }
 
-        const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
+        const remembered = rememberSshEnumeration(
+          raw,
+          sshRosterCache.get(connection.id),
+          connection.kind,
+          connectionInstallIds.get(connection.id)?.id
+        )
 
         return {
           connection,
           ...remembered,
           ...(raw.needsSignIn ? { needsSignIn: true } : {}),
-          ...(raw.installId ? { installId: raw.installId } : {}),
           ...(raw.profileMetadata ? { profileMetadata: raw.profileMetadata } : {})
         }
       })
@@ -14970,11 +14964,7 @@ ipcMain.handle('hermes:agents:roster', async () => {
 
   return {
     agents: buildAgentRoster(enumerations, { primaryConnectionId: registry.primary }),
-    // The active gateway owns the renderer's profiles.list — union agents
-    // that report THIS connection are the same identities, not extra rows.
-    // Expose the primary id so the plugin merger can annotate them in place
-    // instead of appending duplicates (remote-only desktops doubled every
-    // bot otherwise; see #88344).
+    // Legacy renderers use primary; current renderers preserve active alias routes.
     primaryConnectionId: registry.primary,
     sources: enumerations.map(({ connection, error, installId, profiles, needsSignIn }) => ({
       connectionId: connection.id,

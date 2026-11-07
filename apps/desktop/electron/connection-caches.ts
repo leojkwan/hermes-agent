@@ -27,6 +27,17 @@ export const connectionInstallIds = new Map<string, { id?: string; ts: number }>
 /** Last logged roster failure per connection, so repeat polls do not spam the log. */
 export const rosterSourceErrors = new Map<string, string>()
 
+// Async reads may finish after removal/repointing. Their captured scope must
+// still be current before publishing either identity or remembered profiles.
+const connectionCacheScopes = new Map<string, symbol>()
+
+export function captureConnectionCacheValidity(connectionId: string): () => boolean {
+  const scope = connectionCacheScopes.get(connectionId) ?? Symbol(connectionId)
+  connectionCacheScopes.set(connectionId, scope)
+
+  return () => connectionCacheScopes.get(connectionId) === scope
+}
+
 const CONNECTION_SCOPED_CACHES: Map<string, unknown>[] = [
   sshRosterCache,
   sshInventoryAttemptedAt,
@@ -49,4 +60,6 @@ export function evictConnectionCaches(connectionId: string): void {
   for (const cache of CONNECTION_SCOPED_CACHES) {
     cache.delete(id)
   }
+
+  connectionCacheScopes.delete(id)
 }

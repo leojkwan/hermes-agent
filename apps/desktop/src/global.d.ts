@@ -2,6 +2,7 @@ import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { HermesSkin } from '@hermes/shared/skin'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
+import type { RosterEquivalentConnection, RosterProfileMetadata } from '../../shared/src/roster'
 import type { ChallengeOutcome } from '../electron/challenge-window'
 import type { ScreenshotApi } from '../electron/command-screenshot-types'
 import type { HudModifierApi } from '../electron/hud-modifier-types'
@@ -1346,6 +1347,9 @@ export interface DesktopRosterAgent {
   profile: string
   targetProfile?: string
   handle: string
+  profileMetadata?: RosterProfileMetadata
+  /** Same-install/profile presentation membership; never grants route authority. */
+  equivalentConnections?: RosterEquivalentConnection[]
   // False when this source lists the profile but does not serve it.
   // Absent means the source's own reachable flag.
   reachable?: boolean

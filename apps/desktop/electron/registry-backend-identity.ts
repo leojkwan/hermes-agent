@@ -7,7 +7,7 @@
  * max() instead of a sum.
  */
 
-import { connectionInstallIds } from './connection-caches'
+import { captureConnectionCacheValidity, connectionInstallIds } from './connection-caches'
 
 const IDENTITY_PROBE_BUDGET_MS = 2_000
 
@@ -39,7 +39,7 @@ export async function boundedInstallId(
   }
 }
 
-/** The non-empty `install_id` a `/api/status` body reports, else undefined. */
+/** The existing non-empty `install_id` contract, shared by status and profiles. */
 export function installIdFromStatus(body: unknown): string | undefined {
   const raw = body && typeof body === 'object' ? (body as { install_id?: unknown }).install_id : undefined
 
@@ -107,14 +107,34 @@ export async function probeCachedConnectionInstallId(
   fetchStatus: () => Promise<unknown>
 ): Promise<string | undefined> {
   const cached = connectionInstallIds.get(connectionId)
+  const isCurrent = captureConnectionCacheValidity(connectionId)
 
   if (cached && Date.now() - cached.ts < (cached.id ? INSTALL_ID_TTL_MS : INSTALL_ID_NEGATIVE_TTL_MS)) {
     return cached.id
   }
 
   try {
-    return rememberConnectionInstallId(connectionId, await fetchStatus())
+    const body = await fetchStatus()
+
+    if (!isCurrent()) {
+      return undefined
+    }
+
+    // A profiles response or a newer probe already supplied fresher evidence.
+    if (connectionInstallIds.get(connectionId) !== cached) {
+      return connectionInstallIds.get(connectionId)?.id
+    }
+
+    return rememberConnectionInstallId(connectionId, body)
   } catch {
+    if (!isCurrent()) {
+      return undefined
+    }
+
+    if (connectionInstallIds.get(connectionId) !== cached) {
+      return connectionInstallIds.get(connectionId)?.id
+    }
+
     // Keep any previously-known id (identity is stable; a transient fetch failure must not flap
     // the roster collapse), but do not cache a MISS over it.
     if (cached?.id) {

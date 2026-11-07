@@ -797,13 +797,16 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody, profile: Optio
 @functools.partial(coalesced_read, thread_runner=lambda func: run_in_threadpool(func))
 def _read_profiles():
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.install_identity import get_install_id
     try:
         # Polled by the Desktop on every focus/roster tick: never walk skill trees in-request.
         profiles = profiles_mod.list_profiles(lazy_skill_count=True)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        rows = [_profile_to_dict(p) for p in profiles]
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        rows = _fallback_profile_dicts(profiles_mod)
+    return {"profiles": rows, "install_id": _best_effort(
+        "GET /api/profiles install identity unavailable", fn=get_install_id, default="") or ""}
 
 
 @router.get("/api/profiles")
